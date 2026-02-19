@@ -1,0 +1,35 @@
+[package]
+name = "gpq2tiles-core"
+description = "Core library for converting GeoParquet to PMTiles vector tiles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+geoarrow = { workspace = true }
+geo = { workspace = true }
+pmtiles = { workspace = true }
+geozero = { workspace = true }
+prost = { workspace = true }
+rayon = { workspace = true }
+rstar = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }
+
+[build-dependencies]
+prost-build = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+env_logger = { workspace = true }
+
+[[bench]]
+name = "tiling"
+harness = false

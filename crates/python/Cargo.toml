@@ -1,0 +1,18 @@
+[package]
+name = "gpq2tiles-python"
+description = "Python bindings for gpq2tiles"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[lib]
+name = "gpq2tiles"
+crate-type = ["cdylib"]
+
+[dependencies]
+gpq2tiles-core = { path = "../core" }
+pyo3 = { workspace = true }

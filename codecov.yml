@@ -1,0 +1,20 @@
+coverage:
+  status:
+    project:
+      default:
+        target: 80%
+        threshold: 5%
+    patch:
+      default:
+        target: 80%
+
+ignore:
+  - "crates/cli/**"        # Don't require high coverage for CLI arg parsing
+  - "crates/python/**"     # pyo3 bindings are integration-tested differently
+  - "tests/**"
+  - "benches/**"
+
+comment:
+  layout: "reach,diff,flags,tree"
+  behavior: default
+  require_changes: false
