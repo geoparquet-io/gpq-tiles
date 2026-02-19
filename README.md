@@ -83,17 +83,22 @@ converter.convert("input.parquet", "output.pmtiles")?;
 
 ## How It Works
 
-1. **Read**: Loads GeoParquet using `geoarrow`
-2. **Tile**: For each zoom level, clips features to tile boundaries and simplifies geometry
-3. **Drop**: Applies density-based feature dropping to prevent overcrowding at low zooms
-4. **Encode**: Converts geometries to Mapbox Vector Tile (MVT) format using protobuf
-5. **Write**: Packages tiles into a PMTiles archive
+**Current Implementation (Phase 2 in progress):**
 
-The library prioritizes correctness and performance through:
+1. **Read**: ✅ Loads GeoParquet using `geoparquet` crate (v0.4)
+2. **Iterate**: ✅ Processes features in batches via Apache Arrow RecordBatch
+3. **Tile Math**: ✅ Web Mercator projection (lng/lat ↔ tile x/y/z)
+4. **Extract**: 🚧 Extract geometries from GeoArrow arrays (in progress)
+5. **Clip**: 🚧 Bbox clipping with `geo` crate (planned)
+6. **Simplify**: 🚧 RDP simplification tuned per zoom level (planned)
+7. **Encode**: 🚧 MVT encoding with delta coordinates and command packing (planned)
+8. **Write**: 🚧 Write tiles to PMTiles archive (planned)
+
+**When complete, the library will prioritize:**
 - Exact MVT command encoding (zigzag-encoded delta coordinates)
 - Parallel tile generation with Rayon
 - Spatial indexing with R-trees for efficient feature lookup
-- RDP simplification tuned per zoom level
+- Density-based feature dropping to prevent cluttered maps
 
 ## Development
 
@@ -180,12 +185,26 @@ gpq-tiles/
 
 ## Roadmap
 
-- [x] Phase 1: Skeleton (read GeoParquet → write empty PMTiles)
-- [ ] Phase 2: Naive tiling (zoom-by-zoom tile generation)
-- [ ] Phase 3: Feature dropping (density-based)
-- [ ] Phase 4: Parallelism (Rayon + spatial index)
-- [ ] Phase 5: Python bindings (pyo3)
-- [ ] Future: Attribute filtering, coalesce strategies, streaming for huge files
+- [x] **Phase 1: Skeleton** - Read GeoParquet → write empty PMTiles ✅
+  - [x] Workspace setup with core/CLI/Python crates
+  - [x] Protobuf integration for MVT encoding
+  - [x] Basic tests passing
+
+- [x] **Phase 2: Easy Parts** - Foundation for tiling ✅
+  - [x] GeoParquet reading with `geoparquet` crate
+  - [x] Feature iteration via RecordBatch
+  - [x] Tile coordinate math (Web Mercator projection)
+
+- [ ] **Phase 2: Medium/Hard Parts** - Actual tile generation 🚧
+  - [ ] Extract geometries from GeoArrow arrays
+  - [ ] Bbox clipping with `geo` crate
+  - [ ] RDP simplification
+  - [ ] MVT encoding (delta coordinates, command packing, zigzag)
+  - [ ] Write tiles to PMTiles
+
+- [ ] **Phase 3: Feature Dropping** - Density-based optimization
+- [ ] **Phase 4: Parallelism** - Rayon + spatial indexing
+- [ ] **Phase 5: Python Integration** - Production-ready bindings
 
 See the full [development roadmap](ROADMAP.md) for details.
 
@@ -207,10 +226,15 @@ Contributions are welcome! Please:
 This project follows a layered testing approach:
 
 1. **Unit tests**: Fast, focused tests for algorithmic correctness (MVT encoding, coordinate transforms)
+   - **Current**: 11 tests passing (5 core + 6 tile math)
 2. **Property-based tests**: `proptest` for edge cases (geometry round-trips, tile coordinate invariants)
+   - **Status**: Framework ready, tests planned for MVT encoding phase
 3. **Integration tests**: GeoParquet → PMTiles pipelines with golden file comparison
+   - **Status**: Basic end-to-end test with real fixtures
 4. **Benchmarks**: `criterion` for performance regression detection
+   - **Status**: Stub benchmark harness created
 5. **Mutation tests**: `cargo-mutants` to find test suite gaps (run before releases)
+   - **Status**: Configured in CI (weekly schedule)
 
 See the [testing documentation](TESTING.md) for details.
 
