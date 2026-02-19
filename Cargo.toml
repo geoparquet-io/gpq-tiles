@@ -28,7 +28,7 @@ pmtiles = "0.12"
 geozero = "0.14"
 
 # Protobuf for MVT encoding
-prost = "0.13"
+prost = "0.14"
 prost-build = "0.13"
 
 # Parallelism and spatial indexing
