@@ -24,7 +24,7 @@ geoparquet = "0.4"
 parquet = "55"
 arrow-schema = "55"
 geo = "0.29"
-pmtiles = "0.12"
+pmtiles = "0.19"
 geozero = "0.14"
 
 # Protobuf for MVT encoding
