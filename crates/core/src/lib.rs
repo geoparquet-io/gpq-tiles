@@ -30,6 +30,8 @@ pub mod vector_tile {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 
+pub mod tile;
+
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
 pub enum Error {
