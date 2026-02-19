@@ -26,7 +26,7 @@ End-to-end pipeline with stub implementations:
 
 **Goal**: `cargo run -- input.parquet output.pmtiles` produces a valid (though empty) PMTiles file. This establishes the pipeline structure and resolves dependency/build issues before implementing real logic.
 
-### Phase 2: Naive Tiling
+### Phase 2: Naive Tiling (In Progress)
 
 Produce functional vector tiles:
 - For each zoom level, for each tile intersecting the data bbox:
@@ -36,6 +36,21 @@ Produce functional vector tiles:
   - Write tiles to PMTiles archive
 
 **Single-threaded, in-memory processing.** Optimization comes later. Focus: tiles that render correctly in MapLibre.
+
+#### Progress
+
+- ✅ **Step 1**: GeoParquet reading with `geoparquet` crate (metadata parsing, schema inference)
+- ✅ **Step 2**: Feature iteration via Apache Arrow `RecordBatch`
+- ✅ **Step 3**: Tile coordinate math (Web Mercator projection, `lng_lat_to_tile()`, `tiles_for_bbox()`)
+- ✅ **Step 4**: Dataset bounding box and tile grid calculation
+  - Note: Currently returns world bounds as placeholder; real bbox requires geometry extraction
+- ⏳ **Step 5**: Geometry extraction from Arrow arrays (blocked: needs GeoArrow array handling)
+- ⏳ **Step 6**: Geometry clipping to tile bounds
+- ⏳ **Step 7**: Geometry simplification (Ramer-Douglas-Peucker)
+- ⏳ **Step 8**: MVT encoding with delta-encoded coordinates
+- ⏳ **Step 9**: PMTiles writing
+
+**Current Status**: 13 tests passing. Core library can read GeoParquet, iterate batches, and calculate tile grids. Geometry processing and MVT encoding remain.
 
 **MVT encoding challenges:**
 - Delta-encoded coordinates (each point relative to previous)
