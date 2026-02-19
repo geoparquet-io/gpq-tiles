@@ -26,9 +26,9 @@ log = { workspace = true }
 prost-build = { workspace = true }
 
 [dev-dependencies]
-proptest = { workspace = true }
-criterion = { workspace = true }
-env_logger = { workspace = true }
+proptest = "1"
+criterion = { version = "0.5", features = ["html_reports"] }
+env_logger = "0.11"
 
 [[bench]]
 name = "tiling"

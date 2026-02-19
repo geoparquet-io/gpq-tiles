@@ -46,12 +46,6 @@ thiserror = "1.0"
 log = "0.4"
 env_logger = "0.11"
 
-[workspace.dev-dependencies]
-# Testing
-proptest = "1"
-criterion = { version = "0.5", features = ["html_reports"] }
-wiremock = "0.6"
-
 # Note: Install these separately with cargo install:
 # - cargo-tarpaulin (coverage)
 # - cargo-mutants (mutation testing)
