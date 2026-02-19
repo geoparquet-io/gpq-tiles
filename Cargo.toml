@@ -43,7 +43,7 @@ pyo3 = { version = "0.22", features = ["extension-module"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Utilities
 log = "0.4"
