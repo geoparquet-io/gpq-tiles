@@ -51,6 +51,51 @@ pub struct TileBounds {
     pub lat_max: f64,
 }
 
+impl TileBounds {
+    /// Create a new bounding box
+    pub fn new(lng_min: f64, lat_min: f64, lng_max: f64, lat_max: f64) -> Self {
+        Self {
+            lng_min,
+            lat_min,
+            lng_max,
+            lat_max,
+        }
+    }
+
+    /// Create an empty/invalid bounding box
+    pub fn empty() -> Self {
+        Self {
+            lng_min: f64::INFINITY,
+            lat_min: f64::INFINITY,
+            lng_max: f64::NEG_INFINITY,
+            lat_max: f64::NEG_INFINITY,
+        }
+    }
+
+    /// Check if this is a valid bounding box
+    pub fn is_valid(&self) -> bool {
+        self.lng_min <= self.lng_max && self.lat_min <= self.lat_max
+    }
+
+    /// Expand this bounding box to include another
+    pub fn expand(&mut self, other: &Self) {
+        self.lng_min = self.lng_min.min(other.lng_min);
+        self.lat_min = self.lat_min.min(other.lat_min);
+        self.lng_max = self.lng_max.max(other.lng_max);
+        self.lat_max = self.lat_max.max(other.lat_max);
+    }
+
+    /// Get the width in degrees
+    pub fn width(&self) -> f64 {
+        self.lng_max - self.lng_min
+    }
+
+    /// Get the height in degrees
+    pub fn height(&self) -> f64 {
+        self.lat_max - self.lat_min
+    }
+}
+
 /// Convert longitude/latitude to tile coordinates at a given zoom level
 ///
 /// Uses Web Mercator projection (EPSG:3857)
@@ -81,25 +126,16 @@ pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
 ///
 /// # Arguments
 ///
-/// * `lng_min` - Minimum longitude
-/// * `lat_min` - Minimum latitude
-/// * `lng_max` - Maximum longitude
-/// * `lat_max` - Maximum latitude
+/// * `bbox` - Geographic bounding box
 /// * `zoom` - Zoom level
 ///
 /// # Returns
 ///
 /// Iterator of TileCoord that intersect the bbox
-pub fn tiles_for_bbox(
-    lng_min: f64,
-    lat_min: f64,
-    lng_max: f64,
-    lat_max: f64,
-    zoom: u8,
-) -> impl Iterator<Item = TileCoord> {
+pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileCoord> {
     // Get corner tiles
-    let min_tile = lng_lat_to_tile(lng_min, lat_max, zoom); // Note: lat_max for min_y
-    let max_tile = lng_lat_to_tile(lng_max, lat_min, zoom); // Note: lat_min for max_y
+    let min_tile = lng_lat_to_tile(bbox.lng_min, bbox.lat_max, zoom); // Note: lat_max for min_y
+    let max_tile = lng_lat_to_tile(bbox.lng_max, bbox.lat_min, zoom); // Note: lat_min for max_y
 
     // Iterate over all tiles in the range
     (min_tile.y..=max_tile.y).flat_map(move |y| {
@@ -151,7 +187,8 @@ mod tests {
     #[test]
     fn test_tiles_for_bbox_single_tile() {
         // Small bbox that fits in one tile
-        let tiles: Vec<_> = tiles_for_bbox(-1.0, -1.0, 1.0, 1.0, 10).collect();
+        let bbox = TileBounds::new(-1.0, -1.0, 1.0, 1.0);
+        let tiles: Vec<_> = tiles_for_bbox(&bbox, 10).collect();
 
         // Should be at least 1 tile
         assert!(!tiles.is_empty());
@@ -165,7 +202,8 @@ mod tests {
     #[test]
     fn test_tiles_for_bbox_multiple_tiles() {
         // Larger bbox spanning multiple tiles at zoom 5
-        let tiles: Vec<_> = tiles_for_bbox(-10.0, -10.0, 10.0, 10.0, 5).collect();
+        let bbox = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+        let tiles: Vec<_> = tiles_for_bbox(&bbox, 5).collect();
 
         // Should cover multiple tiles
         assert!(tiles.len() > 1);
@@ -175,6 +213,30 @@ mod tests {
         let last = tiles.last().unwrap();
         assert!(first.x <= last.x);
         assert!(first.y <= last.y);
+    }
+
+    #[test]
+    fn test_bbox_expand() {
+        let mut bbox1 = TileBounds::new(-10.0, -10.0, 10.0, 10.0);
+        let bbox2 = TileBounds::new(-20.0, -5.0, 5.0, 15.0);
+
+        bbox1.expand(&bbox2);
+
+        assert_eq!(bbox1.lng_min, -20.0);
+        assert_eq!(bbox1.lat_min, -10.0);
+        assert_eq!(bbox1.lng_max, 10.0);
+        assert_eq!(bbox1.lat_max, 15.0);
+    }
+
+    #[test]
+    fn test_bbox_empty() {
+        let bbox = TileBounds::empty();
+        assert!(!bbox.is_valid());
+
+        let mut bbox = TileBounds::empty();
+        bbox.expand(&TileBounds::new(-10.0, -10.0, 10.0, 10.0));
+        assert!(bbox.is_valid());
+        assert_eq!(bbox.lng_min, -10.0);
     }
 
     #[test]

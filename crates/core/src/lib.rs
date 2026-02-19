@@ -19,10 +19,13 @@
 //! ```
 
 use std::path::Path;
+use std::collections::HashMap;
 use thiserror::Error;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use geoparquet::reader::GeoParquetReaderBuilder;
 use arrow_schema::SchemaRef;
+
+use crate::tile::{TileBounds, TileCoord, tiles_for_bbox};
 
 // Include the protobuf-generated code
 pub mod vector_tile {
@@ -103,8 +106,9 @@ impl Converter {
     /// Currently:
     /// - ✓ Reads GeoParquet with geoarrow
     /// - ✓ Iterates features via RecordBatch
-    /// - TODO: Extract geometries from batches
-    /// - TODO: Calculate tile bounds
+    /// - ✓ Calculates tile grid (placeholder bbox for now)
+    /// - TODO: Extract geometries from batches (needed for real bbox)
+    /// - TODO: Calculate actual dataset bounds from geometries
     /// - TODO: Clip to tile bounds
     /// - TODO: Simplify geometries
     /// - TODO: Encode as MVT
@@ -136,6 +140,29 @@ impl Converter {
         let batch_count = self.iterate_features(input_path)?;
 
         log::info!("Processed {} batches of features", batch_count);
+
+        // Step 3: Calculate dataset bounding box
+        let bbox = self.calculate_bounds(input_path)?;
+
+        log::info!(
+            "Dataset bounds: ({}, {}) to ({}, {})",
+            bbox.lng_min,
+            bbox.lat_min,
+            bbox.lng_max,
+            bbox.lat_max
+        );
+        log::info!(
+            "  Width: {:.4}°, Height: {:.4}°",
+            bbox.width(),
+            bbox.height()
+        );
+
+        // Step 4: Generate tile grid for all zoom levels
+        let tile_grid = self.generate_tile_grid(&bbox)?;
+
+        for (zoom, tiles) in &tile_grid {
+            log::info!("  Zoom {}: {} tiles", zoom, tiles.len());
+        }
 
         // TODO: Extract geometries and generate tiles
 
@@ -230,6 +257,74 @@ impl Converter {
         log::info!("Iterated {} total rows in {} batches", total_rows, batch_count);
 
         Ok(batch_count)
+    }
+
+    /// Calculate the bounding box of all features in the GeoParquet file
+    ///
+    /// Note: Currently returns world bounds as a placeholder.
+    /// Real implementation requires geometry extraction (Phase 2, step 4).
+    fn calculate_bounds<P: AsRef<Path>>(&self, path: P) -> Result<TileBounds> {
+        let path = path.as_ref();
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+        let reader = builder.build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+        let mut global_bbox = TileBounds::empty();
+
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+            // Find the geometry column (assume first geometry column for now)
+            for (_idx, field) in batch.schema().fields().iter().enumerate() {
+                // Check if this is a geometry column by metadata or name
+                if field.name() == "geometry" || field.name().contains("geom") {
+
+                    // Try to extract bounds from the array
+                    // For now, we'll use a simple approach: scan coordinates
+                    // This is a simplified version - real implementation would use GeoArrow's bounding_rect
+
+                    // Use geo crate to calculate bounds if we can convert
+                    // For MVP, we'll extract min/max from coordinate buffer if available
+
+                    // Simplified: assume we can get some coordinate data
+                    // In practice, this needs proper GeoArrow array handling
+                    log::debug!("Found geometry column: {}", field.name());
+
+                    // For now, expand with a placeholder - we'll refine this
+                    // when we implement proper geometry extraction
+                    let batch_bbox = TileBounds::new(-180.0, -90.0, 180.0, 90.0);
+                    global_bbox.expand(&batch_bbox);
+                    break;
+                }
+            }
+        }
+
+        if !global_bbox.is_valid() {
+            return Err(Error::GeoParquetRead(
+                "No valid geometries found in file".to_string(),
+            ));
+        }
+
+        Ok(global_bbox)
+    }
+
+    /// Generate tile grid for all zoom levels
+    fn generate_tile_grid(&self, bbox: &TileBounds) -> Result<HashMap<u8, Vec<TileCoord>>> {
+        let mut tile_grid = HashMap::new();
+
+        for zoom in self.config.min_zoom..=self.config.max_zoom {
+            let tiles: Vec<TileCoord> = tiles_for_bbox(bbox, zoom).collect();
+            tile_grid.insert(zoom, tiles);
+        }
+
+        Ok(tile_grid)
     }
 }
 
