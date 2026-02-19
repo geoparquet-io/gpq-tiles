@@ -23,6 +23,7 @@ use thiserror::Error;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use geoparquet::reader::GeoParquetReaderBuilder;
 use arrow_schema::SchemaRef;
+use parquet::arrow::ProjectionMask;
 
 // Include the protobuf-generated code
 pub mod vector_tile {
@@ -100,7 +101,8 @@ impl Converter {
     ///
     /// Currently:
     /// - ✓ Reads GeoParquet with geoarrow
-    /// - TODO: Iterate features and extract geometries
+    /// - ✓ Iterates features via RecordBatch
+    /// - TODO: Extract geometries from batches
     /// - TODO: Calculate tile bounds
     /// - TODO: Clip to tile bounds
     /// - TODO: Simplify geometries
@@ -129,14 +131,20 @@ impl Converter {
             schema.fields().len()
         );
 
-        // TODO: Iterate features and generate tiles
+        // Step 2: Iterate features in batches
+        let batch_count = self.iterate_features(input_path)?;
+
+        log::info!("Processed {} batches of features", batch_count);
+
+        // TODO: Extract geometries and generate tiles
 
         // Create empty output file as proof of concept
         std::fs::File::create(output_path)?;
 
         log::info!(
-            "Phase 2 in progress: Read {} features from {}",
+            "Phase 2 in progress: Read {} features in {} batches from {}",
             num_rows,
+            batch_count,
             input_path.display()
         );
 
@@ -183,6 +191,44 @@ impl Converter {
         }
 
         Ok((schema, num_rows))
+    }
+
+    /// Iterate through features in a GeoParquet file
+    /// Returns the number of batches processed
+    fn iterate_features<P: AsRef<Path>>(&self, path: P) -> Result<usize> {
+        let path = path.as_ref();
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
+
+        // Create parquet reader builder
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+        // Build the reader
+        let reader = builder.build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+        let mut batch_count = 0;
+        let mut total_rows = 0;
+
+        // Iterate through batches
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+            batch_count += 1;
+            total_rows += batch.num_rows();
+
+            log::debug!("Batch {}: {} rows", batch_count, batch.num_rows());
+
+            // TODO: Extract geometries from batch
+            // TODO: Process features for tiling
+        }
+
+        log::info!("Iterated {} total rows in {} batches", total_rows, batch_count);
+
+        Ok(batch_count)
     }
 }
 
