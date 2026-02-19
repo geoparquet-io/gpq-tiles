@@ -1,5 +1,5 @@
 [package]
-name = "gpq2tiles-core"
+name = "gpq-tiles-core"
 description = "Core library for converting GeoParquet to PMTiles vector tiles"
 version.workspace = true
 edition.workspace = true

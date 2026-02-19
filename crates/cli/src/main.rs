@@ -1,15 +1,15 @@
-//! CLI for gpq2tiles - Convert GeoParquet to PMTiles
+//! CLI for gpq-tiles - Convert GeoParquet to PMTiles
 //!
-//! This is a thin wrapper around the gpq2tiles-core library.
+//! This is a thin wrapper around the gpq-tiles-core library.
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gpq2tiles_core::{Config, Converter, DropDensity};
+use gpq_tiles_core::{Config, Converter, DropDensity};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
 #[command(
-    name = "gpq2tiles",
+    name = "gpq-tiles",
     about = "Convert GeoParquet to PMTiles vector tiles",
     version
 )]

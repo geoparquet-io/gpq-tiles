@@ -1,6 +1,6 @@
 # Development Guide
 
-Quick reference for working on gpq2tiles.
+Quick reference for working on gpq-tiles.
 
 ## Initial Setup
 
@@ -57,7 +57,7 @@ cargo test --lib
 cargo test --test '*'
 
 # Specific crate
-cargo test -p gpq2tiles-core
+cargo test -p gpq-tiles-core
 
 # With output (show println!)
 cargo test -- --nocapture
@@ -131,7 +131,7 @@ cargo build
 cargo build --release
 
 # Build specific crate
-cargo build -p gpq2tiles-core
+cargo build -p gpq-tiles-core
 
 # Check compilation without building
 cargo check
@@ -148,7 +148,7 @@ cd crates/python
 maturin develop
 
 # Test Python bindings
-python -c "from gpq2tiles import convert; print(convert.__doc__)"
+python -c "from gpq-tiles import convert; print(convert.__doc__)"
 ```
 
 ## Debugging
@@ -163,7 +163,7 @@ RUST_LOG=debug cargo run -- input.parquet output.pmtiles
 RUST_BACKTRACE=1 cargo test test_name
 
 # Run under debugger (requires lldb or gdb)
-rust-lldb target/debug/gpq2tiles
+rust-lldb target/debug/gpq-tiles
 ```
 
 ### Common Issues
@@ -189,7 +189,7 @@ cargo install flamegraph
 cargo flamegraph --bench tiling
 
 # Profile the CLI
-cargo flamegraph -- target/release/gpq2tiles input.parquet output.pmtiles
+cargo flamegraph -- target/release/gpq-tiles input.parquet output.pmtiles
 ```
 
 ### Using criterion

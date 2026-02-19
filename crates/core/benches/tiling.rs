@@ -2,7 +2,7 @@
 // Phase 1: Stub benchmarks
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use gpq2tiles_core::{Config, Converter};
+use gpq_tiles_core::{Config, Converter};
 
 fn bench_converter_creation(c: &mut Criterion) {
     c.bench_function("converter_creation", |b| {

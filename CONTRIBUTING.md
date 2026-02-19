@@ -1,4 +1,4 @@
-# Contributing to gpq2tiles
+# Contributing to gpq-tiles
 
 Thank you for your interest in contributing! This document provides guidelines and information for contributors.
 
@@ -247,7 +247,7 @@ Add doc comments for all public items:
 /// # Examples
 ///
 /// ```
-/// use gpq2tiles_core::{convert, Config};
+/// use gpq_tiles_core::{convert, Config};
 ///
 /// let config = Config::default();
 /// convert("input.parquet", "output.pmtiles", &config)?;
@@ -296,7 +296,7 @@ Understanding the layout:
 ```
 gpq-tiles/
 ├── crates/
-│   ├── core/              # Core library (gpq2tiles-core)
+│   ├── core/              # Core library (gpq-tiles-core)
 │   │   ├── src/
 │   │   │   ├── lib.rs     # Public API
 │   │   │   ├── mvt.rs     # MVT encoding logic
@@ -352,7 +352,7 @@ gpq-tiles/
 2. Update `CHANGELOG.md`
 3. Create a git tag: `git tag -a v0.1.0 -m "Release v0.1.0"`
 4. Push tag: `git push origin v0.1.0`
-5. Publish to crates.io: `cargo publish -p gpq2tiles-core && cargo publish -p gpq2tiles`
+5. Publish to crates.io: `cargo publish -p gpq-tiles-core && cargo publish -p gpq-tiles`
 6. Build Python wheels and publish to PyPI
 
 ## Getting Help

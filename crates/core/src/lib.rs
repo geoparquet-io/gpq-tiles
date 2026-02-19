@@ -6,7 +6,7 @@
 //! # Examples
 //!
 //! ```no_run
-//! use gpq2tiles_core::{Converter, Config};
+//! use gpq_tiles_core::{Converter, Config};
 //!
 //! let config = Config {
 //!     min_zoom: 0,
@@ -23,7 +23,6 @@ use thiserror::Error;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use geoparquet::reader::GeoParquetReaderBuilder;
 use arrow_schema::SchemaRef;
-use parquet::arrow::ProjectionMask;
 
 // Include the protobuf-generated code
 pub mod vector_tile {

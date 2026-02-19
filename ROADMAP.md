@@ -1,11 +1,11 @@
-# gpq2tiles Roadmap
+# gpq-tiles Roadmap
 
 Production-grade GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Python bindings.
 
 ## Architecture
 
 ```
-gpq2tiles/
+gpq-tiles/
 ├── crates/
 │   ├── core/          # All tiling logic
 │   ├── cli/           # Thin wrapper: args → core
@@ -72,7 +72,7 @@ Leverage Rust's concurrency for performance:
 Expose Python API via pyo3:
 
 ```python
-from gpq2tiles import convert
+from gpq-tiles import convert
 
 convert(
     input="buildings.parquet",
@@ -138,7 +138,7 @@ Specification-driven development. MVT encoding, PMTiles format, and tile coordin
 
 The initial release is complete when:
 
-- CLI produces valid PMTiles from GeoParquet: `gpq2tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14`
+- CLI produces valid PMTiles from GeoParquet: `gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14`
 - Output renders correctly in MapLibre at all zoom levels
 - Feature density appropriately decreases at lower zooms
 - Python `convert()` function works in production environments

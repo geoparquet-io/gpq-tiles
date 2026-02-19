@@ -1,6 +1,6 @@
 [package]
-name = "gpq2tiles-python"
-description = "Python bindings for gpq2tiles"
+name = "gpq-tiles-python"
+description = "Python bindings for gpq-tiles"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,9 +10,9 @@ repository.workspace = true
 homepage.workspace = true
 
 [lib]
-name = "gpq2tiles"
+name = "gpq_tiles"
 crate-type = ["cdylib"]
 
 [dependencies]
-gpq2tiles-core = { path = "../core" }
+gpq-tiles-core = { path = "../core" }
 pyo3 = { workspace = true }

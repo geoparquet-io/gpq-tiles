@@ -1,8 +1,8 @@
-# gpq2tiles
+# gpq-tiles
 
 [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
-[![Crates.io](https://img.shields.io/crates/v/gpq2tiles.svg)](https://crates.io/crates/gpq2tiles)
+[![Crates.io](https://img.shields.io/crates/v/gpq-tiles.svg)](https://crates.io/crates/gpq-tiles)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 A Rust library and CLI tool for converting GeoParquet files into PMTiles vector tile archives. Designed as a faster, more correct replacement for `gpio-pmtiles`, with native Python bindings for integration into the [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) ecosystem.
@@ -19,13 +19,13 @@ A Rust library and CLI tool for converting GeoParquet files into PMTiles vector 
 ### Rust CLI
 
 ```bash
-cargo install gpq2tiles
+cargo install gpq-tiles
 ```
 
 ### Python
 
 ```bash
-pip install gpq2tiles
+pip install gpq-tiles
 ```
 
 ### From Source
@@ -36,7 +36,7 @@ cd gpq-tiles
 cargo build --release
 ```
 
-The compiled binary will be in `target/release/gpq2tiles`.
+The compiled binary will be in `target/release/gpq-tiles`.
 
 ## Usage
 
@@ -44,19 +44,19 @@ The compiled binary will be in `target/release/gpq2tiles`.
 
 ```bash
 # Basic usage
-gpq2tiles input.parquet output.pmtiles
+gpq-tiles input.parquet output.pmtiles
 
 # With zoom levels
-gpq2tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 
 # With feature dropping control
-gpq2tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14 --drop-density low
+gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14 --drop-density low
 ```
 
 ### Python
 
 ```python
-from gpq2tiles import convert
+from gpq-tiles import convert
 
 convert(
     input="buildings.parquet",
@@ -69,7 +69,7 @@ convert(
 ### Rust Library
 
 ```rust
-use gpq2tiles_core::{Converter, Config};
+use gpq_tiles_core::{Converter, Config};
 
 let config = Config {
     min_zoom: 0,
@@ -117,7 +117,7 @@ converter.convert("input.parquet", "output.pmtiles")?;
 cargo build
 
 # Just the core library
-cargo build -p gpq2tiles-core
+cargo build -p gpq-tiles-core
 
 # Release build with optimizations
 cargo build --release
@@ -161,8 +161,8 @@ cargo doc --open
 ```
 gpq-tiles/
 ├── crates/
-│   ├── core/          # Core library (gpq2tiles-core)
-│   ├── cli/           # CLI binary (gpq2tiles)
+│   ├── core/          # Core library (gpq-tiles-core)
+│   ├── cli/           # CLI binary (gpq-tiles)
 │   └── python/        # Python bindings (pyo3)
 ├── tests/
 │   └── fixtures/      # Test GeoParquet files and expected outputs
@@ -172,9 +172,9 @@ gpq-tiles/
 
 ## Comparison to Tippecanoe
 
-`gpq2tiles` is inspired by [Tippecanoe](https://github.com/felt/tippecanoe) but optimized for the GeoParquet → PMTiles workflow:
+`gpq-tiles` is inspired by [Tippecanoe](https://github.com/felt/tippecanoe) but optimized for the GeoParquet → PMTiles workflow:
 
-| Feature | gpq2tiles | Tippecanoe |
+| Feature | gpq-tiles | Tippecanoe |
 |---------|-----------|------------|
 | Input format | GeoParquet | GeoJSON, CSV |
 | Output format | PMTiles | PMTiles, MBTiles |

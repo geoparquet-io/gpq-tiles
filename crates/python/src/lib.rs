@@ -1,8 +1,8 @@
-//! Python bindings for gpq2tiles
+//! Python bindings for gpq-tiles
 //!
-//! This module exposes the gpq2tiles-core functionality to Python via pyo3.
+//! This module exposes the gpq-tiles-core functionality to Python via pyo3.
 
-use gpq2tiles_core::{Config, Converter, DropDensity};
+use gpq_tiles_core::{Config, Converter, DropDensity};
 use pyo3::prelude::*;
 
 /// Convert GeoParquet to PMTiles
@@ -21,7 +21,7 @@ use pyo3::prelude::*;
 ///     Exception: If conversion fails
 ///
 /// Example:
-///     >>> from gpq2tiles import convert
+///     >>> from gpq_tiles import convert
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", min_zoom=0, max_zoom=14)
 #[pyfunction]
 #[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium"))]
@@ -62,11 +62,11 @@ fn convert(
     Ok(())
 }
 
-/// gpq2tiles: Fast GeoParquet to PMTiles converter
+/// gpq_tiles: Fast GeoParquet to PMTiles converter
 ///
-/// This module provides Python bindings for the gpq2tiles Rust library.
+/// This module provides Python bindings for the gpq-tiles Rust library.
 #[pymodule]
-fn gpq2tiles(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn gpq_tiles(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(convert, m)?)?;
     Ok(())
 }

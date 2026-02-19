@@ -22,9 +22,9 @@ This document summarizes what was created during initial repository setup.
 
 ```
 crates/
-├── core/          # gpq2tiles-core (library)
-├── cli/           # gpq2tiles (binary)
-└── python/        # gpq2tiles (pyo3 bindings)
+├── core/          # gpq-tiles-core (library)
+├── cli/           # gpq-tiles (binary)
+└── python/        # gpq-tiles (pyo3 bindings)
 ```
 
 Each crate has its own `Cargo.toml` configured.
@@ -41,7 +41,7 @@ Each crate has its own `Cargo.toml` configured.
 - **.github/workflows/mutation-tests.yml** - Weekly mutation testing
   - Runs every Sunday at 2 AM UTC
   - Can be triggered manually
-  - Tests `gpq2tiles-core` only
+  - Tests `gpq-tiles-core` only
 
 - **.github/dependabot.yml** - Automated dependency updates
   - Weekly Cargo dependency checks
@@ -194,7 +194,7 @@ cargo tarpaulin --out html
 cargo bench
 
 # Mutation tests (slow!)
-cargo mutants --package gpq2tiles-core
+cargo mutants --package gpq-tiles-core
 ```
 
 ## Documentation Links
