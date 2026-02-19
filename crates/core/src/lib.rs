@@ -20,6 +20,9 @@
 
 use std::path::Path;
 use thiserror::Error;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use geoparquet::reader::GeoParquetReaderBuilder;
+use arrow_schema::SchemaRef;
 
 // Include the protobuf-generated code
 pub mod vector_tile {
@@ -93,13 +96,16 @@ impl Converter {
 
     /// Convert a GeoParquet file to PMTiles
     ///
-    /// # Phase 1 Implementation (Stub)
+    /// # Phase 2 Progress
     ///
-    /// Currently produces an empty but valid PMTiles file.
-    /// Future phases will add:
-    /// - Phase 2: Actual tile generation with MVT encoding
-    /// - Phase 3: Feature dropping
-    /// - Phase 4: Parallelization
+    /// Currently:
+    /// - ✓ Reads GeoParquet with geoarrow
+    /// - TODO: Iterate features and extract geometries
+    /// - TODO: Calculate tile bounds
+    /// - TODO: Clip to tile bounds
+    /// - TODO: Simplify geometries
+    /// - TODO: Encode as MVT
+    /// - TODO: Write to PMTiles
     pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         input: P,
@@ -109,33 +115,74 @@ impl Converter {
         let output_path = output.as_ref();
 
         log::info!(
-            "Converting {} to {} (Phase 1: Stub implementation)",
+            "Converting {} to {}",
             input_path.display(),
             output_path.display()
         );
 
-        // Phase 1: Stub implementation
-        // TODO: Actually read GeoParquet with geoarrow
-        // TODO: Iterate features
-        // TODO: Write empty PMTiles with pmtiles crate
+        // Step 1: Read GeoParquet file
+        let (schema, num_rows) = self.read_geoparquet(input_path)?;
 
-        // For now, just verify the input exists
-        if !input_path.exists() {
-            return Err(Error::GeoParquetRead(format!(
-                "Input file does not exist: {}",
-                input_path.display()
-            )));
-        }
+        log::info!(
+            "Read GeoParquet: {} rows, {} columns",
+            num_rows,
+            schema.fields().len()
+        );
+
+        // TODO: Iterate features and generate tiles
 
         // Create empty output file as proof of concept
         std::fs::File::create(output_path)?;
 
         log::info!(
-            "Phase 1 complete: Created stub output at {}",
-            output_path.display()
+            "Phase 2 in progress: Read {} features from {}",
+            num_rows,
+            input_path.display()
         );
 
         Ok(())
+    }
+
+    /// Read a GeoParquet file and return schema + row count
+    fn read_geoparquet<P: AsRef<Path>>(&self, path: P) -> Result<(SchemaRef, usize)> {
+        let path = path.as_ref();
+
+        if !path.exists() {
+            return Err(Error::GeoParquetRead(format!(
+                "Input file does not exist: {}",
+                path.display()
+            )));
+        }
+
+        let file = std::fs::File::open(path)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
+
+        // Create parquet reader builder
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+        // Get GeoParquet metadata
+        let metadata_result = builder.geoparquet_metadata()
+            .ok_or_else(|| Error::GeoParquetRead("No GeoParquet metadata found".to_string()))?;
+
+        let metadata = metadata_result
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse GeoParquet metadata: {}", e)))?;
+
+        // Get schema with GeoArrow types (parse WKB to native GeoArrow)
+        let schema = builder.geoarrow_schema(
+            &metadata,
+            true,  // parse_wkb: convert WKB to native GeoArrow types
+            Default::default(),  // coord_type: use default coordinate type
+        ).map_err(|e| Error::GeoParquetRead(format!("Failed to infer schema: {}", e)))?;
+
+        // Get row count from metadata
+        let num_rows = builder.metadata().file_metadata().num_rows() as usize;
+
+        if num_rows == 0 {
+            log::warn!("GeoParquet file is empty");
+        }
+
+        Ok((schema, num_rows))
     }
 }
 
@@ -172,6 +219,23 @@ mod tests {
         match result {
             Err(Error::GeoParquetRead(_)) => {}, // Expected error type
             _ => panic!("Expected GeoParquetRead error"),
+        }
+    }
+
+    #[test]
+    fn test_read_geoparquet() {
+        let config = Config::default();
+        let converter = Converter::new(config);
+
+        let fixture = "../../tests/fixtures/realdata/open-buildings.parquet";
+
+        if Path::new(fixture).exists() {
+            let result = converter.read_geoparquet(fixture);
+            assert!(result.is_ok());
+
+            let (schema, num_rows) = result.unwrap();
+            assert!(num_rows > 0, "Should have rows");
+            assert!(schema.fields().len() > 0, "Should have columns");
         }
     }
 
