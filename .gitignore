@@ -32,6 +32,7 @@ ENV/
 # Test outputs
 tests/fixtures/output/
 *.pmtiles
+!tests/fixtures/golden/*.pmtiles
 *.mvt
 
 # Coverage
