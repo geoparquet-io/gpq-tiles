@@ -28,7 +28,692 @@
 
 ---
 
-## Task 1: PMTiles Writer - Header and Structures
+## Task 1: Geometry Extraction - Failing Test
+
+**Difficulty:** 3/10 | **Time:** 15 min
+
+**Files:**
+- Create: `crates/core/src/geometry.rs`
+- Modify: `crates/core/src/lib.rs`
+
+**Step 1: Write failing test**
+
+Create `crates/core/src/geometry.rs`:
+
+```rust
+//! Geometry extraction from GeoParquet files using geozero.
+
+use std::path::Path;
+use geo::Geometry;
+use crate::{Error, Result};
+use crate::tile::TileBounds;
+
+/// Extract geometries from a GeoParquet file
+pub fn extract_geometries(_path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
+    todo!("Implement geometry extraction")
+}
+
+/// Calculate bounding box of all geometries
+pub fn calculate_bbox(_path: &Path) -> Result<TileBounds> {
+    todo!("Implement bbox calculation")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_geometries_returns_geometries() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let geometries = extract_geometries(fixture).expect("Should extract");
+        assert!(!geometries.is_empty(), "Should have geometries");
+        assert!(geometries.len() > 100, "Should have many features");
+    }
+
+    #[test]
+    fn test_calculate_bbox_returns_valid_bounds() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
+
+        // Andorra bounds: ~1.4-1.8 lon, ~42.4-42.7 lat
+        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0);
+        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0);
+        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0);
+        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0);
+        assert!(bbox.lng_min > -180.0, "Should not be world bounds");
+    }
+}
+```
+
+**Step 2: Add module to lib.rs**
+
+```rust
+pub mod geometry;
+```
+
+**Step 3: Run test to verify it fails**
+
+Run: `cargo test --package gpq-tiles-core geometry -- --nocapture`
+Expected: FAIL with "not yet implemented"
+
+**Step 4: Commit failing test**
+
+```bash
+git add crates/core/src/geometry.rs crates/core/src/lib.rs
+git commit -m "test: add failing geometry extraction tests (TDD red)"
+```
+
+---
+
+## Task 2: Geometry Extraction - Implementation
+
+**Difficulty:** 5/10 | **Time:** 45 min
+
+**Files:**
+- Modify: `crates/core/src/geometry.rs`
+
+**Step 1: Implement using geozero**
+
+Replace content of `crates/core/src/geometry.rs`:
+
+```rust
+//! Geometry extraction from GeoParquet files using geozero.
+
+use std::path::Path;
+use geo::{Geometry, BoundingRect};
+use geozero::ToGeo;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use arrow_array::cast::AsArray;
+
+use crate::{Error, Result};
+use crate::tile::TileBounds;
+
+/// Extract geometries from a GeoParquet file
+pub fn extract_geometries(path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+    let reader = builder.build()
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+    let mut geometries = Vec::new();
+    let mut row_offset = 0;
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+        // Find geometry column (usually WKB binary)
+        let geom_idx = batch.schema().fields().iter()
+            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .ok_or_else(|| Error::GeoParquetRead("No geometry column".to_string()))?;
+
+        let geom_col = batch.column(geom_idx);
+
+        // Try as binary array (WKB)
+        if let Some(binary_array) = geom_col.as_binary_opt::<i32>() {
+            for i in 0..binary_array.len() {
+                if binary_array.is_null(i) {
+                    continue;
+                }
+                let wkb = binary_array.value(i);
+                if let Ok(geom) = geozero::wkb::Wkb(wkb.to_vec()).to_geo() {
+                    geometries.push((geom, row_offset + i));
+                }
+            }
+        } else if let Some(binary_array) = geom_col.as_binary_opt::<i64>() {
+            for i in 0..binary_array.len() {
+                if binary_array.is_null(i) {
+                    continue;
+                }
+                let wkb = binary_array.value(i);
+                if let Ok(geom) = geozero::wkb::Wkb(wkb.to_vec()).to_geo() {
+                    geometries.push((geom, row_offset + i));
+                }
+            }
+        } else {
+            return Err(Error::GeoParquetRead("Unsupported geometry format".to_string()));
+        }
+
+        row_offset += batch.num_rows();
+    }
+
+    Ok(geometries)
+}
+
+/// Calculate bounding box of all geometries
+pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
+    let geometries = extract_geometries(path)?;
+
+    if geometries.is_empty() {
+        return Err(Error::GeoParquetRead("No geometries found".to_string()));
+    }
+
+    let mut bounds = TileBounds::empty();
+
+    for (geom, _) in &geometries {
+        if let Some(rect) = geom.bounding_rect() {
+            bounds.expand(&TileBounds::new(
+                rect.min().x,
+                rect.min().y,
+                rect.max().x,
+                rect.max().y,
+            ));
+        }
+    }
+
+    if !bounds.is_valid() {
+        return Err(Error::GeoParquetRead("Invalid bounds".to_string()));
+    }
+
+    Ok(bounds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_geometries_returns_geometries() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let geometries = extract_geometries(fixture).expect("Should extract");
+        assert!(!geometries.is_empty(), "Should have geometries");
+        assert!(geometries.len() > 100, "Should have many features");
+    }
+
+    #[test]
+    fn test_calculate_bbox_returns_valid_bounds() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
+
+        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0);
+        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0);
+        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0);
+        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0);
+        assert!(bbox.lng_min > -180.0, "Should not be world bounds");
+    }
+}
+```
+
+**Step 2: Run tests**
+
+Run: `cargo test --package gpq-tiles-core geometry -- --nocapture`
+Expected: PASS
+
+**Step 3: Commit**
+
+```bash
+git add crates/core/src/geometry.rs
+git commit -m "feat: implement geometry extraction with geozero (TDD green)"
+```
+
+---
+
+## Task 3: Geometry Clipping
+
+**Difficulty:** 5/10 | **Time:** 45 min
+
+**Files:**
+- Create: `crates/core/src/clip.rs`
+- Modify: `crates/core/src/lib.rs`
+
+**Step 1: Implement clipping with correct BooleanOps usage**
+
+Create `crates/core/src/clip.rs`:
+
+```rust
+//! Geometry clipping to tile bounds.
+
+use geo::{Geometry, Point, LineString, Polygon, MultiPolygon, MultiLineString, Coord, Rect};
+use geo::algorithm::bool_ops::BooleanOps;
+use geo::algorithm::bounding_rect::BoundingRect;
+use crate::tile::TileBounds;
+
+/// Clip a geometry to tile bounds
+pub fn clip_geometry(geom: &Geometry<f64>, bounds: &TileBounds, buffer: f64) -> Option<Geometry<f64>> {
+    let buffered = TileBounds::new(
+        bounds.lng_min - buffer,
+        bounds.lat_min - buffer,
+        bounds.lng_max + buffer,
+        bounds.lat_max + buffer,
+    );
+
+    match geom {
+        Geometry::Point(p) => clip_point(p, &buffered).map(Geometry::Point),
+        Geometry::LineString(ls) => clip_linestring(ls, &buffered),
+        Geometry::Polygon(poly) => clip_polygon(poly, &buffered).map(Geometry::Polygon),
+        Geometry::MultiPolygon(mp) => clip_multipolygon(mp, &buffered).map(Geometry::MultiPolygon),
+        Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered),
+        other => {
+            if let Some(rect) = other.bounding_rect() {
+                if intersects_bounds(&rect, &buffered) {
+                    return Some(other.clone());
+                }
+            }
+            None
+        }
+    }
+}
+
+fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
+    rect.max().x >= bounds.lng_min
+        && rect.min().x <= bounds.lng_max
+        && rect.max().y >= bounds.lat_min
+        && rect.min().y <= bounds.lat_max
+}
+
+fn clip_point(point: &Point<f64>, bounds: &TileBounds) -> Option<Point<f64>> {
+    if point.x() >= bounds.lng_min
+        && point.x() <= bounds.lng_max
+        && point.y() >= bounds.lat_min
+        && point.y() <= bounds.lat_max
+    {
+        Some(*point)
+    } else {
+        None
+    }
+}
+
+fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+    let clip_rect = Rect::new(
+        Coord { x: bounds.lng_min, y: bounds.lat_min },
+        Coord { x: bounds.lng_max, y: bounds.lat_max },
+    );
+    let clip_poly = clip_rect.to_polygon();
+
+    // Correct usage: polygon.clip(&multilinestring, invert)
+    let mls = MultiLineString::new(vec![ls.clone()]);
+    let clipped = clip_poly.clip(&mls, false);
+
+    if clipped.0.is_empty() {
+        None
+    } else if clipped.0.len() == 1 {
+        Some(Geometry::LineString(clipped.0.into_iter().next().unwrap()))
+    } else {
+        Some(Geometry::MultiLineString(clipped))
+    }
+}
+
+fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+    let clip_rect = Rect::new(
+        Coord { x: bounds.lng_min, y: bounds.lat_min },
+        Coord { x: bounds.lng_max, y: bounds.lat_max },
+    );
+    let clip_poly = clip_rect.to_polygon();
+    let clipped = clip_poly.clip(mls, false);
+
+    if clipped.0.is_empty() {
+        None
+    } else {
+        Some(Geometry::MultiLineString(clipped))
+    }
+}
+
+fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Polygon<f64>> {
+    let clip_rect = Rect::new(
+        Coord { x: bounds.lng_min, y: bounds.lat_min },
+        Coord { x: bounds.lng_max, y: bounds.lat_max },
+    );
+    let clip_poly = clip_rect.to_polygon();
+    let clipped = poly.intersection(&clip_poly);
+
+    if clipped.0.is_empty() {
+        None
+    } else {
+        Some(clipped.0.into_iter().next().unwrap())
+    }
+}
+
+fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
+    let clip_rect = Rect::new(
+        Coord { x: bounds.lng_min, y: bounds.lat_min },
+        Coord { x: bounds.lng_max, y: bounds.lat_max },
+    );
+    let clip_poly = clip_rect.to_polygon();
+    let clipped = mp.intersection(&clip_poly);
+
+    if clipped.0.is_empty() {
+        None
+    } else {
+        Some(clipped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geo::point;
+
+    #[test]
+    fn test_clip_point_inside() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let point = point!(x: 5.0, y: 5.0);
+        assert!(clip_point(&point, &bounds).is_some());
+    }
+
+    #[test]
+    fn test_clip_point_outside() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let point = point!(x: 15.0, y: 5.0);
+        assert!(clip_point(&point, &bounds).is_none());
+    }
+
+    #[test]
+    fn test_clip_polygon_partial() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -5.0, y: -5.0 },
+                Coord { x: 5.0, y: -5.0 },
+                Coord { x: 5.0, y: 5.0 },
+                Coord { x: -5.0, y: 5.0 },
+                Coord { x: -5.0, y: -5.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon(&poly, &bounds);
+        assert!(result.is_some());
+
+        let clipped = result.unwrap();
+        for coord in clipped.exterior().coords() {
+            assert!(coord.x >= 0.0 && coord.x <= 10.0);
+            assert!(coord.y >= 0.0 && coord.y <= 10.0);
+        }
+    }
+
+    #[test]
+    fn test_clip_polygon_outside() {
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 20.0, y: 20.0 },
+                Coord { x: 30.0, y: 20.0 },
+                Coord { x: 30.0, y: 30.0 },
+                Coord { x: 20.0, y: 30.0 },
+                Coord { x: 20.0, y: 20.0 },
+            ]),
+            vec![],
+        );
+        assert!(clip_polygon(&poly, &bounds).is_none());
+    }
+}
+```
+
+**Step 2: Add module**
+
+```rust
+pub mod clip;
+```
+
+**Step 3: Run tests**
+
+Run: `cargo test --package gpq-tiles-core clip -- --nocapture`
+Expected: PASS
+
+**Step 4: Commit**
+
+```bash
+git add crates/core/src/clip.rs crates/core/src/lib.rs
+git commit -m "feat: implement geometry clipping with correct BooleanOps"
+```
+
+---
+
+## Task 4: Simplification
+
+**Difficulty:** 3/10 | **Time:** 20 min
+
+**Files:**
+- Create: `crates/core/src/simplify.rs`
+- Modify: `crates/core/src/lib.rs`
+
+**Step 1: Implement simplification**
+
+Create `crates/core/src/simplify.rs`:
+
+```rust
+//! Zoom-based geometry simplification.
+
+use geo::{Geometry, Simplify};
+
+/// Simplify geometry for zoom level
+pub fn simplify_for_zoom(geom: &Geometry<f64>, zoom: u8, extent: u32) -> Geometry<f64> {
+    let tile_degrees = 360.0 / (1u64 << zoom) as f64;
+    let pixel_degrees = tile_degrees / extent as f64;
+    let tolerance = pixel_degrees * 2.0;
+
+    if tolerance < 1e-10 {
+        return geom.clone();
+    }
+
+    match geom {
+        Geometry::Point(_) | Geometry::MultiPoint(_) => geom.clone(),
+        Geometry::LineString(ls) => Geometry::LineString(ls.simplify(&tolerance)),
+        Geometry::Polygon(poly) => Geometry::Polygon(poly.simplify(&tolerance)),
+        Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(mp.simplify(&tolerance)),
+        Geometry::MultiLineString(mls) => Geometry::MultiLineString(mls.simplify(&tolerance)),
+        other => other.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geo::{LineString, Coord};
+
+    #[test]
+    fn test_simplify_reduces_vertices() {
+        let coords: Vec<Coord<f64>> = (0..100)
+            .map(|i| Coord { x: i as f64 * 0.01, y: (i as f64 * 0.1).sin() * 0.001 })
+            .collect();
+        let line = LineString::new(coords);
+        let geom = Geometry::LineString(line.clone());
+
+        let simplified = simplify_for_zoom(&geom, 0, 4096);
+        if let Geometry::LineString(s) = simplified {
+            assert!(s.coords().count() < line.coords().count());
+        }
+    }
+
+    #[test]
+    fn test_points_unchanged() {
+        let point = Geometry::Point(geo::point!(x: 1.0, y: 2.0));
+        assert_eq!(point, simplify_for_zoom(&point, 5, 4096));
+    }
+}
+```
+
+**Step 2: Add module, run tests, commit**
+
+```bash
+# Add to lib.rs: pub mod simplify;
+cargo test --package gpq-tiles-core simplify -- --nocapture
+git add crates/core/src/simplify.rs crates/core/src/lib.rs
+git commit -m "feat: implement zoom-based simplification"
+```
+
+---
+
+## Task 5: MVT Encoding
+
+**Difficulty:** 5/10 | **Time:** 45 min
+
+**Files:**
+- Create: `crates/core/src/mvt.rs`
+- Modify: `crates/core/src/lib.rs`
+
+**Step 1: Implement MVT encoding (zigzag, delta, commands)**
+
+Create `crates/core/src/mvt.rs`:
+
+```rust
+//! MVT encoding utilities.
+
+use geo::{Coord, LineString, Polygon};
+use crate::tile::TileBounds;
+
+pub fn zigzag_encode(n: i32) -> u32 {
+    ((n << 1) ^ (n >> 31)) as u32
+}
+
+pub fn zigzag_decode(n: u32) -> i32 {
+    ((n >> 1) as i32) ^ (-((n & 1) as i32))
+}
+
+pub fn geo_to_tile_coords(coord: Coord<f64>, bounds: &TileBounds, extent: u32) -> (i32, i32) {
+    let x = ((coord.x - bounds.lng_min) / bounds.width() * extent as f64).round() as i32;
+    let y = ((bounds.lat_max - coord.y) / bounds.height() * extent as f64).round() as i32;
+    (x, y)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Command { MoveTo, LineTo, ClosePath }
+
+impl Command {
+    fn id(self) -> u32 {
+        match self { Command::MoveTo => 1, Command::LineTo => 2, Command::ClosePath => 7 }
+    }
+}
+
+pub fn encode_command(cmd: Command, count: u32) -> u32 {
+    (cmd.id() & 0x7) | (count << 3)
+}
+
+pub fn decode_command(cmd_int: u32) -> (Command, u32) {
+    let id = cmd_int & 0x7;
+    let count = cmd_int >> 3;
+    let cmd = match id { 1 => Command::MoveTo, 2 => Command::LineTo, 7 => Command::ClosePath, _ => panic!("Unknown") };
+    (cmd, count)
+}
+
+pub fn encode_polygon(poly: &Polygon<f64>, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+    let mut cmds = Vec::new();
+    encode_ring(&mut cmds, poly.exterior(), bounds, extent);
+    for interior in poly.interiors() {
+        encode_ring(&mut cmds, interior, bounds, extent);
+    }
+    cmds
+}
+
+pub fn encode_linestring(ls: &LineString<f64>, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+    let mut cmds = Vec::new();
+    if ls.coords().count() < 2 { return cmds; }
+
+    let coords: Vec<_> = ls.coords().map(|c| geo_to_tile_coords(*c, bounds, extent)).collect();
+
+    cmds.push(encode_command(Command::MoveTo, 1));
+    cmds.push(zigzag_encode(coords[0].0));
+    cmds.push(zigzag_encode(coords[0].1));
+
+    if coords.len() > 1 {
+        cmds.push(encode_command(Command::LineTo, (coords.len() - 1) as u32));
+        let (mut px, mut py) = coords[0];
+        for &(x, y) in &coords[1..] {
+            cmds.push(zigzag_encode(x - px));
+            cmds.push(zigzag_encode(y - py));
+            px = x; py = y;
+        }
+    }
+    cmds
+}
+
+fn encode_ring(cmds: &mut Vec<u32>, ring: &LineString<f64>, bounds: &TileBounds, extent: u32) {
+    if ring.coords().count() < 4 { return; }
+
+    let coords: Vec<_> = ring.coords().take(ring.coords().count() - 1)
+        .map(|c| geo_to_tile_coords(*c, bounds, extent)).collect();
+
+    if coords.is_empty() { return; }
+
+    cmds.push(encode_command(Command::MoveTo, 1));
+    cmds.push(zigzag_encode(coords[0].0));
+    cmds.push(zigzag_encode(coords[0].1));
+
+    if coords.len() > 1 {
+        cmds.push(encode_command(Command::LineTo, (coords.len() - 1) as u32));
+        let (mut px, mut py) = coords[0];
+        for &(x, y) in &coords[1..] {
+            cmds.push(zigzag_encode(x - px));
+            cmds.push(zigzag_encode(y - py));
+            px = x; py = y;
+        }
+    }
+    cmds.push(encode_command(Command::ClosePath, 1));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_zigzag() {
+        assert_eq!(zigzag_encode(0), 0);
+        assert_eq!(zigzag_encode(-1), 1);
+        assert_eq!(zigzag_encode(1), 2);
+        for i in -1000..1000 { assert_eq!(zigzag_decode(zigzag_encode(i)), i); }
+    }
+
+    #[test]
+    fn test_commands() {
+        assert_eq!(encode_command(Command::MoveTo, 1), 9);
+        assert_eq!(decode_command(9), (Command::MoveTo, 1));
+    }
+}
+```
+
+**Step 2: Add module, run tests, commit**
+
+```bash
+cargo test --package gpq-tiles-core mvt -- --nocapture
+git add crates/core/src/mvt.rs crates/core/src/lib.rs
+git commit -m "feat: implement MVT encoding"
+```
+
+---
+
+## Task 6: Tile Generation Pipeline
+
+**Difficulty:** 5/10 | **Time:** 45 min
+
+**Files:**
+- Create: `crates/core/src/tiler.rs`
+- Modify: `crates/core/src/lib.rs`
+
+**Step 1: Implement tile generation**
+
+Create `crates/core/src/tiler.rs` with the pipeline that ties geometry → clip → simplify → encode.
+
+*(Code similar to original plan but using correct modules)*
+
+**Step 2: Run tests, commit**
+
+---
+
+## Task 7: PMTiles Writer - Header and Structures
 
 **Difficulty:** 5/10 | **Time:** 45 min
 
@@ -306,7 +991,7 @@ git commit -m "feat: add PMTiles v3 header and tile ID calculation"
 
 ---
 
-## Task 2: PMTiles Writer - Directory Encoding
+## Task 8: PMTiles Writer - Directory Encoding
 
 **Difficulty:** 6/10 | **Time:** 45 min
 
@@ -443,7 +1128,7 @@ git commit -m "feat: add PMTiles directory encoding with varints"
 
 ---
 
-## Task 3: PMTiles Writer - Full Writer
+## Task 9: PMTiles Writer - Full Writer
 
 **Difficulty:** 6/10 | **Time:** 60 min
 
@@ -634,692 +1319,6 @@ git commit -m "feat: implement full PMTiles v3 writer"
 
 ---
 
-## Task 4: Geometry Extraction with Geozero
-
-**Difficulty:** 5/10 | **Time:** 45 min
-
-**Files:**
-- Create: `crates/core/src/geometry.rs`
-- Modify: `crates/core/src/lib.rs`
-
-**Step 1: Write failing test**
-
-Create `crates/core/src/geometry.rs`:
-
-```rust
-//! Geometry extraction from GeoParquet files using geozero.
-
-use std::path::Path;
-use geo::Geometry;
-use crate::{Error, Result};
-use crate::tile::TileBounds;
-
-/// Extract geometries from a GeoParquet file
-pub fn extract_geometries(_path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
-    todo!("Implement geometry extraction")
-}
-
-/// Calculate bounding box of all geometries
-pub fn calculate_bbox(_path: &Path) -> Result<TileBounds> {
-    todo!("Implement bbox calculation")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_geometries_returns_geometries() {
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        let geometries = extract_geometries(fixture).expect("Should extract");
-        assert!(!geometries.is_empty(), "Should have geometries");
-        assert!(geometries.len() > 100, "Should have many features");
-    }
-
-    #[test]
-    fn test_calculate_bbox_returns_valid_bounds() {
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
-
-        // Andorra bounds: ~1.4-1.8 lon, ~42.4-42.7 lat
-        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0);
-        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0);
-        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0);
-        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0);
-        assert!(bbox.lng_min > -180.0, "Should not be world bounds");
-    }
-}
-```
-
-**Step 2: Add module to lib.rs**
-
-```rust
-pub mod geometry;
-```
-
-**Step 3: Run test to verify it fails**
-
-Run: `cargo test --package gpq-tiles-core geometry -- --nocapture`
-Expected: FAIL with "not yet implemented"
-
-**Step 4: Commit failing test**
-
-```bash
-git add crates/core/src/geometry.rs crates/core/src/lib.rs
-git commit -m "test: add failing geometry extraction tests (TDD red)"
-```
-
----
-
-## Task 5: Geometry Extraction - Implementation
-
-**Difficulty:** 5/10 | **Time:** 45 min
-
-**Files:**
-- Modify: `crates/core/src/geometry.rs`
-
-**Step 1: Implement using geozero**
-
-Replace content of `crates/core/src/geometry.rs`:
-
-```rust
-//! Geometry extraction from GeoParquet files using geozero.
-
-use std::path::Path;
-use geo::{Geometry, BoundingRect};
-use geozero::ToGeo;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow_array::cast::AsArray;
-use arrow_array::types::GenericBinaryType;
-
-use crate::{Error, Result};
-use crate::tile::TileBounds;
-
-/// Extract geometries from a GeoParquet file
-pub fn extract_geometries(path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
-    let file = std::fs::File::open(path)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
-
-    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
-
-    let reader = builder.build()
-        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
-
-    let mut geometries = Vec::new();
-    let mut row_offset = 0;
-
-    for batch_result in reader {
-        let batch = batch_result
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
-
-        // Find geometry column (usually WKB binary)
-        let geom_idx = batch.schema().fields().iter()
-            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
-            .ok_or_else(|| Error::GeoParquetRead("No geometry column".to_string()))?;
-
-        let geom_col = batch.column(geom_idx);
-
-        // Try as binary array (WKB)
-        if let Some(binary_array) = geom_col.as_binary_opt::<i32>() {
-            for i in 0..binary_array.len() {
-                if binary_array.is_null(i) {
-                    continue;
-                }
-                let wkb = binary_array.value(i);
-                if let Ok(geom) = geozero::wkb::Wkb(wkb.to_vec()).to_geo() {
-                    geometries.push((geom, row_offset + i));
-                }
-            }
-        } else if let Some(binary_array) = geom_col.as_binary_opt::<i64>() {
-            for i in 0..binary_array.len() {
-                if binary_array.is_null(i) {
-                    continue;
-                }
-                let wkb = binary_array.value(i);
-                if let Ok(geom) = geozero::wkb::Wkb(wkb.to_vec()).to_geo() {
-                    geometries.push((geom, row_offset + i));
-                }
-            }
-        } else {
-            return Err(Error::GeoParquetRead("Unsupported geometry format".to_string()));
-        }
-
-        row_offset += batch.num_rows();
-    }
-
-    Ok(geometries)
-}
-
-/// Calculate bounding box of all geometries
-pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
-    let geometries = extract_geometries(path)?;
-
-    if geometries.is_empty() {
-        return Err(Error::GeoParquetRead("No geometries found".to_string()));
-    }
-
-    let mut bounds = TileBounds::empty();
-
-    for (geom, _) in &geometries {
-        if let Some(rect) = geom.bounding_rect() {
-            bounds.expand(&TileBounds::new(
-                rect.min().x,
-                rect.min().y,
-                rect.max().x,
-                rect.max().y,
-            ));
-        }
-    }
-
-    if !bounds.is_valid() {
-        return Err(Error::GeoParquetRead("Invalid bounds".to_string()));
-    }
-
-    Ok(bounds)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_geometries_returns_geometries() {
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        let geometries = extract_geometries(fixture).expect("Should extract");
-        assert!(!geometries.is_empty(), "Should have geometries");
-        assert!(geometries.len() > 100, "Should have many features");
-    }
-
-    #[test]
-    fn test_calculate_bbox_returns_valid_bounds() {
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
-
-        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0);
-        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0);
-        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0);
-        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0);
-        assert!(bbox.lng_min > -180.0, "Should not be world bounds");
-    }
-}
-```
-
-**Step 2: Run tests**
-
-Run: `cargo test --package gpq-tiles-core geometry -- --nocapture`
-Expected: PASS
-
-**Step 3: Commit**
-
-```bash
-git add crates/core/src/geometry.rs
-git commit -m "feat: implement geometry extraction with geozero (TDD green)"
-```
-
----
-
-## Task 6: Geometry Clipping
-
-**Difficulty:** 5/10 | **Time:** 45 min
-
-**Files:**
-- Create: `crates/core/src/clip.rs`
-- Modify: `crates/core/src/lib.rs`
-
-**Step 1: Implement clipping with correct BooleanOps usage**
-
-Create `crates/core/src/clip.rs`:
-
-```rust
-//! Geometry clipping to tile bounds.
-
-use geo::{Geometry, Point, LineString, Polygon, MultiPolygon, MultiLineString, Coord, Rect};
-use geo::algorithm::bool_ops::BooleanOps;
-use geo::algorithm::bounding_rect::BoundingRect;
-use crate::tile::TileBounds;
-
-/// Clip a geometry to tile bounds
-pub fn clip_geometry(geom: &Geometry<f64>, bounds: &TileBounds, buffer: f64) -> Option<Geometry<f64>> {
-    let buffered = TileBounds::new(
-        bounds.lng_min - buffer,
-        bounds.lat_min - buffer,
-        bounds.lng_max + buffer,
-        bounds.lat_max + buffer,
-    );
-
-    match geom {
-        Geometry::Point(p) => clip_point(p, &buffered).map(Geometry::Point),
-        Geometry::LineString(ls) => clip_linestring(ls, &buffered),
-        Geometry::Polygon(poly) => clip_polygon(poly, &buffered).map(Geometry::Polygon),
-        Geometry::MultiPolygon(mp) => clip_multipolygon(mp, &buffered).map(Geometry::MultiPolygon),
-        Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered),
-        other => {
-            if let Some(rect) = other.bounding_rect() {
-                if intersects_bounds(&rect, &buffered) {
-                    return Some(other.clone());
-                }
-            }
-            None
-        }
-    }
-}
-
-fn intersects_bounds(rect: &Rect<f64>, bounds: &TileBounds) -> bool {
-    rect.max().x >= bounds.lng_min
-        && rect.min().x <= bounds.lng_max
-        && rect.max().y >= bounds.lat_min
-        && rect.min().y <= bounds.lat_max
-}
-
-fn clip_point(point: &Point<f64>, bounds: &TileBounds) -> Option<Point<f64>> {
-    if point.x() >= bounds.lng_min
-        && point.x() <= bounds.lng_max
-        && point.y() >= bounds.lat_min
-        && point.y() <= bounds.lat_max
-    {
-        Some(*point)
-    } else {
-        None
-    }
-}
-
-fn clip_linestring(ls: &LineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
-    let clip_rect = Rect::new(
-        Coord { x: bounds.lng_min, y: bounds.lat_min },
-        Coord { x: bounds.lng_max, y: bounds.lat_max },
-    );
-    let clip_poly = clip_rect.to_polygon();
-
-    // Correct usage: polygon.clip(&multilinestring, invert)
-    let mls = MultiLineString::new(vec![ls.clone()]);
-    let clipped = clip_poly.clip(&mls, false);
-
-    if clipped.0.is_empty() {
-        None
-    } else if clipped.0.len() == 1 {
-        Some(Geometry::LineString(clipped.0.into_iter().next().unwrap()))
-    } else {
-        Some(Geometry::MultiLineString(clipped))
-    }
-}
-
-fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
-    let clip_rect = Rect::new(
-        Coord { x: bounds.lng_min, y: bounds.lat_min },
-        Coord { x: bounds.lng_max, y: bounds.lat_max },
-    );
-    let clip_poly = clip_rect.to_polygon();
-    let clipped = clip_poly.clip(mls, false);
-
-    if clipped.0.is_empty() {
-        None
-    } else {
-        Some(Geometry::MultiLineString(clipped))
-    }
-}
-
-fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Polygon<f64>> {
-    let clip_rect = Rect::new(
-        Coord { x: bounds.lng_min, y: bounds.lat_min },
-        Coord { x: bounds.lng_max, y: bounds.lat_max },
-    );
-    let clip_poly = clip_rect.to_polygon();
-    let clipped = poly.intersection(&clip_poly);
-
-    if clipped.0.is_empty() {
-        None
-    } else {
-        Some(clipped.0.into_iter().next().unwrap())
-    }
-}
-
-fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
-    let clip_rect = Rect::new(
-        Coord { x: bounds.lng_min, y: bounds.lat_min },
-        Coord { x: bounds.lng_max, y: bounds.lat_max },
-    );
-    let clip_poly = clip_rect.to_polygon();
-    let clipped = mp.intersection(&clip_poly);
-
-    if clipped.0.is_empty() {
-        None
-    } else {
-        Some(clipped)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use geo::point;
-
-    #[test]
-    fn test_clip_point_inside() {
-        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let point = point!(x: 5.0, y: 5.0);
-        assert!(clip_point(&point, &bounds).is_some());
-    }
-
-    #[test]
-    fn test_clip_point_outside() {
-        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let point = point!(x: 15.0, y: 5.0);
-        assert!(clip_point(&point, &bounds).is_none());
-    }
-
-    #[test]
-    fn test_clip_polygon_partial() {
-        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let poly = Polygon::new(
-            LineString::from(vec![
-                Coord { x: -5.0, y: -5.0 },
-                Coord { x: 5.0, y: -5.0 },
-                Coord { x: 5.0, y: 5.0 },
-                Coord { x: -5.0, y: 5.0 },
-                Coord { x: -5.0, y: -5.0 },
-            ]),
-            vec![],
-        );
-
-        let result = clip_polygon(&poly, &bounds);
-        assert!(result.is_some());
-
-        let clipped = result.unwrap();
-        for coord in clipped.exterior().coords() {
-            assert!(coord.x >= 0.0 && coord.x <= 10.0);
-            assert!(coord.y >= 0.0 && coord.y <= 10.0);
-        }
-    }
-
-    #[test]
-    fn test_clip_polygon_outside() {
-        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
-        let poly = Polygon::new(
-            LineString::from(vec![
-                Coord { x: 20.0, y: 20.0 },
-                Coord { x: 30.0, y: 20.0 },
-                Coord { x: 30.0, y: 30.0 },
-                Coord { x: 20.0, y: 30.0 },
-                Coord { x: 20.0, y: 20.0 },
-            ]),
-            vec![],
-        );
-        assert!(clip_polygon(&poly, &bounds).is_none());
-    }
-}
-```
-
-**Step 2: Add module**
-
-```rust
-pub mod clip;
-```
-
-**Step 3: Run tests**
-
-Run: `cargo test --package gpq-tiles-core clip -- --nocapture`
-Expected: PASS
-
-**Step 4: Commit**
-
-```bash
-git add crates/core/src/clip.rs crates/core/src/lib.rs
-git commit -m "feat: implement geometry clipping with correct BooleanOps"
-```
-
----
-
-## Task 7: Simplification
-
-**Difficulty:** 3/10 | **Time:** 20 min
-
-**Files:**
-- Create: `crates/core/src/simplify.rs`
-- Modify: `crates/core/src/lib.rs`
-
-**Step 1: Implement simplification**
-
-Create `crates/core/src/simplify.rs`:
-
-```rust
-//! Zoom-based geometry simplification.
-
-use geo::{Geometry, Simplify};
-
-/// Simplify geometry for zoom level
-pub fn simplify_for_zoom(geom: &Geometry<f64>, zoom: u8, extent: u32) -> Geometry<f64> {
-    let tile_degrees = 360.0 / (1u64 << zoom) as f64;
-    let pixel_degrees = tile_degrees / extent as f64;
-    let tolerance = pixel_degrees * 2.0;
-
-    if tolerance < 1e-10 {
-        return geom.clone();
-    }
-
-    match geom {
-        Geometry::Point(_) | Geometry::MultiPoint(_) => geom.clone(),
-        Geometry::LineString(ls) => Geometry::LineString(ls.simplify(&tolerance)),
-        Geometry::Polygon(poly) => Geometry::Polygon(poly.simplify(&tolerance)),
-        Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(mp.simplify(&tolerance)),
-        Geometry::MultiLineString(mls) => Geometry::MultiLineString(mls.simplify(&tolerance)),
-        other => other.clone(),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use geo::{LineString, Coord};
-
-    #[test]
-    fn test_simplify_reduces_vertices() {
-        let coords: Vec<Coord<f64>> = (0..100)
-            .map(|i| Coord { x: i as f64 * 0.01, y: (i as f64 * 0.1).sin() * 0.001 })
-            .collect();
-        let line = LineString::new(coords);
-        let geom = Geometry::LineString(line.clone());
-
-        let simplified = simplify_for_zoom(&geom, 0, 4096);
-        if let Geometry::LineString(s) = simplified {
-            assert!(s.coords().count() < line.coords().count());
-        }
-    }
-
-    #[test]
-    fn test_points_unchanged() {
-        let point = Geometry::Point(geo::point!(x: 1.0, y: 2.0));
-        assert_eq!(point, simplify_for_zoom(&point, 5, 4096));
-    }
-}
-```
-
-**Step 2: Add module, run tests, commit**
-
-```bash
-# Add to lib.rs: pub mod simplify;
-cargo test --package gpq-tiles-core simplify -- --nocapture
-git add crates/core/src/simplify.rs crates/core/src/lib.rs
-git commit -m "feat: implement zoom-based simplification"
-```
-
----
-
-## Task 8: MVT Encoding
-
-**Difficulty:** 5/10 | **Time:** 45 min
-
-**Files:**
-- Create: `crates/core/src/mvt.rs`
-- Modify: `crates/core/src/lib.rs`
-
-**Step 1: Implement MVT encoding (zigzag, delta, commands)**
-
-Create `crates/core/src/mvt.rs`:
-
-```rust
-//! MVT encoding utilities.
-
-use geo::{Coord, LineString, Polygon};
-use crate::tile::TileBounds;
-
-pub fn zigzag_encode(n: i32) -> u32 {
-    ((n << 1) ^ (n >> 31)) as u32
-}
-
-pub fn zigzag_decode(n: u32) -> i32 {
-    ((n >> 1) as i32) ^ (-((n & 1) as i32))
-}
-
-pub fn geo_to_tile_coords(coord: Coord<f64>, bounds: &TileBounds, extent: u32) -> (i32, i32) {
-    let x = ((coord.x - bounds.lng_min) / bounds.width() * extent as f64).round() as i32;
-    let y = ((bounds.lat_max - coord.y) / bounds.height() * extent as f64).round() as i32;
-    (x, y)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Command { MoveTo, LineTo, ClosePath }
-
-impl Command {
-    fn id(self) -> u32 {
-        match self { Command::MoveTo => 1, Command::LineTo => 2, Command::ClosePath => 7 }
-    }
-}
-
-pub fn encode_command(cmd: Command, count: u32) -> u32 {
-    (cmd.id() & 0x7) | (count << 3)
-}
-
-pub fn decode_command(cmd_int: u32) -> (Command, u32) {
-    let id = cmd_int & 0x7;
-    let count = cmd_int >> 3;
-    let cmd = match id { 1 => Command::MoveTo, 2 => Command::LineTo, 7 => Command::ClosePath, _ => panic!("Unknown") };
-    (cmd, count)
-}
-
-pub fn encode_polygon(poly: &Polygon<f64>, bounds: &TileBounds, extent: u32) -> Vec<u32> {
-    let mut cmds = Vec::new();
-    encode_ring(&mut cmds, poly.exterior(), bounds, extent);
-    for interior in poly.interiors() {
-        encode_ring(&mut cmds, interior, bounds, extent);
-    }
-    cmds
-}
-
-pub fn encode_linestring(ls: &LineString<f64>, bounds: &TileBounds, extent: u32) -> Vec<u32> {
-    let mut cmds = Vec::new();
-    if ls.coords().count() < 2 { return cmds; }
-
-    let coords: Vec<_> = ls.coords().map(|c| geo_to_tile_coords(*c, bounds, extent)).collect();
-
-    cmds.push(encode_command(Command::MoveTo, 1));
-    cmds.push(zigzag_encode(coords[0].0));
-    cmds.push(zigzag_encode(coords[0].1));
-
-    if coords.len() > 1 {
-        cmds.push(encode_command(Command::LineTo, (coords.len() - 1) as u32));
-        let (mut px, mut py) = coords[0];
-        for &(x, y) in &coords[1..] {
-            cmds.push(zigzag_encode(x - px));
-            cmds.push(zigzag_encode(y - py));
-            px = x; py = y;
-        }
-    }
-    cmds
-}
-
-fn encode_ring(cmds: &mut Vec<u32>, ring: &LineString<f64>, bounds: &TileBounds, extent: u32) {
-    if ring.coords().count() < 4 { return; }
-
-    let coords: Vec<_> = ring.coords().take(ring.coords().count() - 1)
-        .map(|c| geo_to_tile_coords(*c, bounds, extent)).collect();
-
-    if coords.is_empty() { return; }
-
-    cmds.push(encode_command(Command::MoveTo, 1));
-    cmds.push(zigzag_encode(coords[0].0));
-    cmds.push(zigzag_encode(coords[0].1));
-
-    if coords.len() > 1 {
-        cmds.push(encode_command(Command::LineTo, (coords.len() - 1) as u32));
-        let (mut px, mut py) = coords[0];
-        for &(x, y) in &coords[1..] {
-            cmds.push(zigzag_encode(x - px));
-            cmds.push(zigzag_encode(y - py));
-            px = x; py = y;
-        }
-    }
-    cmds.push(encode_command(Command::ClosePath, 1));
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_zigzag() {
-        assert_eq!(zigzag_encode(0), 0);
-        assert_eq!(zigzag_encode(-1), 1);
-        assert_eq!(zigzag_encode(1), 2);
-        for i in -1000..1000 { assert_eq!(zigzag_decode(zigzag_encode(i)), i); }
-    }
-
-    #[test]
-    fn test_commands() {
-        assert_eq!(encode_command(Command::MoveTo, 1), 9);
-        assert_eq!(decode_command(9), (Command::MoveTo, 1));
-    }
-}
-```
-
-**Step 2: Add module, run tests, commit**
-
-```bash
-cargo test --package gpq-tiles-core mvt -- --nocapture
-git add crates/core/src/mvt.rs crates/core/src/lib.rs
-git commit -m "feat: implement MVT encoding"
-```
-
----
-
-## Task 9: Tile Generation Pipeline
-
-**Difficulty:** 5/10 | **Time:** 45 min
-
-**Files:**
-- Create: `crates/core/src/tiler.rs`
-- Modify: `crates/core/src/lib.rs`
-
-**Step 1: Implement tile generation**
-
-Create `crates/core/src/tiler.rs` with the pipeline that ties geometry → clip → simplify → encode.
-
-*(Code similar to original plan but using correct modules)*
-
-**Step 2: Run tests, commit**
-
----
-
 ## Task 10: Integration and Golden Tests
 
 **Difficulty:** 4/10 | **Time:** 30 min
@@ -1349,15 +1348,15 @@ Use `dtolnay/rust-toolchain` (not `rust-action`).
 
 | Task | Description | Difficulty | Time Est. |
 |------|-------------|------------|-----------|
-| 1 | PMTiles Writer - Header | 5/10 | 45 min |
-| 2 | PMTiles Writer - Directory | 6/10 | 45 min |
-| 3 | PMTiles Writer - Full | 6/10 | 60 min |
-| 4 | Geometry Extraction - Test | 3/10 | 15 min |
-| 5 | Geometry Extraction - Impl | 5/10 | 45 min |
-| 6 | Clipping | 5/10 | 45 min |
-| 7 | Simplification | 3/10 | 20 min |
-| 8 | MVT Encoding | 5/10 | 45 min |
-| 9 | Tile Pipeline | 5/10 | 45 min |
+| 1 | Geometry Extraction - Test | 3/10 | 15 min |
+| 2 | Geometry Extraction - Impl | 5/10 | 45 min |
+| 3 | Clipping | 5/10 | 45 min |
+| 4 | Simplification | 3/10 | 20 min |
+| 5 | MVT Encoding | 5/10 | 45 min |
+| 6 | Tile Pipeline | 5/10 | 45 min |
+| 7 | PMTiles Writer - Header | 5/10 | 45 min |
+| 8 | PMTiles Writer - Directory | 6/10 | 45 min |
+| 9 | PMTiles Writer - Full | 6/10 | 60 min |
 | 10 | Integration Tests | 4/10 | 30 min |
 | 11 | CI Configuration | 2/10 | 15 min |
 
@@ -1369,9 +1368,9 @@ Use `dtolnay/rust-toolchain` (not `rust-action`).
 
 ## Key Changes from Original Plan
 
-1. **Tasks 1-3 (NEW)**: PMTiles v3 writer from scratch instead of using non-existent `pmtiles` write API
-2. **Task 5**: Use `geozero` for WKB parsing instead of complex geoarrow accessor pattern
-3. **Task 6**: Fixed `BooleanOps::clip()` signature - polygon clips linestring, not vice versa
-4. **Task 11**: Fixed CI action name: `dtolnay/rust-toolchain`
+1. **Task Order Corrected**: Geometry extraction, clipping, simplification, and MVT encoding now come FIRST (Tasks 1-6). PMTiles writer is LAST (Tasks 7-9) since you need tiles to exist before you can write them.
+2. **Geometry Extraction**: Use `geozero` for WKB parsing instead of complex geoarrow accessor pattern.
+3. **Clipping**: Fixed `BooleanOps::clip()` signature - polygon clips linestring, not vice versa.
+4. **CI**: Use `dtolnay/rust-toolchain` not `rust-action`.
 
 Each task is TDD: write failing test → implement → verify → commit.
