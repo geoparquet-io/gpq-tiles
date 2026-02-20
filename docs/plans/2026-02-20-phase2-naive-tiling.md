@@ -4,19 +4,50 @@
 
 **Goal:** Produce functional vector tiles from GeoParquet files that render correctly in MapLibre.
 
-**Architecture:** Read GeoParquet → extract geometries via geozero → for each zoom/tile: clip to bounds, simplify, encode as MVT → write PMTiles (custom writer from spec). Single-threaded, in-memory. Compare output against tippecanoe golden files for verification.
+**Architecture:** Read GeoParquet → process geometries via GeoArrow (zero-copy within batch scope) → for each zoom/tile: clip to bounds, simplify, encode as MVT → write PMTiles (custom writer from spec). Single-threaded, in-memory. Compare output against tippecanoe golden files for verification.
 
-**Tech Stack:** Rust, geozero (geometry extraction - simpler than geoarrow), geo (clipping/simplification), prost (MVT encoding), custom PMTiles v3 writer (from spec)
+**Tech Stack:** Rust, geoarrow (zero-copy geometry access), geo (clipping/simplification), prost (MVT encoding), custom PMTiles v3 writer (from spec)
+
+**Reference implementations:** [tippecanoe](https://github.com/felt/tippecanoe), [planetiler](https://github.com/onthegomap/planetiler)
 
 ---
 
-## Critical Fixes from Adversarial Review
+## Critical Constraints
 
-1. **PMTiles Writer**: `pmtiles` crate is read-only. We implement our own writer from the PMTiles v3 spec.
-2. **Geometry Extraction**: Use `geozero` instead of complex geoarrow accessor pattern.
-3. **LineString Clipping**: Use correct `BooleanOps` signature - `polygon.clip()` not `linestring.clip()`.
-4. **CI Workflow**: Use `dtolnay/rust-toolchain` not `rust-action`.
-5. **geo-traits**: Add explicit dependency for `ToGeoGeometry` trait.
+1. **TDD is mandatory**: Every feature follows failing test → implementation → refactor
+2. **Arrow-first**: Use GeoArrow accessors within batch lifetime - DO NOT bulk-extract to `Vec<Geometry>`
+3. **PMTiles Writer**: `pmtiles` crate is read-only. We implement our own writer from the PMTiles v3 spec.
+4. **LineString Clipping**: Use correct `BooleanOps` signature - `polygon.clip()` not `linestring.clip()`.
+5. **CI Workflow**: Use `dtolnay/rust-toolchain` not `rust-action`.
+
+### Arrow-First Pattern (CRITICAL)
+
+**DO** - Process geometries within Arrow batch lifetime:
+```rust
+for batch in reader {
+    let geom_array = get_geometry_array(&batch)?;
+    for i in 0..geom_array.len() {
+        let geom_ref = geom_array.value(i);  // Borrows from batch, no allocation
+        // Process immediately within this scope
+        let clipped = clip_geometry(&geom_ref, &tile_bounds);
+        encode_to_mvt(&clipped, &mut tile_builder);
+    }
+}
+```
+
+**DO NOT** - Bulk extract geometries (defeats Arrow's zero-copy benefits):
+```rust
+// WRONG: This allocates per-feature and defeats Arrow's purpose
+let mut all_geometries = Vec::new();
+for batch in reader {
+    for i in 0..batch.num_rows() {
+        let geom: geo::Geometry = extract_geometry(&batch, i);  // Allocation!
+        all_geometries.push(geom);  // More allocations!
+    }
+}
+```
+
+**Exception:** Complex boolean operations (clipping) may require temporary `geo::Geometry` conversion. This is acceptable but should be minimized and kept within batch scope.
 
 ---
 
@@ -28,34 +59,67 @@
 
 ---
 
-## Task 1: Geometry Extraction - Failing Test
+## Task 1: GeoArrow Batch Iterator - Failing Test
 
-**Difficulty:** 3/10 | **Time:** 15 min
+**Difficulty:** 4/10 | **Time:** 20 min
 
 **Files:**
-- Create: `crates/core/src/geometry.rs`
+- Create: `crates/core/src/batch_processor.rs`
 - Modify: `crates/core/src/lib.rs`
+
+**Design Note:** Instead of extracting all geometries to a `Vec`, we create an iterator that processes geometries within Arrow batch scope. This preserves Arrow's zero-copy benefits.
 
 **Step 1: Write failing test**
 
-Create `crates/core/src/geometry.rs`:
+Create `crates/core/src/batch_processor.rs`:
 
 ```rust
-//! Geometry extraction from GeoParquet files using geozero.
+//! Arrow-native geometry batch processing.
+//!
+//! Processes geometries within Arrow RecordBatch lifetime to preserve zero-copy benefits.
+//! DO NOT extract geometries to Vec<Geometry> - that defeats Arrow's purpose.
 
 use std::path::Path;
-use geo::Geometry;
 use crate::{Error, Result};
 use crate::tile::TileBounds;
 
-/// Extract geometries from a GeoParquet file
-pub fn extract_geometries(_path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
-    todo!("Implement geometry extraction")
+/// Process geometries in a GeoParquet file batch-by-batch.
+///
+/// The callback receives each geometry and its row index, processed within
+/// the Arrow batch scope (no allocations per feature).
+pub fn process_geometries<F>(
+    _path: &Path,
+    _callback: F,
+) -> Result<usize>
+where
+    F: FnMut(geo::Geometry<f64>, usize) -> Result<()>,
+{
+    todo!("Implement batch processing")
 }
 
-/// Calculate bounding box of all geometries
-pub fn calculate_bbox(_path: &Path) -> Result<TileBounds> {
-    todo!("Implement bbox calculation")
+/// Calculate bounding box by streaming through batches.
+/// Does NOT load all geometries into memory.
+pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
+    let mut bounds = TileBounds::empty();
+
+    process_geometries(path, |geom, _idx| {
+        use geo::BoundingRect;
+        if let Some(rect) = geom.bounding_rect() {
+            bounds.expand(&TileBounds::new(
+                rect.min().x,
+                rect.min().y,
+                rect.max().x,
+                rect.max().y,
+            ));
+        }
+        Ok(())
+    })?;
+
+    if !bounds.is_valid() {
+        return Err(Error::GeoParquetRead("No valid geometries found".to_string()));
+    }
+
+    Ok(bounds)
 }
 
 #[cfg(test)]
@@ -63,16 +127,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_geometries_returns_geometries() {
+    fn test_process_geometries_iterates_all() {
         let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
         if !fixture.exists() {
             eprintln!("Skipping: fixture not found");
             return;
         }
 
-        let geometries = extract_geometries(fixture).expect("Should extract");
-        assert!(!geometries.is_empty(), "Should have geometries");
-        assert!(geometries.len() > 100, "Should have many features");
+        let mut count = 0;
+        let result = process_geometries(fixture, |_geom, _idx| {
+            count += 1;
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(count > 100, "Should have many features, got {}", count);
     }
 
     #[test]
@@ -86,11 +155,10 @@ mod tests {
         let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
 
         // Andorra bounds: ~1.4-1.8 lon, ~42.4-42.7 lat
-        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0);
-        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0);
-        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0);
-        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0);
-        assert!(bbox.lng_min > -180.0, "Should not be world bounds");
+        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0, "lng_min={}", bbox.lng_min);
+        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0, "lng_max={}", bbox.lng_max);
+        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0, "lat_min={}", bbox.lat_min);
+        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0, "lat_max={}", bbox.lat_max);
     }
 }
 ```
@@ -98,48 +166,68 @@ mod tests {
 **Step 2: Add module to lib.rs**
 
 ```rust
-pub mod geometry;
+pub mod batch_processor;
 ```
 
 **Step 3: Run test to verify it fails**
 
-Run: `cargo test --package gpq-tiles-core geometry -- --nocapture`
+Run: `cargo test --package gpq-tiles-core batch_processor -- --nocapture`
 Expected: FAIL with "not yet implemented"
 
 **Step 4: Commit failing test**
 
 ```bash
-git add crates/core/src/geometry.rs crates/core/src/lib.rs
-git commit -m "test: add failing geometry extraction tests (TDD red)"
+git add crates/core/src/batch_processor.rs crates/core/src/lib.rs
+git commit -m "test: add failing batch processor tests (TDD red)"
 ```
 
 ---
 
-## Task 2: Geometry Extraction - Implementation
+## Task 2: GeoArrow Batch Iterator - Implementation
 
-**Difficulty:** 5/10 | **Time:** 45 min
+**Difficulty:** 6/10 | **Time:** 60 min
 
 **Files:**
-- Modify: `crates/core/src/geometry.rs`
+- Modify: `crates/core/src/batch_processor.rs`
+- Possibly modify: `crates/core/Cargo.toml` (if geoarrow features needed)
 
-**Step 1: Implement using geozero**
+**Implementation Strategy:**
 
-Replace content of `crates/core/src/geometry.rs`:
+We use GeoArrow's native array types to access geometries. For clipping operations that require `geo::Geometry`, we convert within the batch loop scope - this is acceptable because:
+1. Conversion happens one geometry at a time (not bulk)
+2. Memory is released after each iteration
+3. We preserve Arrow's batch-streaming benefits
+
+**Step 1: Implement using geoarrow**
+
+Replace content of `crates/core/src/batch_processor.rs`:
 
 ```rust
-//! Geometry extraction from GeoParquet files using geozero.
+//! Arrow-native geometry batch processing.
+//!
+//! Processes geometries within Arrow RecordBatch lifetime to preserve zero-copy benefits.
 
 use std::path::Path;
-use geo::{Geometry, BoundingRect};
-use geozero::ToGeo;
+use geo::Geometry;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use arrow_array::cast::AsArray;
+use geoarrow::array::{AsGeometryArray, GeometryArrayTrait};
+use geoarrow::io::parquet::read_geoparquet;
+use geoarrow::trait_::GeometryArrayAccessor;
 
 use crate::{Error, Result};
 use crate::tile::TileBounds;
 
-/// Extract geometries from a GeoParquet file
-pub fn extract_geometries(path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
+/// Process geometries in a GeoParquet file batch-by-batch.
+///
+/// The callback receives each geometry converted to geo::Geometry for processing.
+/// Conversion happens within batch scope to minimize memory usage.
+pub fn process_geometries<F>(
+    path: &Path,
+    mut callback: F,
+) -> Result<usize>
+where
+    F: FnMut(Geometry<f64>, usize) -> Result<()>,
+{
     let file = std::fs::File::open(path)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
 
@@ -149,62 +237,52 @@ pub fn extract_geometries(path: &Path) -> Result<Vec<(Geometry<f64>, usize)>> {
     let reader = builder.build()
         .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
-    let mut geometries = Vec::new();
+    let mut total_processed = 0;
     let mut row_offset = 0;
 
     for batch_result in reader {
         let batch = batch_result
             .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
-        // Find geometry column (usually WKB binary)
+        // Find geometry column
         let geom_idx = batch.schema().fields().iter()
             .position(|f| f.name() == "geometry" || f.name().contains("geom"))
             .ok_or_else(|| Error::GeoParquetRead("No geometry column".to_string()))?;
 
         let geom_col = batch.column(geom_idx);
 
-        // Try as binary array (WKB)
-        if let Some(binary_array) = geom_col.as_binary_opt::<i32>() {
-            for i in 0..binary_array.len() {
-                if binary_array.is_null(i) {
-                    continue;
-                }
-                let wkb = binary_array.value(i);
-                if let Ok(geom) = geozero::wkb::Wkb(wkb.to_vec()).to_geo() {
-                    geometries.push((geom, row_offset + i));
-                }
+        // Convert Arrow array to GeoArrow geometry array
+        // This interprets the WKB bytes as geometries without copying
+        let geom_array = geoarrow::array::from_arrow_array(geom_col, batch.schema().field(geom_idx))
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
+
+        // Process each geometry within batch scope
+        for i in 0..geom_array.len() {
+            if geom_array.is_null(i) {
+                continue;
             }
-        } else if let Some(binary_array) = geom_col.as_binary_opt::<i64>() {
-            for i in 0..binary_array.len() {
-                if binary_array.is_null(i) {
-                    continue;
-                }
-                let wkb = binary_array.value(i);
-                if let Ok(geom) = geozero::wkb::Wkb(wkb.to_vec()).to_geo() {
-                    geometries.push((geom, row_offset + i));
-                }
-            }
-        } else {
-            return Err(Error::GeoParquetRead("Unsupported geometry format".to_string()));
+
+            // Convert to geo::Geometry for processing
+            // This is acceptable because it happens one-at-a-time within batch scope
+            let geo_geom = geom_array.value_as_geo(i);
+
+            callback(geo_geom, row_offset + i)?;
+            total_processed += 1;
         }
 
         row_offset += batch.num_rows();
     }
 
-    Ok(geometries)
+    Ok(total_processed)
 }
 
-/// Calculate bounding box of all geometries
+/// Calculate bounding box by streaming through batches.
+/// Does NOT load all geometries into memory.
 pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
-    let geometries = extract_geometries(path)?;
-
-    if geometries.is_empty() {
-        return Err(Error::GeoParquetRead("No geometries found".to_string()));
-    }
-
     let mut bounds = TileBounds::empty();
 
-    for (geom, _) in &geometries {
+    process_geometries(path, |geom, _idx| {
+        use geo::BoundingRect;
         if let Some(rect) = geom.bounding_rect() {
             bounds.expand(&TileBounds::new(
                 rect.min().x,
@@ -213,10 +291,11 @@ pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
                 rect.max().y,
             ));
         }
-    }
+        Ok(())
+    })?;
 
     if !bounds.is_valid() {
-        return Err(Error::GeoParquetRead("Invalid bounds".to_string()));
+        return Err(Error::GeoParquetRead("No valid geometries found".to_string()));
     }
 
     Ok(bounds)
@@ -227,16 +306,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_geometries_returns_geometries() {
+    fn test_process_geometries_iterates_all() {
         let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
         if !fixture.exists() {
             eprintln!("Skipping: fixture not found");
             return;
         }
 
-        let geometries = extract_geometries(fixture).expect("Should extract");
-        assert!(!geometries.is_empty(), "Should have geometries");
-        assert!(geometries.len() > 100, "Should have many features");
+        let mut count = 0;
+        let result = process_geometries(fixture, |_geom, _idx| {
+            count += 1;
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "Error: {:?}", result.err());
+        assert!(count > 100, "Should have many features, got {}", count);
     }
 
     #[test]
@@ -249,26 +333,56 @@ mod tests {
 
         let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
 
-        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0);
-        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0);
-        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0);
-        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0);
-        assert!(bbox.lng_min > -180.0, "Should not be world bounds");
+        // Andorra bounds: ~1.4-1.8 lon, ~42.4-42.7 lat
+        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0, "lng_min={}", bbox.lng_min);
+        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0, "lng_max={}", bbox.lng_max);
+        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0, "lat_min={}", bbox.lat_min);
+        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0, "lat_max={}", bbox.lat_max);
+    }
+
+    #[test]
+    fn test_process_geometries_receives_valid_geometry_types() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let mut polygon_count = 0;
+        process_geometries(fixture, |geom, _idx| {
+            match geom {
+                Geometry::Polygon(_) | Geometry::MultiPolygon(_) => polygon_count += 1,
+                _ => {}
+            }
+            Ok(())
+        }).expect("Should process");
+
+        assert!(polygon_count > 0, "Buildings should be polygons");
     }
 }
 ```
 
-**Step 2: Run tests**
+**Step 2: Verify geoarrow features in Cargo.toml**
 
-Run: `cargo test --package gpq-tiles-core geometry -- --nocapture`
+The workspace already has `geoarrow = "0.4"`. You may need to enable specific features if the above code doesn't compile. Check geoarrow docs for the exact trait imports.
+
+**Step 3: Run tests**
+
+Run: `cargo test --package gpq-tiles-core batch_processor -- --nocapture`
 Expected: PASS
 
-**Step 3: Commit**
+**Step 4: Commit**
 
 ```bash
-git add crates/core/src/geometry.rs
-git commit -m "feat: implement geometry extraction with geozero (TDD green)"
+git add crates/core/src/batch_processor.rs
+git commit -m "feat: implement Arrow-native geometry batch processing (TDD green)"
 ```
+
+**Note:** If geoarrow's API differs from above, consult the geoarrow 0.4 documentation. The key pattern is:
+1. Get Arrow array from RecordBatch
+2. Convert to geoarrow geometry array (interprets WKB)
+3. Iterate with `value_as_geo(i)` or similar accessor
+4. Process within loop scope
 
 ---
 
@@ -1348,8 +1462,8 @@ Use `dtolnay/rust-toolchain` (not `rust-action`).
 
 | Task | Description | Difficulty | Time Est. |
 |------|-------------|------------|-----------|
-| 1 | Geometry Extraction - Test | 3/10 | 15 min |
-| 2 | Geometry Extraction - Impl | 5/10 | 45 min |
+| 1 | GeoArrow Batch Iterator - Test | 4/10 | 20 min |
+| 2 | GeoArrow Batch Iterator - Impl | 6/10 | 60 min |
 | 3 | Clipping | 5/10 | 45 min |
 | 4 | Simplification | 3/10 | 20 min |
 | 5 | MVT Encoding | 5/10 | 45 min |
@@ -1360,17 +1474,43 @@ Use `dtolnay/rust-toolchain` (not `rust-action`).
 | 10 | Integration Tests | 4/10 | 30 min |
 | 11 | CI Configuration | 2/10 | 15 min |
 
-**Total: ~7 hours estimated**
+**Total: ~7.5 hours estimated**
 
-**Average Difficulty: 4.5/10**
+**Average Difficulty: 4.6/10**
+
+## Parallelization
+
+Tasks can be parallelized as follows:
+
+```
+Phase 1:  Task 1-2 (GeoArrow)   ║  Task 7 (PMTiles Header)  ║  Task 11 (CI)
+             ↓                  ║           ↓               ║
+Phase 2:  Task 3, 4, 5          ║  Task 8 (PMTiles Dir)     ║
+          (in parallel)         ║           ↓               ║
+             ↓                  ║  Task 9 (PMTiles Full)    ║
+Phase 3:  Task 6 (Pipeline)     ║           ↓               ║
+             ↓                  ║           ↓               ║
+Phase 4:  Task 10 (Golden Tests) ◀─────────┘
+```
+
+- **Group A** (Tasks 1-6): Geometry pipeline - sequential dependencies
+- **Group B** (Tasks 7-9): PMTiles writer - sequential within, parallel to Group A
+- **Group C** (Task 11): CI - fully independent
 
 ---
 
-## Key Changes from Original Plan
+## Key Architectural Decisions
 
-1. **Task Order Corrected**: Geometry extraction, clipping, simplification, and MVT encoding now come FIRST (Tasks 1-6). PMTiles writer is LAST (Tasks 7-9) since you need tiles to exist before you can write them.
-2. **Geometry Extraction**: Use `geozero` for WKB parsing instead of complex geoarrow accessor pattern.
-3. **Clipping**: Fixed `BooleanOps::clip()` signature - polygon clips linestring, not vice versa.
-4. **CI**: Use `dtolnay/rust-toolchain` not `rust-action`.
+1. **Arrow-First Design**: Use GeoArrow batch processing instead of bulk geometry extraction. Process geometries within Arrow batch scope to preserve zero-copy benefits. See CLAUDE.md for patterns.
+
+2. **Task Order**: Geometry pipeline (Tasks 1-6) comes before PMTiles writer (Tasks 7-9) - you need tiles before you can write them.
+
+3. **Clipping**: Use correct `BooleanOps::clip()` signature - `polygon.clip(&linestring)`, not vice versa.
+
+4. **PMTiles**: The `pmtiles` crate is read-only. We implement our own v3 writer from spec.
+
+5. **CI**: Use `dtolnay/rust-toolchain` not `rust-action`.
+
+6. **Reference Implementations**: Consult [tippecanoe](https://github.com/felt/tippecanoe) and [planetiler](https://github.com/onthegomap/planetiler) for algorithm decisions and edge case handling.
 
 Each task is TDD: write failing test → implement → verify → commit.
