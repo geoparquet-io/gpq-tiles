@@ -4,9 +4,13 @@ updates:
     directory: "/"
     schedule:
       interval: "weekly"
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 5
     reviewers:
       - "nlebovits"
     labels:
       - "dependencies"
       - "rust"
+    groups:
+      all-cargo-deps:
+        patterns:
+          - "*"
