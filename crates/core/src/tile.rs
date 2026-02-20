@@ -138,9 +138,8 @@ pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileC
     let max_tile = lng_lat_to_tile(bbox.lng_max, bbox.lat_min, zoom); // Note: lat_min for max_y
 
     // Iterate over all tiles in the range
-    (min_tile.y..=max_tile.y).flat_map(move |y| {
-        (min_tile.x..=max_tile.x).map(move |x| TileCoord::new(x, y, zoom))
-    })
+    (min_tile.y..=max_tile.y)
+        .flat_map(move |y| (min_tile.x..=max_tile.x).map(move |x| TileCoord::new(x, y, zoom)))
 }
 
 #[cfg(test)]

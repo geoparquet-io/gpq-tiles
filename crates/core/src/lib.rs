@@ -19,14 +19,14 @@
 //! converter.convert("input.parquet", "output.pmtiles").unwrap();
 //! ```
 
-use std::path::Path;
-use std::collections::HashMap;
-use thiserror::Error;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-use geoparquet::reader::GeoParquetReaderBuilder;
 use arrow_schema::SchemaRef;
+use geoparquet::reader::GeoParquetReaderBuilder;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use std::collections::HashMap;
+use std::path::Path;
+use thiserror::Error;
 
-use crate::tile::{TileBounds, TileCoord, tiles_for_bbox};
+use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
 
 // Include the protobuf-generated code
 pub mod vector_tile {
@@ -115,11 +115,7 @@ impl Converter {
     /// - TODO: Simplify geometries
     /// - TODO: Encode as MVT
     /// - TODO: Write to PMTiles
-    pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(
-        &self,
-        input: P,
-        output: Q,
-    ) -> Result<()> {
+    pub fn convert<P: AsRef<Path>, Q: AsRef<Path>>(&self, input: P, output: Q) -> Result<()> {
         let input_path = input.as_ref();
         let output_path = output.as_ref();
 
@@ -200,18 +196,22 @@ impl Converter {
             .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
         // Get GeoParquet metadata
-        let metadata_result = builder.geoparquet_metadata()
+        let metadata_result = builder
+            .geoparquet_metadata()
             .ok_or_else(|| Error::GeoParquetRead("No GeoParquet metadata found".to_string()))?;
 
-        let metadata = metadata_result
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse GeoParquet metadata: {}", e)))?;
+        let metadata = metadata_result.map_err(|e| {
+            Error::GeoParquetRead(format!("Failed to parse GeoParquet metadata: {}", e))
+        })?;
 
         // Get schema with GeoArrow types (parse WKB to native GeoArrow)
-        let schema = builder.geoarrow_schema(
-            &metadata,
-            true,  // parse_wkb: convert WKB to native GeoArrow types
-            Default::default(),  // coord_type: use default coordinate type
-        ).map_err(|e| Error::GeoParquetRead(format!("Failed to infer schema: {}", e)))?;
+        let schema = builder
+            .geoarrow_schema(
+                &metadata,
+                true,               // parse_wkb: convert WKB to native GeoArrow types
+                Default::default(), // coord_type: use default coordinate type
+            )
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to infer schema: {}", e)))?;
 
         // Get row count from metadata
         let num_rows = builder.metadata().file_metadata().num_rows() as usize;
@@ -236,7 +236,8 @@ impl Converter {
             .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
         // Build the reader
-        let reader = builder.build()
+        let reader = builder
+            .build()
             .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
         let mut batch_count = 0;
@@ -256,7 +257,11 @@ impl Converter {
             // TODO: Process features for tiling
         }
 
-        log::info!("Iterated {} total rows in {} batches", total_rows, batch_count);
+        log::info!(
+            "Iterated {} total rows in {} batches",
+            total_rows,
+            batch_count
+        );
 
         Ok(batch_count)
     }
@@ -274,7 +279,8 @@ impl Converter {
         let builder = ParquetRecordBatchReaderBuilder::try_new(file)
             .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
-        let reader = builder.build()
+        let reader = builder
+            .build()
             .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
         let mut global_bbox = TileBounds::empty();
@@ -287,7 +293,6 @@ impl Converter {
             for field in batch.schema().fields().iter() {
                 // Check if this is a geometry column by metadata or name
                 if field.name() == "geometry" || field.name().contains("geom") {
-
                     // Try to extract bounds from the array
                     // For now, we'll use a simple approach: scan coordinates
                     // This is a simplified version - real implementation would use GeoArrow's bounding_rect
@@ -354,14 +359,11 @@ mod tests {
         let config = Config::default();
         let converter = Converter::new(config);
 
-        let result = converter.convert(
-            "/nonexistent/file.parquet",
-            "/tmp/output.pmtiles",
-        );
+        let result = converter.convert("/nonexistent/file.parquet", "/tmp/output.pmtiles");
 
         assert!(result.is_err());
         match result {
-            Err(Error::GeoParquetRead(_)) => {}, // Expected error type
+            Err(Error::GeoParquetRead(_)) => {} // Expected error type
             _ => panic!("Expected GeoParquetRead error"),
         }
     }

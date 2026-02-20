@@ -54,13 +54,8 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     // Initialize logging
-    let log_level = if args.verbose {
-        "debug"
-    } else {
-        "info"
-    };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level))
-        .init();
+    let log_level = if args.verbose { "debug" } else { "info" };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
     // Build configuration
     let config = Config {
@@ -79,7 +74,11 @@ fn main() -> Result<()> {
         .convert(&args.input, &args.output)
         .context("Failed to convert GeoParquet to PMTiles")?;
 
-    println!("✓ Converted {} to {}", args.input.display(), args.output.display());
+    println!(
+        "✓ Converted {} to {}",
+        args.input.display(),
+        args.output.display()
+    );
 
     Ok(())
 }

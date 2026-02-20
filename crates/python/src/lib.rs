@@ -38,9 +38,10 @@ fn convert(
         "medium" => DropDensity::Medium,
         "high" => DropDensity::High,
         _ => {
-            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
-                format!("Invalid drop density: {}", drop_density),
-            ))
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid drop density: {}",
+                drop_density
+            )))
         }
     };
 

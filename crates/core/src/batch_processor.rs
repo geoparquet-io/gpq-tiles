@@ -9,13 +9,13 @@ use std::sync::Arc;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
 use geoarrow::array::from_arrow_array;
-use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
-use geoarrow_array::cast::AsGeoArrowArray;
 use geoarrow::datatypes::GeoArrowType;
+use geoarrow_array::cast::AsGeoArrowArray;
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
-use crate::{Error, Result};
 use crate::tile::TileBounds;
+use crate::{Error, Result};
 
 /// Process geometries in a GeoParquet file batch-by-batch.
 ///
@@ -31,10 +31,7 @@ use crate::tile::TileBounds;
 /// # Returns
 ///
 /// Total number of geometries processed
-pub fn process_geometries<F>(
-    path: &Path,
-    mut callback: F,
-) -> Result<usize>
+pub fn process_geometries<F>(path: &Path, mut callback: F) -> Result<usize>
 where
     F: FnMut(Geometry<f64>, usize) -> Result<()>,
 {
@@ -44,7 +41,8 @@ where
     let builder = ParquetRecordBatchReaderBuilder::try_new(file)
         .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
 
-    let reader = builder.build()
+    let reader = builder
+        .build()
         .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
 
     let mut total_processed = 0;
@@ -56,7 +54,9 @@ where
 
         // Find geometry column by name
         let schema = batch.schema();
-        let geom_idx = schema.fields().iter()
+        let geom_idx = schema
+            .fields()
+            .iter()
             .position(|f| f.name() == "geometry" || f.name().contains("geom"))
             .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
 
@@ -69,11 +69,7 @@ where
 
         // Process each geometry within batch scope using explicit type dispatch
         // This avoids bulk extraction while leveraging GeoArrow's type system
-        let batch_count = process_geoarrow_array(
-            geom_array.as_ref(),
-            row_offset,
-            &mut callback,
-        )?;
+        let batch_count = process_geoarrow_array(geom_array.as_ref(), row_offset, &mut callback)?;
 
         total_processed += batch_count;
         row_offset += batch.num_rows();
@@ -139,12 +135,10 @@ where
             let arr = array.as_wkb_view();
             process_typed_array(arr, row_offset, callback)
         }
-        _ => {
-            Err(Error::GeoParquetRead(format!(
-                "Unsupported geometry type: {:?}",
-                array.data_type()
-            )))
-        }
+        _ => Err(Error::GeoParquetRead(format!(
+            "Unsupported geometry type: {:?}",
+            array.data_type()
+        ))),
     }
 }
 
@@ -164,8 +158,9 @@ where
         if let Some(geom_result) = item {
             // Convert GeoArrow scalar to geo::Geometry
             // This happens one-at-a-time within batch scope
-            let geom_trait = geom_result
-                .map_err(|e| Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e)))?;
+            let geom_trait = geom_result.map_err(|e| {
+                Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
+            })?;
 
             // Use ToGeoGeometry trait to convert to geo::Geometry
             if let Some(geo_geom) = geom_trait.try_to_geometry() {
@@ -196,7 +191,9 @@ pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
     })?;
 
     if !bounds.is_valid() {
-        return Err(Error::GeoParquetRead("No valid geometries found".to_string()));
+        return Err(Error::GeoParquetRead(
+            "No valid geometries found".to_string(),
+        ));
     }
 
     Ok(bounds)
@@ -235,9 +232,25 @@ mod tests {
         let bbox = calculate_bbox(fixture).expect("Should calculate bbox");
 
         // Andorra bounds: ~1.4-1.8 lon, ~42.4-42.7 lat
-        assert!(bbox.lng_min > 1.0 && bbox.lng_min < 2.0, "lng_min={}", bbox.lng_min);
-        assert!(bbox.lng_max > 1.0 && bbox.lng_max < 2.0, "lng_max={}", bbox.lng_max);
-        assert!(bbox.lat_min > 42.0 && bbox.lat_min < 43.0, "lat_min={}", bbox.lat_min);
-        assert!(bbox.lat_max > 42.0 && bbox.lat_max < 43.0, "lat_max={}", bbox.lat_max);
+        assert!(
+            bbox.lng_min > 1.0 && bbox.lng_min < 2.0,
+            "lng_min={}",
+            bbox.lng_min
+        );
+        assert!(
+            bbox.lng_max > 1.0 && bbox.lng_max < 2.0,
+            "lng_max={}",
+            bbox.lng_max
+        );
+        assert!(
+            bbox.lat_min > 42.0 && bbox.lat_min < 43.0,
+            "lat_min={}",
+            bbox.lat_min
+        );
+        assert!(
+            bbox.lat_max > 42.0 && bbox.lat_max < 43.0,
+            "lat_max={}",
+            bbox.lat_max
+        );
     }
 }
