@@ -4,21 +4,125 @@
 //! DO NOT extract geometries to Vec<Geometry> - that defeats Arrow's purpose.
 
 use std::path::Path;
+use std::sync::Arc;
+
+use geo::Geometry;
+use geo_traits::to_geo::ToGeoGeometry;
+use geoarrow::array::from_arrow_array;
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, downcast_geoarrow_array};
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
 use crate::{Error, Result};
 use crate::tile::TileBounds;
 
 /// Process geometries in a GeoParquet file batch-by-batch.
 ///
-/// The callback receives each geometry and its row index, processed within
-/// the Arrow batch scope (no allocations per feature).
+/// The callback receives each geometry converted to geo::Geometry for processing.
+/// Conversion happens within batch scope to minimize memory usage - we process
+/// one geometry at a time rather than bulk-extracting to Vec<Geometry>.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file
+/// * `callback` - Function called for each geometry with the geometry and its row index
+///
+/// # Returns
+///
+/// Total number of geometries processed
 pub fn process_geometries<F>(
-    _path: &Path,
-    _callback: F,
+    path: &Path,
+    mut callback: F,
 ) -> Result<usize>
 where
-    F: FnMut(geo::Geometry<f64>, usize) -> Result<()>,
+    F: FnMut(Geometry<f64>, usize) -> Result<()>,
 {
-    todo!("Implement batch processing")
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+    let reader = builder.build()
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+    let mut total_processed = 0;
+    let mut row_offset = 0;
+
+    for batch_result in reader {
+        let batch = batch_result
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+        // Find geometry column by name
+        let schema = batch.schema();
+        let geom_idx = schema.fields().iter()
+            .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+            .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+
+        let geom_col = batch.column(geom_idx);
+        let geom_field = schema.field(geom_idx);
+
+        // Convert Arrow array to GeoArrow geometry array
+        let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), geom_field)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
+
+        // Process each geometry within batch scope using the downcast macro
+        // This avoids bulk extraction while leveraging GeoArrow's type system
+        let batch_count = process_geoarrow_array(
+            geom_array.as_ref(),
+            row_offset,
+            &mut callback,
+        )?;
+
+        total_processed += batch_count;
+        row_offset += batch.num_rows();
+    }
+
+    Ok(total_processed)
+}
+
+/// Process geometries from a GeoArrow array, calling the callback for each valid geometry.
+///
+/// Uses the downcast_geoarrow_array macro to handle all geometry types uniformly.
+fn process_geoarrow_array<F>(
+    array: &dyn GeoArrowArray,
+    row_offset: usize,
+    callback: &mut F,
+) -> Result<usize>
+where
+    F: FnMut(Geometry<f64>, usize) -> Result<()>,
+{
+    // Helper function that works with any GeoArrowArrayAccessor
+    fn process_accessor<'a, A, F>(
+        accessor: &'a A,
+        row_offset: usize,
+        callback: &mut F,
+    ) -> Result<usize>
+    where
+        A: GeoArrowArrayAccessor<'a>,
+        F: FnMut(Geometry<f64>, usize) -> Result<()>,
+    {
+        let mut count = 0;
+        for (i, item) in accessor.iter().enumerate() {
+            if let Some(geom_result) = item {
+                // Convert GeoArrow scalar to geo::Geometry
+                // This happens one-at-a-time within batch scope
+                let geom_trait = geom_result
+                    .map_err(|e| Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e)))?;
+
+                // Use ToGeoGeometry trait to convert to geo::Geometry
+                if let Some(geo_geom) = geom_trait.try_to_geometry() {
+                    callback(geo_geom, row_offset + i)?;
+                    count += 1;
+                }
+            }
+        }
+        Ok(count)
+    }
+
+    // Use the downcast macro to dispatch to the correct array type
+    downcast_geoarrow_array!(array, |typed_array| {
+        process_accessor(typed_array, row_offset, callback)
+    })
 }
 
 /// Calculate bounding box by streaming through batches.

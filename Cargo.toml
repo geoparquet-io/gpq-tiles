@@ -20,6 +20,8 @@ categories = ["science", "data-structures", "encoding"]
 [workspace.dependencies]
 # Core geospatial dependencies
 geoarrow = "0.4"
+geoarrow-array = "0.4"
+geo-traits = "0.3"
 geoparquet = "0.4"
 parquet = "55"
 arrow-schema = "55"

@@ -13,6 +13,8 @@ categories.workspace = true
 
 [dependencies]
 geoarrow = { workspace = true }
+geoarrow-array = { workspace = true }
+geo-traits = { workspace = true }
 geoparquet = { workspace = true }
 parquet = { workspace = true }
 arrow-schema = { workspace = true }
