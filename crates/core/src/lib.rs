@@ -267,59 +267,8 @@ impl Converter {
     }
 
     /// Calculate the bounding box of all features in the GeoParquet file
-    ///
-    /// Note: Currently returns world bounds as a placeholder.
-    /// Real implementation requires geometry extraction (Phase 2, step 4).
     fn calculate_bounds<P: AsRef<Path>>(&self, path: P) -> Result<TileBounds> {
-        let path = path.as_ref();
-
-        let file = std::fs::File::open(path)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to open file: {}", e)))?;
-
-        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
-
-        let reader = builder
-            .build()
-            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
-
-        let mut global_bbox = TileBounds::empty();
-
-        for batch_result in reader {
-            let batch = batch_result
-                .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
-
-            // Find the geometry column (assume first geometry column for now)
-            for field in batch.schema().fields().iter() {
-                // Check if this is a geometry column by metadata or name
-                if field.name() == "geometry" || field.name().contains("geom") {
-                    // Try to extract bounds from the array
-                    // For now, we'll use a simple approach: scan coordinates
-                    // This is a simplified version - real implementation would use GeoArrow's bounding_rect
-
-                    // Use geo crate to calculate bounds if we can convert
-                    // For MVP, we'll extract min/max from coordinate buffer if available
-
-                    // Simplified: assume we can get some coordinate data
-                    // In practice, this needs proper GeoArrow array handling
-                    log::debug!("Found geometry column: {}", field.name());
-
-                    // For now, expand with a placeholder - we'll refine this
-                    // when we implement proper geometry extraction
-                    let batch_bbox = TileBounds::new(-180.0, -90.0, 180.0, 90.0);
-                    global_bbox.expand(&batch_bbox);
-                    break;
-                }
-            }
-        }
-
-        if !global_bbox.is_valid() {
-            return Err(Error::GeoParquetRead(
-                "No valid geometries found in file".to_string(),
-            ));
-        }
-
-        Ok(global_bbox)
+        batch_processor::calculate_bbox(path.as_ref())
     }
 
     /// Generate tile grid for all zoom levels
@@ -385,17 +334,8 @@ mod tests {
         }
     }
 
-    /// Integration test with real fixture data.
-    /// Runs automatically in CI's slow test job (GPQ_SLOW_TESTS=1).
-    /// Run locally with: GPQ_SLOW_TESTS=1 cargo test test_convert_with_real_fixture
     #[test]
     fn test_convert_with_real_fixture() {
-        // Skip unless explicitly enabled - this test can take minutes
-        if std::env::var("GPQ_SLOW_TESTS").is_err() {
-            eprintln!("Skipping slow test (set GPQ_SLOW_TESTS=1 to enable)");
-            return;
-        }
-
         let config = Config::default();
         let converter = Converter::new(config);
 

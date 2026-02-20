@@ -99,14 +99,8 @@ jobs:
         if: runner.os == 'macOS'
         run: brew install protobuf
 
-      - name: Run fast tests
+      - name: Run all tests
         run: cargo test --all-features
-
-      - name: Run slow tests
-        run: cargo test --all-features -- --nocapture
-        timeout-minutes: 10
-        env:
-          GPQ_SLOW_TESTS: "1"
 
   # Coverage reporting
   coverage:
