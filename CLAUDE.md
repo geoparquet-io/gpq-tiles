@@ -137,6 +137,16 @@ Use `proptest` for geometry operations:
 
 See `ROADMAP.md` for phase details. Currently in Phase 2 (Naive Tiling).
 
+## Setup
+
+After cloning, configure git to use the project's hooks:
+
+```bash
+git config core.hooksPath .githooks
+```
+
+This enables the pre-commit hook that runs `cargo fmt --check` before each commit.
+
 ## Commands
 
 ```bash
@@ -151,4 +161,7 @@ cargo run --package gpq-tiles-cli -- input.parquet output.pmtiles
 
 # Benchmarks
 cargo bench
+
+# Format code (required before commit)
+cargo fmt --all
 ```

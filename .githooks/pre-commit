@@ -1,0 +1,13 @@
+#!/bin/sh
+# Pre-commit hook for gpq-tiles
+# Runs cargo fmt check before allowing commit
+
+echo "Running cargo fmt check..."
+if ! cargo fmt --all -- --check 2>/dev/null; then
+    echo ""
+    echo "ERROR: Code is not formatted. Run 'cargo fmt --all' to fix."
+    echo ""
+    exit 1
+fi
+
+echo "Format check passed!"
