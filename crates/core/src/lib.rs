@@ -32,6 +32,7 @@ pub mod vector_tile {
     include!(concat!(env!("OUT_DIR"), "/vector_tile.rs"));
 }
 
+pub mod batch_processor;
 pub mod tile;
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
