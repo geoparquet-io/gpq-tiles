@@ -9,7 +9,9 @@ use std::sync::Arc;
 use geo::Geometry;
 use geo_traits::to_geo::ToGeoGeometry;
 use geoarrow::array::from_arrow_array;
-use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor, downcast_geoarrow_array};
+use geoarrow_array::{GeoArrowArray, GeoArrowArrayAccessor};
+use geoarrow_array::cast::AsGeoArrowArray;
+use geoarrow::datatypes::GeoArrowType;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::{Error, Result};
@@ -65,7 +67,7 @@ where
         let geom_array: Arc<dyn GeoArrowArray> = from_arrow_array(geom_col.as_ref(), geom_field)
             .map_err(|e| Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e)))?;
 
-        // Process each geometry within batch scope using the downcast macro
+        // Process each geometry within batch scope using explicit type dispatch
         // This avoids bulk extraction while leveraging GeoArrow's type system
         let batch_count = process_geoarrow_array(
             geom_array.as_ref(),
@@ -82,7 +84,8 @@ where
 
 /// Process geometries from a GeoArrow array, calling the callback for each valid geometry.
 ///
-/// Uses the downcast_geoarrow_array macro to handle all geometry types uniformly.
+/// Uses explicit type dispatch to avoid deep generic recursion that causes
+/// compile-time issues with the downcast_geoarrow_array macro in release builds.
 fn process_geoarrow_array<F>(
     array: &dyn GeoArrowArray,
     row_offset: usize,
@@ -91,38 +94,87 @@ fn process_geoarrow_array<F>(
 where
     F: FnMut(Geometry<f64>, usize) -> Result<()>,
 {
-    // Helper function that works with any GeoArrowArrayAccessor
-    fn process_accessor<'a, A, F>(
-        accessor: &'a A,
-        row_offset: usize,
-        callback: &mut F,
-    ) -> Result<usize>
-    where
-        A: GeoArrowArrayAccessor<'a>,
-        F: FnMut(Geometry<f64>, usize) -> Result<()>,
-    {
-        let mut count = 0;
-        for (i, item) in accessor.iter().enumerate() {
-            if let Some(geom_result) = item {
-                // Convert GeoArrow scalar to geo::Geometry
-                // This happens one-at-a-time within batch scope
-                let geom_trait = geom_result
-                    .map_err(|e| Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e)))?;
+    match array.data_type() {
+        GeoArrowType::Point(_) => {
+            let arr = array.as_point();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::LineString(_) => {
+            let arr = array.as_line_string();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::Polygon(_) => {
+            let arr = array.as_polygon();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::MultiPoint(_) => {
+            let arr = array.as_multi_point();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::MultiLineString(_) => {
+            let arr = array.as_multi_line_string();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::MultiPolygon(_) => {
+            let arr = array.as_multi_polygon();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::Geometry(_) => {
+            let arr = array.as_geometry();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::GeometryCollection(_) => {
+            let arr = array.as_geometry_collection();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::Wkb(_) => {
+            let arr = array.as_wkb::<i32>();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::LargeWkb(_) => {
+            let arr = array.as_wkb::<i64>();
+            process_typed_array(arr, row_offset, callback)
+        }
+        GeoArrowType::WkbView(_) => {
+            let arr = array.as_wkb_view();
+            process_typed_array(arr, row_offset, callback)
+        }
+        _ => {
+            Err(Error::GeoParquetRead(format!(
+                "Unsupported geometry type: {:?}",
+                array.data_type()
+            )))
+        }
+    }
+}
 
-                // Use ToGeoGeometry trait to convert to geo::Geometry
-                if let Some(geo_geom) = geom_trait.try_to_geometry() {
-                    callback(geo_geom, row_offset + i)?;
-                    count += 1;
-                }
+/// Process a typed GeoArrow array, converting each geometry to geo::Geometry.
+fn process_typed_array<'a, A, F>(
+    accessor: &'a A,
+    row_offset: usize,
+    callback: &mut F,
+) -> Result<usize>
+where
+    A: GeoArrowArrayAccessor<'a>,
+    A::Item: ToGeoGeometry<f64>,
+    F: FnMut(Geometry<f64>, usize) -> Result<()>,
+{
+    let mut count = 0;
+    for (i, item) in accessor.iter().enumerate() {
+        if let Some(geom_result) = item {
+            // Convert GeoArrow scalar to geo::Geometry
+            // This happens one-at-a-time within batch scope
+            let geom_trait = geom_result
+                .map_err(|e| Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e)))?;
+
+            // Use ToGeoGeometry trait to convert to geo::Geometry
+            if let Some(geo_geom) = geom_trait.try_to_geometry() {
+                callback(geo_geom, row_offset + i)?;
+                count += 1;
             }
         }
-        Ok(count)
     }
-
-    // Use the downcast macro to dispatch to the correct array type
-    downcast_geoarrow_array!(array, |typed_array| {
-        process_accessor(typed_array, row_offset, callback)
-    })
+    Ok(count)
 }
 
 /// Calculate bounding box by streaming through batches.

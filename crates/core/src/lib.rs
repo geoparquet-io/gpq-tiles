@@ -1,3 +1,4 @@
+#![recursion_limit = "256"]
 //! Core library for converting GeoParquet to PMTiles vector tiles.
 //!
 //! This library provides the foundational functionality for reading GeoParquet files
@@ -283,7 +284,7 @@ impl Converter {
                 .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
 
             // Find the geometry column (assume first geometry column for now)
-            for (_idx, field) in batch.schema().fields().iter().enumerate() {
+            for field in batch.schema().fields().iter() {
                 // Check if this is a geometry column by metadata or name
                 if field.name() == "geometry" || field.name().contains("geom") {
 
@@ -378,7 +379,7 @@ mod tests {
 
             let (schema, num_rows) = result.unwrap();
             assert!(num_rows > 0, "Should have rows");
-            assert!(schema.fields().len() > 0, "Should have columns");
+            assert!(!schema.fields().is_empty(), "Should have columns");
         }
     }
 
