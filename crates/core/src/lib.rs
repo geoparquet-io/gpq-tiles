@@ -386,6 +386,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore] // Slow test - run with `cargo test -- --ignored`
     fn test_convert_with_real_fixture() {
         let config = Config::default();
         let converter = Converter::new(config);

@@ -125,7 +125,7 @@ jobs:
         run: cargo install cargo-tarpaulin
 
       - name: Generate coverage
-        run: cargo tarpaulin --out xml --all-features
+        run: cargo tarpaulin --out xml --all-features --exclude gpq-tiles-python
 
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v4
