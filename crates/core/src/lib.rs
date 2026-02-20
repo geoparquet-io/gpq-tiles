@@ -385,9 +385,17 @@ mod tests {
         }
     }
 
+    /// Integration test with real fixture data.
+    /// Runs automatically in CI's slow test job (GPQ_SLOW_TESTS=1).
+    /// Run locally with: GPQ_SLOW_TESTS=1 cargo test test_convert_with_real_fixture
     #[test]
-    #[ignore] // Slow test - run with `cargo test -- --ignored`
     fn test_convert_with_real_fixture() {
+        // Skip unless explicitly enabled - this test can take minutes
+        if std::env::var("GPQ_SLOW_TESTS").is_err() {
+            eprintln!("Skipping slow test (set GPQ_SLOW_TESTS=1 to enable)");
+            return;
+        }
+
         let config = Config::default();
         let converter = Converter::new(config);
 
@@ -395,7 +403,7 @@ mod tests {
         let fixture = "../../tests/fixtures/realdata/open-buildings.parquet";
         let output = "/tmp/test-output.pmtiles";
 
-        // Only run if fixture exists (CI might not have it)
+        // Only run if fixture exists
         if Path::new(fixture).exists() {
             let result = converter.convert(fixture, output);
             assert!(result.is_ok());
