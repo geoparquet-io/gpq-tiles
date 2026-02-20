@@ -128,7 +128,7 @@ jobs:
         with:
           files: ./cobertura.xml
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: true
+          fail_ci_if_error: false  # Don't fail if token not configured
 
   # Benchmarks (only on main branch merges)
   bench:
