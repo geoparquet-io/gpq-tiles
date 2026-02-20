@@ -19,19 +19,19 @@ categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
 # Core geospatial dependencies
-geoarrow = "0.4"
-geoarrow-array = "0.4"
+geoarrow = "0.7"
+geoarrow-array = "0.7"
 geo-traits = "0.3"
-geoparquet = "0.4"
-parquet = "55"
-arrow-schema = "55"
-geo = "0.29"
-pmtiles = "0.12"
-geozero = "0.14"
+geoparquet = "0.7"
+parquet = "57"
+arrow-schema = "57"
+geo = "0.32"
+pmtiles = "0.19"
+geozero = "0.15"
 
 # Protobuf for MVT encoding
-prost = "0.13"
-prost-build = "0.13"
+prost = "0.14"
+prost-build = "0.14"
 
 # Parallelism and spatial indexing
 rayon = "1.10"
@@ -45,7 +45,7 @@ pyo3 = { version = "0.28", features = ["extension-module"] }
 
 # Error handling
 anyhow = "1.0"
-thiserror = "1.0"
+thiserror = "2.0"
 
 # Utilities
 log = "0.4"
