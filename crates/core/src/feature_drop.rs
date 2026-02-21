@@ -1,9 +1,13 @@
-//! Feature dropping logic for tiny polygons.
+//! Feature dropping logic for zoom-based filtering.
 //!
-//! Implements tippecanoe's "diffuse probability" algorithm for dropping
-//! polygons that are too small to render meaningfully at a given zoom level.
+//! This module implements tippecanoe-compatible feature dropping:
+//! - **Tiny polygons**: Diffuse probability dropping for polygons < 4 sq pixels
+//! - **Tiny lines**: Drop lines when all vertices collapse to the same tile pixel
+//! - **Point thinning**: Drop 1/2.5 of points per zoom level above base zoom
 //!
 //! # Tippecanoe Behavior
+//!
+//! ## Tiny Polygons
 //!
 //! > "Any polygons that are smaller than a minimum area (currently 4 square
 //! > subpixels) will have their probability diffused, so that some of them
@@ -11,14 +15,15 @@
 //! > drawn at all, preserving the total area that all of them should have
 //! > had together."
 //!
-//! # Algorithm
+//! ## Tiny Lines
 //!
-//! 1. Calculate polygon area in tile-local pixel coordinates (0-4096 extent)
-//! 2. If area >= threshold (default 4 sq pixels): keep polygon
-//! 3. If area < threshold: apply diffuse drop probability
-//!    - `drop_probability = 1.0 - (area / threshold)`
-//!    - Use deterministic randomness based on geometry hash for consistency
-//! 4. Zero-area polygons are always dropped
+//! Tippecanoe drops lines when **all vertices collapse to the same tile pixel**
+//! after coordinate quantization. There's no explicit pixel length threshold -
+//! it's based on whether the geometry has any visual extent at the target zoom.
+//!
+//! ## Point Thinning
+//!
+//! > "drops 1/2.5 of the dots for each zoom level above the point base zoom"
 //!
 //! # Coordinate System
 //!
@@ -26,7 +31,7 @@
 //! to ensure consistent behavior regardless of geographic location (latitude).
 
 use crate::tile::TileBounds;
-use geo::{Area, Coord, LineString, Polygon};
+use geo::{Area, Coord, LineString, MultiLineString, Polygon};
 use std::hash::{Hash, Hasher};
 
 /// Default tiny polygon threshold: 4 square pixels (matches tippecanoe)
@@ -195,10 +200,371 @@ fn geometry_hash(polygon: &Polygon<f64>) -> u64 {
     hasher.finish()
 }
 
+// =============================================================================
+// LINE DROPPING
+// =============================================================================
+
+/// Convert a geographic coordinate to tile-local pixel coordinates (integer).
+///
+/// Returns (x, y) where both are in the range [0, extent).
+/// Coordinates outside the tile bounds may be negative or >= extent.
+#[inline]
+fn to_tile_pixel(coord: &Coord<f64>, bounds: &TileBounds, extent: u32) -> (i32, i32) {
+    let extent_f = extent as f64;
+
+    // Normalize to 0-1 within tile bounds
+    let x_ratio = (coord.x - bounds.lng_min) / (bounds.lng_max - bounds.lng_min);
+    let y_ratio = (coord.y - bounds.lat_min) / (bounds.lat_max - bounds.lat_min);
+
+    // Scale to extent and flip Y (tile coords have Y increasing downward)
+    let x = (x_ratio * extent_f).floor() as i32;
+    let y = ((1.0 - y_ratio) * extent_f).floor() as i32;
+
+    (x, y)
+}
+
+/// Returns true if the line should be DROPPED (not rendered).
+///
+/// Tippecanoe drops lines when all vertices collapse to the same tile pixel
+/// after coordinate quantization. This happens when a line is too small to
+/// have any visual extent at the current zoom level.
+///
+/// # Arguments
+///
+/// * `line` - The LineString to check (in geographic coordinates)
+/// * `_zoom` - The zoom level (unused - bounds already define the tile)
+/// * `extent` - The tile extent (typically 4096)
+/// * `tile_bounds` - The geographic bounds of the tile
+///
+/// # Returns
+///
+/// `true` if the line should be dropped (all points collapse to same pixel),
+/// `false` if the line should be kept (has visual extent).
+///
+/// # Example
+///
+/// ```
+/// use gpq_tiles_core::feature_drop::should_drop_tiny_line;
+/// use gpq_tiles_core::tile::TileBounds;
+/// use geo::{LineString, Coord};
+///
+/// let bounds = TileBounds::new(0.0, 0.0, 1.0, 1.0);
+/// let extent = 4096;
+///
+/// // A line that spans most of the tile - should NOT be dropped
+/// let long_line = LineString::new(vec![
+///     Coord { x: 0.1, y: 0.1 },
+///     Coord { x: 0.9, y: 0.9 },
+/// ]);
+/// assert!(!should_drop_tiny_line(&long_line, 0, extent, &bounds));
+///
+/// // A tiny line (all points collapse to same pixel) - should be dropped
+/// let tiny_line = LineString::new(vec![
+///     Coord { x: 0.5, y: 0.5 },
+///     Coord { x: 0.50012, y: 0.5 },
+/// ]);
+/// assert!(should_drop_tiny_line(&tiny_line, 0, extent, &bounds));
+/// ```
+pub fn should_drop_tiny_line(
+    line: &LineString<f64>,
+    _zoom: u8,
+    extent: u32,
+    tile_bounds: &TileBounds,
+) -> bool {
+    // Empty lines should be dropped
+    if line.0.is_empty() {
+        return true;
+    }
+
+    // Single-point "lines" should be dropped (they have no extent)
+    if line.0.len() == 1 {
+        return true;
+    }
+
+    // Convert all points to tile-local pixel coordinates
+    let first_pixel = to_tile_pixel(&line.0[0], tile_bounds, extent);
+
+    // Check if all points collapse to the same pixel
+    line.0
+        .iter()
+        .skip(1)
+        .all(|coord| to_tile_pixel(coord, tile_bounds, extent) == first_pixel)
+}
+
+/// Returns true if any line in the MultiLineString should be kept.
+///
+/// Filters out lines that collapse to a single pixel. If ALL lines
+/// collapse, the entire MultiLineString should be dropped.
+///
+/// # Returns
+///
+/// `true` if the entire MultiLineString should be dropped,
+/// `false` if at least one line has visual extent.
+pub fn should_drop_tiny_multiline(
+    mls: &MultiLineString<f64>,
+    zoom: u8,
+    extent: u32,
+    tile_bounds: &TileBounds,
+) -> bool {
+    // Drop if empty
+    if mls.0.is_empty() {
+        return true;
+    }
+
+    // Drop if ALL component lines are too small
+    mls.0
+        .iter()
+        .all(|line| should_drop_tiny_line(line, zoom, extent, tile_bounds))
+}
+
+/// Filter a MultiLineString, keeping only lines with visual extent.
+///
+/// Returns `None` if all lines should be dropped.
+pub fn filter_multiline(
+    mls: &MultiLineString<f64>,
+    zoom: u8,
+    extent: u32,
+    tile_bounds: &TileBounds,
+) -> Option<MultiLineString<f64>> {
+    let kept: Vec<LineString<f64>> = mls
+        .0
+        .iter()
+        .filter(|line| !should_drop_tiny_line(line, zoom, extent, tile_bounds))
+        .cloned()
+        .collect();
+
+    if kept.is_empty() {
+        None
+    } else {
+        Some(MultiLineString::new(kept))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo::{Coord, LineString, Polygon};
+    use geo::{Coord, LineString, MultiLineString, Polygon};
+
+    // =========================================================================
+    // LINE DROPPING TESTS
+    // =========================================================================
+
+    /// Helper to create a TileBounds
+    fn bounds(lng_min: f64, lat_min: f64, lng_max: f64, lat_max: f64) -> TileBounds {
+        TileBounds::new(lng_min, lat_min, lng_max, lat_max)
+    }
+
+    /// Helper to create a LineString from coordinate pairs
+    fn line(coords: &[(f64, f64)]) -> LineString<f64> {
+        LineString::new(coords.iter().map(|&(x, y)| Coord { x, y }).collect())
+    }
+
+    #[test]
+    fn test_long_line_never_dropped() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let long_line = line(&[(0.0, 0.0), (1.0, 1.0)]);
+        assert!(
+            !should_drop_tiny_line(&long_line, 10, extent, &tile_bounds),
+            "Long diagonal line should NOT be dropped"
+        );
+    }
+
+    #[test]
+    fn test_horizontal_line_100_pixels() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let horizontal_line = line(&[(0.0, 0.5), (0.0244, 0.5)]);
+        assert!(
+            !should_drop_tiny_line(&horizontal_line, 10, extent, &tile_bounds),
+            "100-pixel horizontal line should NOT be dropped"
+        );
+    }
+
+    #[test]
+    fn test_tiny_line_always_dropped() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let tiny_line = line(&[(0.5, 0.5), (0.50012, 0.5)]);
+        assert!(
+            should_drop_tiny_line(&tiny_line, 10, extent, &tile_bounds),
+            "Tiny line (sub-pixel, horizontal only) should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_zero_length_line_dropped() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let zero_line = line(&[(0.5, 0.5), (0.5, 0.5)]);
+        assert!(
+            should_drop_tiny_line(&zero_line, 10, extent, &tile_bounds),
+            "Zero-length line should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_single_point_line_dropped() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let single_point = line(&[(0.5, 0.5)]);
+        assert!(
+            should_drop_tiny_line(&single_point, 10, extent, &tile_bounds),
+            "Single-point line should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_empty_line_dropped() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let empty_line = LineString::new(vec![]);
+        assert!(
+            should_drop_tiny_line(&empty_line, 10, extent, &tile_bounds),
+            "Empty line should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_multiline_with_one_visible_line_kept() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let mls = MultiLineString::new(vec![
+            line(&[(0.0, 0.0), (1.0, 1.0)]),
+            line(&[(0.5, 0.5), (0.50001, 0.50001)]),
+        ]);
+        assert!(
+            !should_drop_tiny_multiline(&mls, 10, extent, &tile_bounds),
+            "MultiLineString with at least one visible line should NOT be dropped"
+        );
+    }
+
+    #[test]
+    fn test_multiline_all_tiny_dropped() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let mls = MultiLineString::new(vec![
+            line(&[(0.5, 0.5), (0.50012, 0.5)]),
+            line(&[(0.25, 0.25), (0.25012, 0.25)]),
+            line(&[(0.75, 0.75), (0.75012, 0.75)]),
+        ]);
+        assert!(
+            should_drop_tiny_multiline(&mls, 10, extent, &tile_bounds),
+            "MultiLineString where ALL lines are tiny should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_filter_multiline_removes_tiny() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let mls = MultiLineString::new(vec![
+            line(&[(0.0, 0.0), (1.0, 1.0)]),
+            line(&[(0.5, 0.5), (0.5001, 0.5)]),
+            line(&[(0.0, 0.5), (0.5, 0.5)]),
+        ]);
+        let filtered = filter_multiline(&mls, 10, extent, &tile_bounds);
+        assert!(filtered.is_some());
+        let filtered = filtered.unwrap();
+        assert_eq!(filtered.0.len(), 2, "Should have 2 lines after filtering");
+    }
+
+    #[test]
+    fn test_line_at_tile_edge_short_segment() {
+        let tile_bounds = bounds(-180.0, -85.0, 180.0, 85.0);
+        let extent = 4096;
+        let edge_line = line(&[(179.95, 0.0), (179.951, 0.0)]);
+        assert!(
+            should_drop_tiny_line(&edge_line, 0, extent, &tile_bounds),
+            "Very short line near tile edge should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_line_crosses_multiple_pixels() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let two_pixel_line = line(&[(0.5, 0.5), (0.5005, 0.5)]);
+        assert!(
+            !should_drop_tiny_line(&two_pixel_line, 10, extent, &tile_bounds),
+            "Line spanning 2+ pixels should NOT be dropped"
+        );
+    }
+
+    #[test]
+    fn test_to_tile_pixel_corners() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let bl = to_tile_pixel(&Coord { x: 0.0, y: 0.0 }, &tile_bounds, extent);
+        assert_eq!(bl.0, 0);
+        assert_eq!(bl.1, 4096);
+        let tr = to_tile_pixel(&Coord { x: 1.0, y: 1.0 }, &tile_bounds, extent);
+        assert_eq!(tr.0, 4096);
+        assert_eq!(tr.1, 0);
+    }
+
+    #[test]
+    fn test_to_tile_pixel_center() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let center = to_tile_pixel(&Coord { x: 0.5, y: 0.5 }, &tile_bounds, extent);
+        assert_eq!(center.0, 2048);
+        assert_eq!(center.1, 2048);
+    }
+
+    #[test]
+    fn test_multipoint_line_all_collapse() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let dense_tiny_line = line(&[
+            (0.5, 0.5),
+            (0.50004, 0.5),
+            (0.50008, 0.5),
+            (0.50012, 0.5),
+            (0.50016, 0.5),
+        ]);
+        assert!(
+            should_drop_tiny_line(&dense_tiny_line, 10, extent, &tile_bounds),
+            "Line with many points that all collapse should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_multipoint_line_one_different() {
+        let tile_bounds = bounds(0.0, 0.0, 1.0, 1.0);
+        let extent = 4096;
+        let mixed_line = line(&[
+            (0.5, 0.5),
+            (0.50001, 0.50001),
+            (0.50002, 0.50002),
+            (0.6, 0.6),
+            (0.50004, 0.50004),
+        ]);
+        assert!(
+            !should_drop_tiny_line(&mixed_line, 10, extent, &tile_bounds),
+            "Line with at least one point in a different pixel should NOT be dropped"
+        );
+    }
+
+    #[test]
+    fn test_line_visible_at_high_zoom_dropped_at_low() {
+        let extent = 4096;
+        let high_zoom_bounds = bounds(0.0, 0.0, 0.01, 0.01);
+        let small_line = line(&[(0.005, 0.005), (0.0051, 0.0051)]);
+        assert!(
+            !should_drop_tiny_line(&small_line, 14, extent, &high_zoom_bounds),
+            "Line should be visible at high zoom (small tile bounds)"
+        );
+        let low_zoom_bounds = bounds(0.0, 0.0, 10.0, 10.0);
+        assert!(
+            should_drop_tiny_line(&small_line, 4, extent, &low_zoom_bounds),
+            "Line should be dropped at low zoom (large tile bounds)"
+        );
+    }
+
+    // =========================================================================
+    // POLYGON DROPPING TESTS
+    // =========================================================================
 
     /// Create a square polygon centered at the given tile-local coordinates.
     /// `side` is the side length in tile pixels (at extent 4096).
