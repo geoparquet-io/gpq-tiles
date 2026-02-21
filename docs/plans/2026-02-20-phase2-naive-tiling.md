@@ -166,6 +166,60 @@ Document expected differences from tippecanoe here. These are not bugs—they're
 | Clipping buffer | We use configurable buffer; tippecanoe uses 8 pixels default | `--buffer` flag | Match tippecanoe default |
 | Coordinate precision | Rounding behavior at tile extent boundaries | MVT spec §4.3.3 | Verify via round-trip tests |
 
+## Critical Issues Found (Post-Implementation Review)
+
+These issues were identified during code review and **must be fixed** before Phase 3:
+
+### 1. Simplification in Wrong Coordinate Space (CRITICAL)
+
+**Problem:** We simplify geometries in geographic degrees, but tippecanoe simplifies in tile-local pixel coordinates.
+
+**Impact:** At high latitudes (e.g., Alaska, Scandinavia), 1 degree of longitude covers fewer meters than at the equator. Our current approach over-simplifies features at high latitudes and under-simplifies at the equator.
+
+**Current flow:**
+```
+Geographic Coords → Clip → Simplify (degrees) → Transform to tile coords → Encode
+```
+
+**Correct flow:**
+```
+Geographic Coords → Clip → Transform to tile coords → Simplify (pixels) → Encode
+```
+
+**Fix:** Refactor `simplify_for_zoom()` to operate on tile-local coordinates (0-4096), or transform before simplification in the pipeline.
+
+### 2. Antimeridian Crossing (CRITICAL)
+
+**Problem:** `tiles_for_bbox()` produces an empty iterator when `lng_min > lng_max` (e.g., bbox from 170° to -170°).
+
+**Impact:** Global datasets crossing the Pacific will silently produce zero tiles.
+
+**Fix:** Detect antimeridian crossing and split bbox into two ranges: `[lng_min, 180]` and `[-180, lng_max]`.
+
+### 3. Degenerate Geometry Handling (MEDIUM)
+
+**Problem:** After simplification, polygons may become degenerate (<4 coordinates). These are silently dropped in MVT encoding.
+
+**Impact:** Silent feature loss; differs from tippecanoe which preserves as lower-dimensional primitives.
+
+**Fix:** Add validation post-simplification; optionally convert degenerate polygons to points.
+
+### 4. Memory Usage for Large Files (MEDIUM)
+
+**Problem:** `extract_geometries()` loads all geometries into `Vec<Geometry>`, and `TileIterator` stores the full geometry list.
+
+**Impact:** Large files (millions of features) will exhaust memory.
+
+**Fix:** Phase 4 will add streaming with spatial index. For now, document the limitation.
+
+### 5. Polygon Winding Order (MEDIUM)
+
+**Problem:** No validation that polygon rings have correct winding order (exterior CCW, interior CW per MVT spec).
+
+**Impact:** Some renderers may display polygons incorrectly or reject them.
+
+**Fix:** Add winding order validation/correction in MVT encoding.
+
 ---
 
 ## Task 1: GeoArrow Batch Iterator - Failing Test
@@ -2431,22 +2485,19 @@ git commit -m "perf: add criterion benchmarks for pipeline, MVT encoding, and PM
 
 ## Summary Table
 
-| Task | Description | Difficulty | Time Est. |
-|------|-------------|------------|-----------|
-| 1 | GeoArrow Batch Iterator - Test | 4/10 | 20 min |
-| 2 | GeoArrow Batch Iterator - Impl | 6/10 | 60 min |
-| 3 | Clipping | 5/10 | 45 min |
-| 4 | Simplification | 3/10 | 20 min |
-| 5 | MVT Encoding | 5/10 | 45 min |
-| 6 | Tile Pipeline | 5/10 | 45 min |
-| 7 | PMTiles Writer - Header | 5/10 | 45 min |
-| 8 | PMTiles Writer - Directory | 6/10 | 45 min |
-| 9 | PMTiles Writer - Full | 6/10 | 60 min |
-| 10 | Golden Comparison Tests | 5/10 | 45 min |
-| 11 | CI Configuration | 2/10 | 15 min |
-| 12 | Criterion Benchmarks | 3/10 | 30 min |
+| Task | Description | Difficulty | Status | Tests |
+|------|-------------|------------|--------|-------|
+| 1-2 | GeoArrow Batch Iterator | 5/10 | ✅ Done | 3 |
+| 3 | Clipping | 5/10 | ✅ Done | 15 |
+| 4 | Simplification | 3/10 | ✅ Done | 7 |
+| 5 | MVT Encoding | 5/10 | ✅ Done | 28 |
+| 6 | Tile Pipeline | 5/10 | ✅ Done | 13 |
+| 7-9 | PMTiles Writer | 6/10 | ⏳ Next | - |
+| 10 | Golden Comparison Tests | 5/10 | ✅ Done | 6 |
+| 11 | CI Configuration | 2/10 | ✅ Exists | - |
+| 12 | Criterion Benchmarks | 3/10 | 🔲 Phase 3 | - |
 
-**Total: ~8.5 hours estimated**
+**Current: 84 tests passing across 6 modules.**
 
 **Average Difficulty: 4.6/10**
 

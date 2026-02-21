@@ -26,11 +26,11 @@ End-to-end pipeline with stub implementations:
 
 **Goal**: `cargo run -- input.parquet output.pmtiles` produces a valid (though empty) PMTiles file. This establishes the pipeline structure and resolves dependency/build issues before implementing real logic.
 
-### Phase 2: Naive Tiling (In Progress)
+### Phase 2: Naive Tiling (Near Complete)
 
 Produce functional vector tiles:
 - For each zoom level, for each tile intersecting the data bbox:
-  - Clip features to tile bounds (simple bbox clipping)
+  - Clip features to tile bounds (with 8px buffer)
   - Simplify geometries with Ramer-Douglas-Peucker (tolerance scaled to tile size)
   - Encode as Mapbox Vector Tile (MVT) format using `prost`
   - Write tiles to PMTiles archive
@@ -44,16 +44,27 @@ Produce functional vector tiles:
 - ✅ **Step 3**: Tile coordinate math (Web Mercator projection, `lng_lat_to_tile()`, `tiles_for_bbox()`)
 - ✅ **Step 4**: Dataset bounding box and tile grid calculation
 - ✅ **Step 5**: Geometry extraction from GeoArrow arrays (`batch_processor.rs`)
-- ⏳ **Step 6**: Geometry clipping to tile bounds (`clip.rs`)
-- ⏳ **Step 7**: Geometry simplification (`simplify.rs`)
-- ⏳ **Step 8**: MVT encoding (`mvt.rs`)
-- ⏳ **Step 9**: Tile generation pipeline (`tiler.rs`)
-- ⏳ **Step 10**: PMTiles v3 writing (`pmtiles_writer.rs`)
-- ⏳ **Step 11**: Golden comparison tests (`golden.rs`)
+- ✅ **Step 6**: Geometry clipping to tile bounds (`clip.rs`) - 15 tests
+- ✅ **Step 7**: Geometry simplification (`simplify.rs`) - 7 tests
+- ✅ **Step 8**: MVT encoding (`mvt.rs`) - 28 tests
+- ✅ **Step 9**: Tile generation pipeline (`pipeline.rs`) - 13 tests
+- ✅ **Step 10**: Golden comparison tests (`golden.rs`) - 6 tests
+- ⏳ **Step 11**: PMTiles v3 writing (`pmtiles_writer.rs`)
 
-**Current Status**: Core library can read GeoParquet, extract geometries via GeoArrow, and calculate tile grids. Remaining: clipping, simplification, MVT encoding, PMTiles writing, and golden tests.
+**Current Status**: 84 tests passing. Full pipeline works: GeoParquet → clip → simplify → MVT bytes. Remaining: PMTiles writer.
 
-**Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown with code, tests, and acceptance criteria.
+**Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown.
+
+#### Known Issues (Must Fix Before Phase 3)
+
+| Severity | Issue | Description |
+|----------|-------|-------------|
+| **Critical** | Simplification coordinate space | We simplify in geographic degrees; tippecanoe simplifies in tile-local pixels. Causes inconsistent simplification at high latitudes. |
+| **Critical** | Antimeridian crossing | `tiles_for_bbox` produces empty iterator when bbox crosses antimeridian (lng 170 to -170). |
+| **Medium** | Degenerate geometry handling | No validation post-simplification; degenerate polygons silently dropped. |
+| **Medium** | Memory for large files | `extract_geometries` loads all into `Vec`, defeating Arrow zero-copy. |
+| **Medium** | No polygon winding validation | Could produce invalid MVT tiles. |
+| **Low** | Value deduplication uses Debug | `LayerBuilder` uses `format!("{:?}", value)` for hash keys; fragile. |
 
 ### Phase 3: Feature Dropping
 
