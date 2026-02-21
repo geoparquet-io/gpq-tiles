@@ -227,7 +227,7 @@ Contributions are welcome! Please:
 This project follows a layered testing approach:
 
 1. **Unit tests**: Fast, focused tests for algorithmic correctness
-   - **Current**: 117 tests passing across all modules
+   - **Current**: 122 tests passing across all modules
 2. **Property-based tests**: `proptest` for edge cases (geometry round-trips, tile coordinate invariants)
 3. **Integration tests**: GeoParquet → PMTiles pipelines with golden file comparison
    - Semantic comparison against tippecanoe output (not byte-exact)

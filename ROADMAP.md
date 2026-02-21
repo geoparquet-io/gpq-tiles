@@ -53,7 +53,7 @@ Produce functional vector tiles:
 - ✅ **Step 12**: CI/CD configuration (ci.yml, mutation-tests.yml)
 - ✅ **Step 13**: Criterion benchmark harness (`benches/tiling.rs`)
 
-**Final Status**: 117 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
+**Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
 #### Golden Comparison Results
 
@@ -70,12 +70,12 @@ The pipeline is validated against tippecanoe-generated tiles:
 
 **Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown.
 
-#### Known Issues (To Address in Phase 3)
+#### Known Issues (Remaining)
 
 | Severity | Issue | Description |
 |----------|-------|-------------|
-| **Critical** | Simplification coordinate space | We simplify in geographic degrees; tippecanoe simplifies in tile-local pixels. Causes inconsistent simplification at high latitudes. |
-| **Critical** | Antimeridian crossing | `tiles_for_bbox` produces empty iterator when bbox crosses antimeridian (lng 170 to -170). |
+| ~~**Critical**~~ | ~~Simplification coordinate space~~ | ✅ **FIXED** - Now uses `simplify_in_tile_coords()` with pixel-based tolerance |
+| ~~**Critical**~~ | ~~Antimeridian crossing~~ | ✅ **FIXED** - `tiles_for_bbox()` now splits bbox at 180° |
 | **Medium** | Degenerate geometry handling | No validation post-simplification; degenerate polygons silently dropped. |
 | **Medium** | Memory for large files | `extract_geometries` loads all into `Vec`, defeating Arrow zero-copy. |
 | **Medium** | No polygon winding validation | Could produce invalid MVT tiles. |
@@ -83,11 +83,7 @@ The pipeline is validated against tippecanoe-generated tiles:
 
 ### Phase 3: Feature Dropping 🚧 NEXT
 
-**Prerequisites (must fix first):**
-
-1. **Simplification coordinate space** (Critical): Currently we simplify in geographic degrees, but tippecanoe simplifies in tile-local pixel coordinates. This causes inconsistent simplification at high latitudes (1° longitude covers fewer meters near poles). **Fix**: Transform to tile coordinates before simplification, or calculate tolerance in meters.
-
-2. **Antimeridian crossing** (Critical): `tiles_for_bbox()` produces empty iterator when bbox crosses 180° longitude (e.g., lng 170 to -170). **Fix**: Detect when `lng_min > lng_max` and split into two ranges: `[lng_min, 180]` and `[-180, lng_max]`.
+**Prerequisites:** ✅ All critical issues fixed!
 
 **Feature dropping implementation:**
 
