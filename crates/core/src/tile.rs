@@ -131,6 +131,10 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
 
 /// Get all tiles that intersect a geographic bounding box at a given zoom level
 ///
+/// Handles antimeridian crossing: when `lng_min > lng_max`, the bbox crosses
+/// the antimeridian (180° longitude) and is split into two ranges:
+/// `[lng_min, 180°]` and `[-180°, lng_max]`.
+///
 /// # Arguments
 ///
 /// * `bbox` - Geographic bounding box
@@ -140,13 +144,41 @@ pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
 ///
 /// Iterator of TileCoord that intersect the bbox
 pub fn tiles_for_bbox(bbox: &TileBounds, zoom: u8) -> impl Iterator<Item = TileCoord> {
-    // Get corner tiles
-    let min_tile = lng_lat_to_tile(bbox.lng_min, bbox.lat_max, zoom); // Note: lat_max for min_y
-    let max_tile = lng_lat_to_tile(bbox.lng_max, bbox.lat_min, zoom); // Note: lat_min for max_y
+    let crosses_antimeridian = bbox.lng_min > bbox.lng_max;
 
-    // Iterate over all tiles in the range
-    (min_tile.y..=max_tile.y)
-        .flat_map(move |y| (min_tile.x..=max_tile.x).map(move |x| TileCoord::new(x, y, zoom)))
+    // Get y-tile range (latitude doesn't wrap)
+    let min_y_tile = lng_lat_to_tile(bbox.lng_min, bbox.lat_max, zoom).y; // lat_max -> min_y
+    let max_y_tile = lng_lat_to_tile(bbox.lng_min, bbox.lat_min, zoom).y; // lat_min -> max_y
+
+    let max_tile_x = 2_u32.pow(zoom as u32) - 1;
+
+    // Calculate x-tile ranges
+    let (x_ranges, second_range): ((u32, u32), Option<(u32, u32)>) = if crosses_antimeridian {
+        // Split into two ranges: [lng_min, 180°] and [-180°, lng_max]
+        let west_x = lng_lat_to_tile(bbox.lng_min, 0.0, zoom).x; // From lng_min to 180°
+        let east_x = lng_lat_to_tile(bbox.lng_max, 0.0, zoom).x; // From -180° to lng_max
+
+        // First range: lng_min to 180° (west_x to max_tile_x)
+        // Second range: -180° to lng_max (0 to east_x)
+        ((west_x, max_tile_x), Some((0, east_x)))
+    } else {
+        // Normal case: single range
+        let min_x = lng_lat_to_tile(bbox.lng_min, 0.0, zoom).x;
+        let max_x = lng_lat_to_tile(bbox.lng_max, 0.0, zoom).x;
+        ((min_x, max_x), None)
+    };
+
+    // Generate tiles for the first x-range
+    let first_tiles = (min_y_tile..=max_y_tile)
+        .flat_map(move |y| (x_ranges.0..=x_ranges.1).map(move |x| TileCoord::new(x, y, zoom)));
+
+    // Generate tiles for the second x-range (if crossing antimeridian)
+    let second_tiles = second_range.into_iter().flat_map(move |(x_min, x_max)| {
+        (min_y_tile..=max_y_tile)
+            .flat_map(move |y| (x_min..=x_max).map(move |x| TileCoord::new(x, y, zoom)))
+    });
+
+    first_tiles.chain(second_tiles)
 }
 
 #[cfg(test)]
@@ -264,5 +296,69 @@ mod tests {
 
             assert_eq!(tile, tile_back, "Round-trip failed at zoom {}", zoom);
         }
+    }
+
+    #[test]
+    fn test_tiles_for_bbox_antimeridian_crossing() {
+        // Fiji area: bbox from 170°E to 170°W (which is -170°)
+        // This crosses the antimeridian at 180°
+        let bbox = TileBounds::new(170.0, -20.0, -170.0, -10.0);
+        let tiles: Vec<_> = tiles_for_bbox(&bbox, 4).collect();
+
+        // Should NOT be empty - this is the bug we're fixing
+        assert!(
+            !tiles.is_empty(),
+            "Antimeridian crossing bbox should produce tiles"
+        );
+
+        // Collect all unique x coordinates
+        let x_coords: std::collections::HashSet<_> = tiles.iter().map(|t| t.x).collect();
+
+        // At zoom 4, the world is 16 tiles wide (0-15)
+        // 170° is around x=15, -170° is around x=0
+        // We should have tiles on BOTH sides of the antimeridian
+        let has_high_x = x_coords.iter().any(|&x| x >= 15); // Near 180° (east side)
+        let has_low_x = x_coords.iter().any(|&x| x <= 1); // Near -180° (west side)
+
+        assert!(
+            has_high_x && has_low_x,
+            "Should have tiles on both sides of antimeridian. Got x coords: {:?}",
+            x_coords
+        );
+    }
+
+    #[test]
+    fn test_tiles_for_bbox_normal_still_works() {
+        // Normal case: Europe (doesn't cross antimeridian)
+        let bbox = TileBounds::new(-10.0, 40.0, 10.0, 50.0);
+        let tiles: Vec<_> = tiles_for_bbox(&bbox, 4).collect();
+
+        assert!(!tiles.is_empty(), "Normal bbox should produce tiles");
+
+        // All tiles should be in the expected range
+        for tile in &tiles {
+            assert_eq!(tile.z, 4);
+        }
+    }
+
+    #[test]
+    fn test_tiles_for_bbox_antimeridian_tile_count() {
+        // At zoom 2, tiles are ~90° wide
+        // A bbox from 170° to -170° spans about 20° (across the antimeridian)
+        // Should produce a reasonable number of tiles, not wrap around the whole world
+        let bbox = TileBounds::new(170.0, -20.0, -170.0, -10.0);
+        let tiles: Vec<_> = tiles_for_bbox(&bbox, 2).collect();
+
+        // At zoom 2 (4x4 grid), this should be ~1-2 tiles in x direction
+        // The bbox is small, just crossing the antimeridian
+        let x_coords: std::collections::HashSet<_> = tiles.iter().map(|t| t.x).collect();
+
+        // Should have tiles from x=3 (170°-180°) and x=0 (-180° to -170°)
+        assert!(
+            x_coords.len() <= 3,
+            "Antimeridian bbox should produce tiles only near the crossing, not wrap around. Got {} unique x coords: {:?}",
+            x_coords.len(),
+            x_coords
+        );
     }
 }
