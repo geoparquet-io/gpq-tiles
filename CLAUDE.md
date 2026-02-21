@@ -49,14 +49,38 @@ geometries.push((geom, row_offset + i));  // Heap allocation per feature!
 
 **Exception:** Complex operations (boolean clipping) may require temporary `geo::Geometry` conversion, but this should be minimized and documented.
 
-### 3. Reference Implementations
+### 3. Reference Implementations (CRITICAL)
 
-Study these for algorithm decisions:
+**All algorithms MUST match tippecanoe behavior as closely as possible.**
 
-- **tippecanoe** (https://github.com/felt/tippecanoe) - Feature dropping, simplification strategies
-- **planetiler** (https://github.com/onthegomap/planetiler) - Java, but excellent architecture for streaming tile generation
+Reference implementations in priority order:
+1. **tippecanoe** (https://github.com/felt/tippecanoe) - PRIMARY reference for all algorithms
+2. **planetiler** (https://github.com/onthegomap/planetiler) - Secondary reference for architecture patterns
 
-When in doubt about how to handle edge cases (degenerate geometries, antimeridian, etc.), check how tippecanoe handles it.
+**Decision hierarchy:**
+- Where tippecanoe and planetiler agree → follow that approach
+- Where they diverge → prefer tippecanoe
+- Where tippecanoe's approach isn't feasible in Rust → document the deviation explicitly in the code AND in `docs/plans/` with rationale
+
+**Key tippecanoe behaviors to match:**
+
+| Algorithm | Tippecanoe Approach |
+|-----------|---------------------|
+| Simplification | Douglas-Peucker to tile resolution at each zoom level |
+| Tiny polygons | Diffuse probability for polygons < 4 square subpixels |
+| Line dropping | Drop lines too small to render at zoom level |
+| Point thinning | Drop 1/2.5 of points per zoom above base zoom |
+| Clipping buffer | 8 pixels default (`--buffer`) |
+
+**When deviating from tippecanoe:**
+```rust
+// DIVERGENCE FROM TIPPECANOE: [reason]
+// Tippecanoe does X (see tile.cpp:L312)
+// We do Y because [Rust limitation / performance / etc.]
+// Tracking issue: #NNN (if applicable)
+```
+
+Document all divergences in the Known Divergences table in `docs/plans/2026-02-20-phase2-naive-tiling.md`.
 
 ## Architecture
 
