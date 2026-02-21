@@ -35,6 +35,7 @@ pub mod vector_tile {
 
 pub mod batch_processor;
 pub mod clip;
+pub mod feature_drop;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]
