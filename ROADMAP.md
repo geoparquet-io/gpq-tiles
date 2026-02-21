@@ -26,7 +26,7 @@ End-to-end pipeline with stub implementations:
 
 **Goal**: `cargo run -- input.parquet output.pmtiles` produces a valid (though empty) PMTiles file. This establishes the pipeline structure and resolves dependency/build issues before implementing real logic.
 
-### Phase 2: Naive Tiling (Near Complete)
+### Phase 2: Naive Tiling ✅ COMPLETE
 
 Produce functional vector tiles:
 - For each zoom level, for each tile intersecting the data bbox:
@@ -49,13 +49,15 @@ Produce functional vector tiles:
 - ✅ **Step 8**: MVT encoding (`mvt.rs`) - 28 tests
 - ✅ **Step 9**: Tile generation pipeline (`pipeline.rs`) - 13 tests
 - ✅ **Step 10**: Golden comparison tests (`golden.rs`) - 6 tests
-- ⏳ **Step 11**: PMTiles v3 writing (`pmtiles_writer.rs`)
+- ✅ **Step 11**: PMTiles v3 writing (`pmtiles_writer.rs`) - 24 tests
+- ✅ **Step 12**: CI/CD configuration (ci.yml, mutation-tests.yml)
+- ✅ **Step 13**: Criterion benchmark harness (`benches/tiling.rs`)
 
-**Current Status**: 84 tests passing. Full pipeline works: GeoParquet → clip → simplify → MVT bytes. Remaining: PMTiles writer.
+**Final Status**: 108 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
 **Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown.
 
-#### Known Issues (Must Fix Before Phase 3)
+#### Known Issues (To Address in Phase 3)
 
 | Severity | Issue | Description |
 |----------|-------|-------------|
@@ -66,7 +68,7 @@ Produce functional vector tiles:
 | **Medium** | No polygon winding validation | Could produce invalid MVT tiles. |
 | **Low** | Value deduplication uses Debug | `LayerBuilder` uses `format!("{:?}", value)` for hash keys; fragile. |
 
-### Phase 3: Feature Dropping
+### Phase 3: Feature Dropping 🚧 NEXT
 
 Density-based feature dropping to prevent overcrowding at low zoom levels:
 
