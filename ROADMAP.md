@@ -53,7 +53,20 @@ Produce functional vector tiles:
 - ✅ **Step 12**: CI/CD configuration (ci.yml, mutation-tests.yml)
 - ✅ **Step 13**: Criterion benchmark harness (`benches/tiling.rs`)
 
-**Final Status**: 108 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
+**Final Status**: 117 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
+
+#### Golden Comparison Results
+
+The pipeline is validated against tippecanoe-generated tiles:
+
+| Metric | Tippecanoe | gpq-tiles | Notes |
+|--------|------------|-----------|-------|
+| Z10 features | 484 | 684 | 1.41x ratio - expected until Phase 3 |
+| Z8 features | 97 | 1000 | tippecanoe drops 90% at low zoom |
+| Area preserved | - | 88% | After clipping + simplification |
+| All zooms produce output | ✅ | ✅ | Z5-Z10 verified |
+
+**Key insight**: The 1.41x feature ratio at Z10 is expected. Tippecanoe implements tiny polygon reduction and feature dropping which we defer to Phase 3. The tests document this difference explicitly.
 
 **Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown.
 
@@ -70,6 +83,14 @@ Produce functional vector tiles:
 
 ### Phase 3: Feature Dropping 🚧 NEXT
 
+**Prerequisites (must fix first):**
+
+1. **Simplification coordinate space** (Critical): Currently we simplify in geographic degrees, but tippecanoe simplifies in tile-local pixel coordinates. This causes inconsistent simplification at high latitudes (1° longitude covers fewer meters near poles). **Fix**: Transform to tile coordinates before simplification, or calculate tolerance in meters.
+
+2. **Antimeridian crossing** (Critical): `tiles_for_bbox()` produces empty iterator when bbox crosses 180° longitude (e.g., lng 170 to -170). **Fix**: Detect when `lng_min > lng_max` and split into two ranges: `[lng_min, 180]` and `[-180, lng_max]`.
+
+**Feature dropping implementation:**
+
 Density-based feature dropping to prevent overcrowding at low zoom levels:
 
 ```
@@ -79,9 +100,14 @@ for each zoom:
     drop features where local_spacing < mingap
 ```
 
+Additional tippecanoe behaviors to match:
+- **Tiny polygon reduction**: Drop polygons < 4 square subpixels (diffuse probability)
+- **Line dropping**: Drop lines too small to render at zoom level
+- **Point thinning**: Drop 1/2.5 of points per zoom above base zoom
+
 Initial implementation uses simple linear or exponential falloff by zoom. Threshold tuning can be refined based on real-world data.
 
-**Goal**: Feature density visibly decreases at lower zooms without leaving maps empty.
+**Goal**: Feature density visibly decreases at lower zooms without leaving maps empty. Golden comparison ratio should approach 1.0x at high zoom levels.
 
 ### Phase 4: Parallelism
 

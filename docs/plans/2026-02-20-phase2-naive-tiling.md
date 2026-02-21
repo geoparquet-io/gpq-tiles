@@ -166,6 +166,28 @@ Document expected differences from tippecanoe here. These are not bugs—they're
 | Clipping buffer | We use configurable buffer; tippecanoe uses 8 pixels default | `--buffer` flag | Match tippecanoe default |
 | Coordinate precision | Rounding behavior at tile extent boundaries | MVT spec §4.3.3 | Verify via round-trip tests |
 
+## Golden Comparison Results (Phase 2 Complete)
+
+Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (Andorra, ~1000 buildings):
+
+| Zoom | Tippecanoe Features | gpq-tiles Features | Ratio | Notes |
+|------|--------------------|--------------------|-------|-------|
+| Z5 | 1 | 1000 | - | tippecanoe drops aggressively |
+| Z8 | 97 | 1000 | 10.3x | tippecanoe drops 90% at this zoom |
+| Z10 | 484 | 684 | 1.41x | Acceptable for Phase 2 |
+
+**Analysis:**
+- At high zoom (Z10), we're within 1.5x of tippecanoe - acceptable baseline
+- At low zoom (Z5-Z8), tippecanoe's feature dropping dominates - expected until Phase 3
+- Area preservation after clip+simplify: 88% - good fidelity
+- All zoom levels produce valid MVT tiles that decode correctly
+
+**Tests validating this:**
+- `test_golden_open_buildings_z10_feature_count` - verifies 1.41x ratio
+- `test_document_low_zoom_feature_dropping_difference` - documents Z8 difference
+- `test_golden_polygon_area_preserved_z10` - verifies 88% area preservation
+- `test_e2e_feature_count_golden_comparison_z10` - end-to-end pipeline validation
+
 ## Critical Issues Found (Post-Implementation Review)
 
 These issues were identified during code review and **must be fixed** before Phase 3:
