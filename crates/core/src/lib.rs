@@ -34,6 +34,7 @@ pub mod vector_tile {
 }
 
 pub mod batch_processor;
+pub mod clip;
 pub mod simplify;
 pub mod tile;
 
