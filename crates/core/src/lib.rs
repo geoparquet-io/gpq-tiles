@@ -37,6 +37,7 @@ pub mod batch_processor;
 pub mod clip;
 #[cfg(test)]
 mod golden;
+pub mod mvt;
 pub mod simplify;
 pub mod tile;
 
