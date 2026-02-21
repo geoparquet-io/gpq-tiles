@@ -37,6 +37,8 @@ pub mod batch_processor;
 pub mod clip;
 #[cfg(test)]
 mod golden;
+#[cfg(test)]
+mod integration_tests;
 pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
