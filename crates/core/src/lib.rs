@@ -38,6 +38,7 @@ pub mod clip;
 #[cfg(test)]
 mod golden;
 pub mod mvt;
+pub mod pipeline;
 pub mod simplify;
 pub mod tile;
 
