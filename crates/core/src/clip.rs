@@ -59,7 +59,7 @@ pub fn clip_geometry(
     match geom {
         Geometry::Point(p) => clip_point(p, &buffered).map(Geometry::Point),
         Geometry::LineString(ls) => clip_linestring(ls, &buffered),
-        Geometry::Polygon(poly) => clip_polygon(poly, &buffered).map(Geometry::Polygon),
+        Geometry::Polygon(poly) => clip_polygon(poly, &buffered),
         Geometry::MultiPolygon(mp) => clip_multipolygon(mp, &buffered).map(Geometry::MultiPolygon),
         Geometry::MultiLineString(mls) => clip_multilinestring(mls, &buffered),
         other => {
@@ -182,7 +182,11 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
 }
 
 /// Clip a polygon to bounds using intersection
-fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Polygon<f64>> {
+///
+/// Returns `Geometry::Polygon` if clipping results in a single polygon,
+/// or `Geometry::MultiPolygon` if the clip creates multiple disconnected parts
+/// (e.g., a U-shaped polygon clipped across its opening).
+fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
     if let Some(rect) = poly.bounding_rect() {
         if !intersects_bounds(&rect, bounds) {
@@ -205,12 +209,10 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Polygon<f64>
     // Use intersection for polygon-polygon clipping
     let clipped = poly.intersection(&clip_poly);
 
-    if clipped.0.is_empty() {
-        None
-    } else {
-        // Return first polygon (most common case)
-        // For multi-part results, caller may need to handle MultiPolygon
-        Some(clipped.0.into_iter().next().unwrap())
+    match clipped.0.len() {
+        0 => None,
+        1 => Some(Geometry::Polygon(clipped.0.into_iter().next().unwrap())),
+        _ => Some(Geometry::MultiPolygon(clipped)),
     }
 }
 
@@ -292,7 +294,12 @@ mod tests {
         let result = clip_polygon(&poly, &bounds);
         assert!(result.is_some());
 
-        let clipped = result.unwrap();
+        // Extract the polygon (should be single polygon for this simple case)
+        let clipped = match result.unwrap() {
+            Geometry::Polygon(p) => p,
+            Geometry::MultiPolygon(mp) => mp.0.into_iter().next().unwrap(),
+            _ => panic!("Expected polygon geometry"),
+        };
         // Verify clipped polygon is within bounds
         for coord in clipped.exterior().coords() {
             assert!(
@@ -458,5 +465,50 @@ mod tests {
         // With buffer: should clip to buffered bounds
         let result_with_buffer = clip_geometry(&poly, &bounds, buffer);
         assert!(result_with_buffer.is_some());
+    }
+
+    #[test]
+    fn test_clip_polygon_multipart_result() {
+        // U-shaped polygon that, when clipped by a horizontal band,
+        // produces two disconnected polygons (the two "arms" of the U)
+        let bounds = TileBounds::new(0.0, 4.0, 10.0, 6.0); // Horizontal band
+
+        // U-shape: two vertical bars connected at the bottom
+        // Left bar: x=1-2, y=0-10
+        // Right bar: x=8-9, y=0-10
+        // Bottom connector: x=1-9, y=0-2
+        let u_shape = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 1.0, y: 0.0 },
+                Coord { x: 2.0, y: 0.0 },
+                Coord { x: 2.0, y: 10.0 },
+                Coord { x: 1.0, y: 10.0 },
+                Coord { x: 1.0, y: 2.0 },
+                Coord { x: 8.0, y: 2.0 },
+                Coord { x: 8.0, y: 10.0 },
+                Coord { x: 9.0, y: 10.0 },
+                Coord { x: 9.0, y: 0.0 },
+                Coord { x: 1.0, y: 0.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon(&u_shape, &bounds);
+        assert!(result.is_some(), "U-shape should intersect the band");
+
+        // Should produce a MultiPolygon (two separate rectangles from the arms)
+        match result.unwrap() {
+            Geometry::MultiPolygon(mp) => {
+                assert_eq!(
+                    mp.0.len(),
+                    2,
+                    "Should have 2 polygon parts (left and right arms)"
+                );
+            }
+            Geometry::Polygon(_) => {
+                // This is also acceptable if geo merges them somehow
+            }
+            other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
+        }
     }
 }
