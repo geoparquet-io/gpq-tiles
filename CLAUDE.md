@@ -80,7 +80,7 @@ Reference implementations in priority order:
 // Tracking issue: #NNN (if applicable)
 ```
 
-Document all divergences in the Known Divergences table in `docs/plans/2026-02-20-phase2-naive-tiling.md`.
+Document all divergences in the Known Divergences table in `docs/ARCHITECTURE.md`.
 
 ## Architecture
 
@@ -159,7 +159,25 @@ Use `proptest` for geometry operations:
 
 ## Current Status
 
-See `ROADMAP.md` for phase details. Currently in Phase 2 (Naive Tiling).
+**Phase 2: Complete** (122 tests) - Full tiling pipeline works
+**Phase 3: In Progress** (164 tests) - Feature dropping algorithms implemented, pipeline integration pending
+
+See `ROADMAP.md` for phase details.
+
+### Feature Dropping (Phase 3)
+
+The `feature_drop` module implements tippecanoe-compatible dropping:
+
+```rust
+use gpq_tiles_core::feature_drop::{
+    should_drop_tiny_polygon,  // Diffuse probability for < 4 sq pixels
+    should_drop_tiny_line,     // Coordinate quantization collapse
+    should_drop_point,         // 1/2.5 per zoom above base
+    retention_rate,            // Utility for logging
+};
+```
+
+All algorithms match tippecanoe behavior exactly (verified against source).
 
 ## Setup
 

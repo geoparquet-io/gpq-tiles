@@ -55,6 +55,8 @@ Produce functional vector tiles:
 
 **Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
+**Current**: 164 tests (159 unit + 5 doc tests) after Phase 3 feature dropping implementation.
+
 #### Golden Comparison Results
 
 The pipeline is validated against tippecanoe-generated tiles:
@@ -68,7 +70,7 @@ The pipeline is validated against tippecanoe-generated tiles:
 
 **Key insight**: The 1.41x feature ratio at Z10 is expected. Tippecanoe implements tiny polygon reduction and feature dropping which we defer to Phase 3. The tests document this difference explicitly.
 
-**Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown.
+**Architecture**: See `docs/ARCHITECTURE.md` for design decisions and known divergences.
 
 #### Known Issues (Remaining)
 
@@ -81,27 +83,25 @@ The pipeline is validated against tippecanoe-generated tiles:
 | **Medium** | No polygon winding validation | Could produce invalid MVT tiles. |
 | **Low** | Value deduplication uses Debug | `LayerBuilder` uses `format!("{:?}", value)` for hash keys; fragile. |
 
-### Phase 3: Feature Dropping 🚧 NEXT
+### Phase 3: Feature Dropping 🚧 IN PROGRESS
 
 **Prerequisites:** ✅ All critical issues fixed!
 
-**Feature dropping implementation:**
+#### Implemented (39 tests in `feature_drop.rs`)
 
-Density-based feature dropping to prevent overcrowding at low zoom levels:
+| Algorithm | Status | Tests | Description |
+|-----------|--------|-------|-------------|
+| **Tiny polygon** | ✅ Done | 10 | Diffuse probability for < 4 sq pixels (matches tippecanoe) |
+| **Line dropping** | ✅ Done | 17 | Coordinate quantization - drop when all vertices collapse to same pixel |
+| **Point thinning** | ✅ Done | 12 | 1/2.5 drop rate per zoom above base (matches tippecanoe exactly) |
+| **Density-based** | 🚧 TODO | - | Spatial density calculation for overcrowded tiles |
+| **Pipeline integration** | 🚧 TODO | - | Wire dropping predicates into tile generation |
 
-```
-for each zoom:
-    spacing = tile_area / feature_count
-    mingap = threshold(zoom)
-    drop features where local_spacing < mingap
-```
+#### Remaining Work
 
-Additional tippecanoe behaviors to match:
-- **Tiny polygon reduction**: Drop polygons < 4 square subpixels (diffuse probability)
-- **Line dropping**: Drop lines too small to render at zoom level
-- **Point thinning**: Drop 1/2.5 of points per zoom above base zoom
-
-Initial implementation uses simple linear or exponential falloff by zoom. Threshold tuning can be refined based on real-world data.
+1. **Density-based dropping** (3-4 hours): Spatial density calculation for overcrowded tiles
+2. **Pipeline integration** (2-3 hours): Wire all dropping predicates into `pipeline.rs`
+3. **Tuning & validation** (1-2 hours): Adjust thresholds, verify golden comparison ratios improve
 
 **Goal**: Feature density visibly decreases at lower zooms without leaving maps empty. Golden comparison ratio should approach 1.0x at high zoom levels.
 
