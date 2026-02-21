@@ -85,14 +85,14 @@ converter.convert("input.parquet", "output.pmtiles")?;
 
 **Current Implementation (Phase 2 in progress):**
 
-1. **Read**: ✅ Loads GeoParquet using `geoparquet` crate (v0.4)
+1. **Read**: ✅ Loads GeoParquet using `geoparquet` crate
 2. **Iterate**: ✅ Processes features in batches via Apache Arrow RecordBatch
 3. **Tile Math**: ✅ Web Mercator projection (lng/lat ↔ tile x/y/z)
-4. **Extract**: 🚧 Extract geometries from GeoArrow arrays (in progress)
+4. **Extract**: ✅ Extract geometries from GeoArrow arrays (`batch_processor.rs`)
 5. **Clip**: 🚧 Bbox clipping with `geo` crate (planned)
 6. **Simplify**: 🚧 RDP simplification tuned per zoom level (planned)
 7. **Encode**: 🚧 MVT encoding with delta coordinates and command packing (planned)
-8. **Write**: 🚧 Write tiles to PMTiles archive (planned)
+8. **Write**: 🚧 Custom PMTiles v3 writer (planned)
 
 **When complete, the library will prioritize:**
 - Exact MVT command encoding (zigzag-encoded delta coordinates)
@@ -196,11 +196,12 @@ gpq-tiles/
   - [x] Tile coordinate math (Web Mercator projection)
 
 - [ ] **Phase 2: Medium/Hard Parts** - Actual tile generation 🚧
-  - [ ] Extract geometries from GeoArrow arrays
+  - [x] Extract geometries from GeoArrow arrays
   - [ ] Bbox clipping with `geo` crate
   - [ ] RDP simplification
   - [ ] MVT encoding (delta coordinates, command packing, zigzag)
-  - [ ] Write tiles to PMTiles
+  - [ ] Custom PMTiles v3 writer
+  - [ ] Golden comparison tests (semantic, not byte-exact)
 
 - [ ] **Phase 3: Feature Dropping** - Density-based optimization
 - [ ] **Phase 4: Parallelism** - Rayon + spatial indexing

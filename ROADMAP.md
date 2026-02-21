@@ -43,21 +43,17 @@ Produce functional vector tiles:
 - ✅ **Step 2**: Feature iteration via Apache Arrow `RecordBatch`
 - ✅ **Step 3**: Tile coordinate math (Web Mercator projection, `lng_lat_to_tile()`, `tiles_for_bbox()`)
 - ✅ **Step 4**: Dataset bounding box and tile grid calculation
-  - Note: Currently returns world bounds as placeholder; real bbox requires geometry extraction
-- ⏳ **Step 5**: Geometry extraction from Arrow arrays (blocked: needs GeoArrow array handling)
-- ⏳ **Step 6**: Geometry clipping to tile bounds
-- ⏳ **Step 7**: Geometry simplification (Ramer-Douglas-Peucker)
-- ⏳ **Step 8**: MVT encoding with delta-encoded coordinates
-- ⏳ **Step 9**: PMTiles writing
+- ✅ **Step 5**: Geometry extraction from GeoArrow arrays (`batch_processor.rs`)
+- ⏳ **Step 6**: Geometry clipping to tile bounds (`clip.rs`)
+- ⏳ **Step 7**: Geometry simplification (`simplify.rs`)
+- ⏳ **Step 8**: MVT encoding (`mvt.rs`)
+- ⏳ **Step 9**: Tile generation pipeline (`tiler.rs`)
+- ⏳ **Step 10**: PMTiles v3 writing (`pmtiles_writer.rs`)
+- ⏳ **Step 11**: Golden comparison tests (`golden.rs`)
 
-**Current Status**: 13 tests passing. Core library can read GeoParquet, iterate batches, and calculate tile grids. Geometry processing and MVT encoding remain.
+**Current Status**: Core library can read GeoParquet, extract geometries via GeoArrow, and calculate tile grids. Remaining: clipping, simplification, MVT encoding, PMTiles writing, and golden tests.
 
-**MVT encoding challenges:**
-- Delta-encoded coordinates (each point relative to previous)
-- Command integers (MoveTo/LineTo/ClosePath packed into u32s)
-- Zigzag-encoded signed integers
-
-Priority: Implement round-trip tests (encode → decode) to verify correctness.
+**Implementation Plan**: See `docs/plans/2026-02-20-phase2-naive-tiling.md` for detailed task breakdown with code, tests, and acceptance criteria.
 
 ### Phase 3: Feature Dropping
 
