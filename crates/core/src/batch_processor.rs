@@ -172,6 +172,29 @@ where
     Ok(count)
 }
 
+/// Extract all geometries from a GeoParquet file into a Vec.
+///
+/// **WARNING**: This loads all geometries into memory. Only use for small files
+/// or test fixtures. For production, use `process_geometries` instead.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file
+///
+/// # Returns
+///
+/// Vector of all geometries in the file
+pub fn extract_geometries(path: &Path) -> Result<Vec<Geometry<f64>>> {
+    let mut geometries = Vec::new();
+
+    process_geometries(path, |geom, _idx| {
+        geometries.push(geom);
+        Ok(())
+    })?;
+
+    Ok(geometries)
+}
+
 /// Calculate bounding box by streaming through batches.
 /// Does NOT load all geometries into memory.
 pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {

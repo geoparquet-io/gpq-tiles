@@ -122,6 +122,13 @@ pub fn lng_lat_to_tile(lng: f64, lat: f64, zoom: u8) -> TileCoord {
     TileCoord::new(x, y, zoom)
 }
 
+/// Get the geographic bounds of a tile
+///
+/// Convenience function that wraps `TileCoord::bounds()`
+pub fn tile_bounds(x: u32, y: u32, z: u8) -> TileBounds {
+    TileCoord::new(x, y, z).bounds()
+}
+
 /// Get all tiles that intersect a geographic bounding box at a given zoom level
 ///
 /// # Arguments

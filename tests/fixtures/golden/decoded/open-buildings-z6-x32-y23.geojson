@@ -1,0 +1,12 @@
+{
+"type": "FeatureCollection",
+"name": "open-buildings",
+"features": [
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 912.9347, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp94jr65" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 1195.0, 1563.0 ], [ 1195.0, 1561.0 ], [ 1193.0, 1561.0 ], [ 1193.0, 1563.0 ], [ 1195.0, 1563.0 ] ] ] } },
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 383.8355, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp94jx7t" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 1204.0, 1563.0 ], [ 1204.0, 1561.0 ], [ 1202.0, 1561.0 ], [ 1202.0, 1563.0 ], [ 1204.0, 1563.0 ] ] ] } },
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 301.1212, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp94jyvp" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 1214.0, 1561.0 ], [ 1214.0, 1559.0 ], [ 1212.0, 1559.0 ], [ 1212.0, 1561.0 ], [ 1214.0, 1561.0 ] ] ] } },
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 28.2675, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp91uxk0" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 1173.0, 1519.0 ], [ 1173.0, 1517.0 ], [ 1171.0, 1517.0 ], [ 1171.0, 1519.0 ], [ 1173.0, 1519.0 ] ] ] } },
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 524.3869, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp94p2sm" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 1262.0, 1527.0 ], [ 1262.0, 1525.0 ], [ 1260.0, 1525.0 ], [ 1260.0, 1527.0 ], [ 1262.0, 1527.0 ] ] ] } },
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 95.0812, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp94p2n5" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 1263.0, 1524.0 ], [ 1263.0, 1522.0 ], [ 1261.0, 1522.0 ], [ 1261.0, 1524.0 ], [ 1263.0, 1524.0 ] ] ] } }
+]
+}

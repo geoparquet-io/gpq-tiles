@@ -1,0 +1,7 @@
+{
+"type": "FeatureCollection",
+"name": "open-buildings",
+"features": [
+{ "type": "Feature", "properties": { "boundary_id": 334, "bf_source": "microsoft", "area_in_meters": 28.2675, "s2_id": 1441151880758558720, "country_iso": "AND", "geohash": "sp91uxk0" }, "geometry": { "type": "Polygon", "coordinates": [ [ [ 587.0, 760.0 ], [ 587.0, 758.0 ], [ 585.0, 758.0 ], [ 585.0, 760.0 ], [ 587.0, 760.0 ] ] ] } }
+]
+}

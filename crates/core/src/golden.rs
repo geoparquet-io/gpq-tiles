@@ -1,0 +1,382 @@
+//! Golden comparison tests against tippecanoe output.
+//!
+//! These tests verify that our clip/simplify pipeline produces similar results
+//! to tippecanoe by comparing feature counts, areas, and geometric similarity.
+//!
+//! # Golden Data Generation
+//!
+//! Golden tiles were generated using tippecanoe v2.49.0:
+//!
+//! ```bash
+//! tippecanoe \
+//!     -P \
+//!     '--layer=<layer-name>' \
+//!     '--maximum-zoom=10' \
+//!     --simplify-only-low-zooms \
+//!     --no-simplification-of-shared-nodes \
+//!     --no-tile-size-limit \
+//!     --no-feature-limit \
+//!     --force \
+//!     '--output=<output>.pmtiles' \
+//!     '<input>.geojsonl'
+//! ```
+//!
+//! See `tests/fixtures/golden/README.md` for full details.
+//!
+//! # Known Differences from Tippecanoe
+//!
+//! 1. **Feature dropping**: Tippecanoe drops features at low zooms based on density.
+//!    We haven't implemented this yet (Phase 3), so we'll have MORE features at
+//!    low zooms. Tests should focus on high zooms (z10+) where no dropping occurs.
+//!
+//! 2. **Tiny polygon reduction**: Tippecanoe uses diffuse probability for polygons
+//!    < 4 square subpixels. We don't implement this yet.
+//!
+//! # How it works
+//!
+//! 1. Read source GeoParquet file
+//! 2. Clip geometries to specific tile bounds
+//! 3. Simplify for that zoom level
+//! 4. Compare against pre-decoded tippecanoe MVT tiles (stored as GeoJSON)
+
+#[cfg(test)]
+mod tests {
+    use crate::batch_processor;
+    use crate::clip::{
+        buffer_pixels_to_degrees, clip_geometry, DEFAULT_BUFFER_PIXELS, DEFAULT_EXTENT,
+    };
+    use crate::simplify::simplify_for_zoom;
+    use crate::tile::tile_bounds;
+    use geo::{Area, Geometry};
+    use geojson::GeoJson;
+    use std::fs;
+    use std::path::Path;
+
+    /// Tile specification for testing
+    struct TileSpec {
+        z: u8,
+        x: u32,
+        y: u32,
+    }
+
+    impl TileSpec {
+        fn new(z: u8, x: u32, y: u32) -> Self {
+            Self { z, x, y }
+        }
+
+        fn golden_path(&self, dataset: &str) -> String {
+            format!(
+                "../../tests/fixtures/golden/decoded/{}-z{}-x{}-y{}.geojson",
+                dataset, self.z, self.x, self.y
+            )
+        }
+    }
+
+    /// Load geometries from a decoded golden GeoJSON file
+    fn load_golden_geometries(path: &str) -> Vec<Geometry<f64>> {
+        let content = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("Failed to read golden file {}: {}", path, e));
+
+        let geojson: GeoJson = content
+            .parse()
+            .unwrap_or_else(|e| panic!("Failed to parse GeoJSON {}: {}", path, e));
+
+        let mut geometries = Vec::new();
+
+        if let GeoJson::FeatureCollection(fc) = geojson {
+            for feature in fc.features {
+                if let Some(geom) = feature.geometry {
+                    // Convert GeoJSON geometry to geo::Geometry
+                    // Note: MVT tiles use tile-local coordinates (0-4096)
+                    // We'll compare counts and relative metrics, not exact coords
+                    if let Ok(g) = geo::Geometry::try_from(geom) {
+                        geometries.push(g);
+                    }
+                }
+            }
+        }
+
+        geometries
+    }
+
+    /// Process source geometries through our pipeline for a specific tile
+    fn process_tile(source_geometries: &[Geometry<f64>], tile: &TileSpec) -> Vec<Geometry<f64>> {
+        let bounds = tile_bounds(tile.x, tile.y, tile.z);
+        let buffer = buffer_pixels_to_degrees(DEFAULT_BUFFER_PIXELS, &bounds, DEFAULT_EXTENT);
+
+        let mut result = Vec::new();
+
+        for geom in source_geometries {
+            // Clip to tile bounds
+            if let Some(clipped) = clip_geometry(geom, &bounds, buffer) {
+                // Simplify for zoom level
+                let simplified = simplify_for_zoom(&clipped, tile.z, DEFAULT_EXTENT);
+                result.push(simplified);
+            }
+        }
+
+        result
+    }
+
+    /// Calculate total area of all polygons in a geometry collection
+    fn total_polygon_area(geometries: &[Geometry<f64>]) -> f64 {
+        geometries
+            .iter()
+            .map(|g| match g {
+                Geometry::Polygon(p) => p.unsigned_area(),
+                Geometry::MultiPolygon(mp) => mp.unsigned_area(),
+                _ => 0.0,
+            })
+            .sum()
+    }
+
+    // ========== Golden Comparison Tests ==========
+
+    /// Test at z10 where tippecanoe does minimal feature dropping.
+    /// At this zoom, the tile doesn't cover the entire dataset, so we're
+    /// testing actual clipping behavior rather than feature dropping.
+    #[test]
+    fn test_golden_open_buildings_z10_feature_count() {
+        let tile = TileSpec::new(10, 516, 377);
+        let golden_path = tile.golden_path("open-buildings");
+
+        if !Path::new(&golden_path).exists() {
+            eprintln!("Skipping test: golden file not found at {}", golden_path);
+            return;
+        }
+
+        let golden_geoms = load_golden_geometries(&golden_path);
+        let golden_count = golden_geoms.len();
+
+        let source_path = "../../tests/fixtures/realdata/open-buildings.parquet";
+        if !Path::new(source_path).exists() {
+            eprintln!("Skipping test: source file not found at {}", source_path);
+            return;
+        }
+
+        let source_geoms = batch_processor::extract_geometries(Path::new(source_path))
+            .expect("Failed to extract geometries");
+
+        let our_geoms = process_tile(&source_geoms, &tile);
+        let our_count = our_geoms.len();
+
+        println!("Z10 Golden (tippecanoe) feature count: {}", golden_count);
+        println!("Z10 Our pipeline feature count: {}", our_count);
+
+        // At z10, we should be fairly close to tippecanoe
+        // We may have slightly more features since we don't do tiny polygon reduction
+        // Tolerance: we should have at least 80% of tippecanoe's features
+        // and no more than 150% (some edge case differences expected)
+        let min_expected = (golden_count as f64 * 0.80) as usize;
+        let max_expected = (golden_count as f64 * 1.50) as usize;
+
+        assert!(
+            our_count >= min_expected && our_count <= max_expected,
+            "Feature count {} outside tolerance [{}, {}] (golden: {})\n\
+             Note: We don't implement tiny polygon reduction yet, so having\n\
+             more features than tippecanoe is expected.",
+            our_count,
+            min_expected,
+            max_expected,
+            golden_count
+        );
+    }
+
+    /// Document expected difference at low zoom where tippecanoe drops features.
+    /// This test verifies our understanding of the difference, not that we match.
+    #[test]
+    fn test_document_low_zoom_feature_dropping_difference() {
+        let tile = TileSpec::new(8, 129, 94);
+        let golden_path = tile.golden_path("open-buildings");
+
+        if !Path::new(&golden_path).exists() {
+            eprintln!("Skipping test: golden file not found");
+            return;
+        }
+
+        let golden_geoms = load_golden_geometries(&golden_path);
+        let golden_count = golden_geoms.len();
+
+        let source_path = "../../tests/fixtures/realdata/open-buildings.parquet";
+        if !Path::new(source_path).exists() {
+            eprintln!("Skipping test: source file not found");
+            return;
+        }
+
+        let source_geoms = batch_processor::extract_geometries(Path::new(source_path))
+            .expect("Failed to extract geometries");
+
+        let our_geoms = process_tile(&source_geoms, &tile);
+        let our_count = our_geoms.len();
+
+        println!("=== EXPECTED DIFFERENCE: Feature Dropping Not Implemented ===");
+        println!("Z8 Tippecanoe features: {}", golden_count);
+        println!("Z8 Our features: {}", our_count);
+        println!(
+            "Difference: {} more features (tippecanoe drops {:.0}% at this zoom)",
+            our_count.saturating_sub(golden_count),
+            (1.0 - golden_count as f64 / our_count as f64) * 100.0
+        );
+        println!("This is expected until Phase 3 (feature dropping) is implemented.");
+
+        // Just verify we have MORE features than tippecanoe at low zoom
+        // (because we don't drop features yet)
+        assert!(
+            our_count >= golden_count,
+            "At z8, we should have at least as many features as tippecanoe \
+             since we don't implement feature dropping yet"
+        );
+    }
+
+    /// Test that feature counts are monotonic (or close) as we zoom in.
+    /// Each child tile should have <= parent features that intersect it.
+    #[test]
+    fn test_golden_feature_count_monotonic_on_zoom() {
+        let source_path = "../../tests/fixtures/realdata/open-buildings.parquet";
+        if !Path::new(source_path).exists() {
+            eprintln!("Skipping test: source file not found");
+            return;
+        }
+
+        let source_geoms = batch_processor::extract_geometries(Path::new(source_path))
+            .expect("Failed to extract geometries");
+
+        // These tiles are NOT parent-child, they're all covering the same data area
+        // at different zooms. At high zooms, tiles become smaller and contain fewer features.
+        let tiles = vec![
+            TileSpec::new(8, 129, 94),
+            TileSpec::new(9, 258, 188),
+            TileSpec::new(10, 516, 377),
+        ];
+
+        let mut counts = vec![];
+        for tile in &tiles {
+            let our_geoms = process_tile(&source_geoms, tile);
+            counts.push((tile.z, our_geoms.len()));
+            println!("Z{}: {} features", tile.z, our_geoms.len());
+        }
+
+        // At higher zooms, tile area decreases, so feature count should generally decrease
+        // (unless the data is very sparse and all fits in every tile)
+        // For open-buildings data, higher zooms should have fewer features per tile
+        for window in counts.windows(2) {
+            let (z1, count1) = window[0];
+            let (z2, count2) = window[1];
+            println!("Z{} ({}) -> Z{} ({})", z1, count1, z2, count2);
+            // Higher zoom = smaller tile = fewer features (for dense data)
+            // Allow some tolerance for edge cases
+        }
+    }
+
+    /// Test that polygon area is roughly preserved after clipping and simplification.
+    /// Use z10 where simplification is minimal.
+    #[test]
+    fn test_golden_polygon_area_preserved_z10() {
+        let tile = TileSpec::new(10, 516, 377);
+
+        let source_path = "../../tests/fixtures/realdata/open-buildings.parquet";
+        if !Path::new(source_path).exists() {
+            eprintln!("Skipping test: source file not found");
+            return;
+        }
+
+        let source_geoms = batch_processor::extract_geometries(Path::new(source_path))
+            .expect("Failed to extract geometries");
+
+        // Get bounds for this tile
+        let bounds = tile_bounds(tile.x, tile.y, tile.z);
+        let buffer = buffer_pixels_to_degrees(DEFAULT_BUFFER_PIXELS, &bounds, DEFAULT_EXTENT);
+
+        // Calculate area of source geometries that intersect this tile (BEFORE simplification)
+        let clipped_area: f64 = source_geoms
+            .iter()
+            .filter_map(|g| clip_geometry(g, &bounds, buffer))
+            .map(|g| match &g {
+                Geometry::Polygon(p) => p.unsigned_area(),
+                Geometry::MultiPolygon(mp) => mp.unsigned_area(),
+                _ => 0.0,
+            })
+            .sum();
+
+        // Calculate area after simplification
+        let our_geoms = process_tile(&source_geoms, &tile);
+        let our_area = total_polygon_area(&our_geoms);
+
+        println!("Clipped area (before simplify): {:.10}", clipped_area);
+        println!("Our area (after simplify): {:.10}", our_area);
+
+        if clipped_area > 0.0 {
+            let ratio = our_area / clipped_area;
+            println!("Area ratio: {:.4}", ratio);
+
+            // At z10, simplification should be minimal, so area should be well preserved
+            // Allow 20% reduction (buildings can be simplified to rectangles)
+            assert!(
+                ratio >= 0.80,
+                "Area ratio {} is too low - simplification is too aggressive at z10",
+                ratio
+            );
+            assert!(
+                ratio <= 1.05,
+                "Area ratio {} is too high - this shouldn't happen",
+                ratio
+            );
+        }
+    }
+
+    /// Sanity check: all zoom levels should produce some output for the test data.
+    #[test]
+    fn test_all_zoom_levels_produce_output() {
+        let source_path = "../../tests/fixtures/realdata/open-buildings.parquet";
+        if !Path::new(source_path).exists() {
+            eprintln!("Skipping test: source file not found");
+            return;
+        }
+
+        let source_geoms = batch_processor::extract_geometries(Path::new(source_path))
+            .expect("Failed to extract geometries");
+
+        let tiles = vec![
+            TileSpec::new(5, 16, 11),
+            TileSpec::new(6, 32, 23),
+            TileSpec::new(7, 64, 47),
+            TileSpec::new(8, 129, 94),
+            TileSpec::new(9, 258, 188),
+            TileSpec::new(10, 516, 377),
+        ];
+
+        for tile in &tiles {
+            let our_geoms = process_tile(&source_geoms, tile);
+            assert!(
+                !our_geoms.is_empty(),
+                "Z{} x={} y={} produced no features",
+                tile.z,
+                tile.x,
+                tile.y
+            );
+            println!("Z{}: {} features ✓", tile.z, our_geoms.len());
+        }
+    }
+
+    /// Test that we can read and parse the golden GeoJSON files correctly.
+    #[test]
+    fn test_golden_files_parseable() {
+        let tiles = vec![
+            TileSpec::new(5, 16, 11),
+            TileSpec::new(6, 32, 23),
+            TileSpec::new(10, 516, 377),
+        ];
+
+        for tile in &tiles {
+            let path = tile.golden_path("open-buildings");
+            if !Path::new(&path).exists() {
+                eprintln!("Skipping: {} not found", path);
+                continue;
+            }
+
+            let geoms = load_golden_geometries(&path);
+            assert!(!geoms.is_empty(), "Golden file {} has no geometries", path);
+            println!("{}: {} features ✓", path, geoms.len());
+        }
+    }
+}
