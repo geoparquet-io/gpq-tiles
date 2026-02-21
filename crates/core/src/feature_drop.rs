@@ -31,8 +31,100 @@
 //! to ensure consistent behavior regardless of geographic location (latitude).
 
 use crate::tile::TileBounds;
-use geo::{Area, Coord, LineString, MultiLineString, Polygon};
+use geo::{Area, Coord, LineString, MultiLineString, MultiPoint, Point, Polygon};
 use std::hash::{Hash, Hasher};
+
+// =============================================================================
+// POINT THINNING
+// =============================================================================
+
+/// The drop factor per zoom level (tippecanoe uses 2.5, so retention is 1/2.5 = 0.4)
+pub const POINT_DROP_FACTOR: f64 = 2.5;
+
+/// Returns true if the point should be DROPPED (not kept) at the given zoom level.
+///
+/// # Arguments
+/// * `_point` - The point geometry (currently unused, but included for future extensions
+///   like spatial-aware thinning)
+/// * `zoom` - Current zoom level being generated
+/// * `base_zoom` - The zoom level where all points are kept (typically max_zoom)
+/// * `feature_index` - Unique index of this feature for deterministic selection
+///
+/// # Returns
+/// `true` if the point should be dropped, `false` if it should be kept.
+///
+/// # Example
+/// ```
+/// use gpq_tiles_core::feature_drop::should_drop_point;
+/// use geo::Point;
+///
+/// let point = Point::new(0.0, 0.0);
+///
+/// // At base_zoom (14), all points are kept
+/// assert!(!should_drop_point(&point, 14, 14, 0));
+///
+/// // At lower zooms, some points are dropped
+/// // (exact behavior depends on feature_index)
+/// ```
+pub fn should_drop_point(_point: &Point<f64>, zoom: u8, base_zoom: u8, feature_index: u64) -> bool {
+    // At or above base_zoom, keep all points
+    if zoom >= base_zoom {
+        return false;
+    }
+
+    // Calculate retention rate: 0.4^(base_zoom - zoom)
+    let zoom_diff = (base_zoom - zoom) as u32;
+    let retention_rate = (1.0 / POINT_DROP_FACTOR).powi(zoom_diff as i32);
+
+    // Deterministic pseudo-random selection using a simple hash
+    let hash = point_deterministic_hash(feature_index);
+
+    // Convert hash to a value in [0, 1)
+    let normalized = (hash as f64) / (u64::MAX as f64);
+
+    // Keep if normalized < retention_rate, drop otherwise
+    normalized >= retention_rate
+}
+
+/// Deterministic hash function for point feature selection.
+///
+/// Uses a simple but effective mixing function based on the Murmur3 finalizer.
+#[inline]
+fn point_deterministic_hash(index: u64) -> u64 {
+    let mut x = index;
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51afd7ed558ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ceb9fe1a85ec53);
+    x ^= x >> 33;
+    x
+}
+
+/// Returns true if ALL points in the MultiPoint should be dropped.
+///
+/// MultiPoints are treated as a single feature - either all points are kept
+/// or all are dropped. This maintains the semantic integrity of the feature.
+pub fn should_drop_multipoint(
+    _multipoint: &MultiPoint<f64>,
+    zoom: u8,
+    base_zoom: u8,
+    feature_index: u64,
+) -> bool {
+    let dummy_point = Point::new(0.0, 0.0);
+    should_drop_point(&dummy_point, zoom, base_zoom, feature_index)
+}
+
+/// Calculate the retention rate for a given zoom level.
+///
+/// This is useful for statistics and logging.
+pub fn retention_rate(zoom: u8, base_zoom: u8) -> f64 {
+    if zoom >= base_zoom {
+        return 1.0;
+    }
+
+    let zoom_diff = (base_zoom - zoom) as u32;
+    (1.0 / POINT_DROP_FACTOR).powi(zoom_diff as i32)
+}
 
 /// Default tiny polygon threshold: 4 square pixels (matches tippecanoe)
 pub const DEFAULT_TINY_POLYGON_THRESHOLD: f64 = 4.0;
@@ -983,5 +1075,241 @@ mod tests {
             drops_1px,
             drops_3px
         );
+    }
+
+    // =========================================================================
+    // POINT THINNING TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_at_base_zoom_all_points_kept() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+
+        for feature_index in 0..1000 {
+            assert!(
+                !should_drop_point(&point, base_zoom, base_zoom, feature_index),
+                "At base_zoom, point with index {} should NOT be dropped",
+                feature_index
+            );
+        }
+    }
+
+    #[test]
+    fn test_above_base_zoom_all_points_kept() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+
+        for feature_index in 0..100 {
+            assert!(
+                !should_drop_point(&point, 15, base_zoom, feature_index),
+                "Above base_zoom, point should NOT be dropped"
+            );
+            assert!(
+                !should_drop_point(&point, 16, base_zoom, feature_index),
+                "Above base_zoom, point should NOT be dropped"
+            );
+        }
+    }
+
+    #[test]
+    fn test_base_zoom_minus_one_approximately_40_percent_kept() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+        let zoom = 13;
+
+        let sample_size = 10000;
+        let mut kept_count = 0;
+
+        for feature_index in 0..sample_size {
+            if !should_drop_point(&point, zoom, base_zoom, feature_index) {
+                kept_count += 1;
+            }
+        }
+
+        let retention = kept_count as f64 / sample_size as f64;
+        let expected = 0.4;
+
+        assert!(
+            (retention - expected).abs() < 0.05,
+            "At base_zoom - 1, expected ~40% retention, got {:.2}% ({} of {})",
+            retention * 100.0,
+            kept_count,
+            sample_size
+        );
+    }
+
+    #[test]
+    fn test_base_zoom_minus_two_approximately_16_percent_kept() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+        let zoom = 12;
+
+        let sample_size = 10000;
+        let mut kept_count = 0;
+
+        for feature_index in 0..sample_size {
+            if !should_drop_point(&point, zoom, base_zoom, feature_index) {
+                kept_count += 1;
+            }
+        }
+
+        let retention = kept_count as f64 / sample_size as f64;
+        let expected = 0.16;
+
+        assert!(
+            (retention - expected).abs() < 0.03,
+            "At base_zoom - 2, expected ~16% retention, got {:.2}% ({} of {})",
+            retention * 100.0,
+            kept_count,
+            sample_size
+        );
+    }
+
+    #[test]
+    fn test_point_determinism_same_index_same_result() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+        let zoom = 10;
+
+        for feature_index in [0, 42, 1000, 999999, u64::MAX / 2] {
+            let first_result = should_drop_point(&point, zoom, base_zoom, feature_index);
+
+            for _ in 0..100 {
+                let result = should_drop_point(&point, zoom, base_zoom, feature_index);
+                assert_eq!(
+                    result, first_result,
+                    "Determinism violation: feature_index {} gave different results",
+                    feature_index
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_different_indices_have_different_outcomes() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+        let zoom = 12;
+
+        let mut dropped_count = 0;
+        let mut kept_count = 0;
+
+        for feature_index in 0..100 {
+            if should_drop_point(&point, zoom, base_zoom, feature_index) {
+                dropped_count += 1;
+            } else {
+                kept_count += 1;
+            }
+        }
+
+        assert!(
+            dropped_count > 0,
+            "Expected some points to be dropped, but none were"
+        );
+        assert!(
+            kept_count > 0,
+            "Expected some points to be kept, but none were"
+        );
+    }
+
+    #[test]
+    fn test_multipoint_uses_same_logic() {
+        let point = Point::new(0.0, 0.0);
+        let multipoint = MultiPoint::new(vec![
+            Point::new(0.0, 0.0),
+            Point::new(1.0, 1.0),
+            Point::new(2.0, 2.0),
+        ]);
+        let base_zoom = 14;
+        let zoom = 10;
+
+        for feature_index in 0..100 {
+            let point_result = should_drop_point(&point, zoom, base_zoom, feature_index);
+            let multipoint_result =
+                should_drop_multipoint(&multipoint, zoom, base_zoom, feature_index);
+            assert_eq!(
+                point_result, multipoint_result,
+                "MultiPoint and Point should have same drop decision for same index"
+            );
+        }
+    }
+
+    #[test]
+    fn test_retention_rate_calculation() {
+        let base_zoom = 14;
+
+        assert!((retention_rate(14, base_zoom) - 1.0).abs() < 1e-10);
+        assert!((retention_rate(13, base_zoom) - 0.4).abs() < 1e-10);
+        assert!((retention_rate(12, base_zoom) - 0.16).abs() < 1e-10);
+        assert!((retention_rate(11, base_zoom) - 0.064).abs() < 1e-10);
+        assert!((retention_rate(10, base_zoom) - 0.0256).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_very_low_zoom_has_very_few_points() {
+        let point = Point::new(0.0, 0.0);
+        let base_zoom = 14;
+        let zoom = 0;
+
+        let sample_size = 100000;
+        let mut kept_count = 0;
+
+        for feature_index in 0..sample_size {
+            if !should_drop_point(&point, zoom, base_zoom, feature_index) {
+                kept_count += 1;
+            }
+        }
+
+        let retention = kept_count as f64 / sample_size as f64;
+        assert!(
+            retention < 0.001,
+            "At zoom 0, expected <0.1% retention, got {:.4}%",
+            retention * 100.0
+        );
+    }
+
+    #[test]
+    fn test_point_deterministic_hash_distribution() {
+        let h0 = point_deterministic_hash(0);
+        let h1 = point_deterministic_hash(1);
+        let h2 = point_deterministic_hash(2);
+
+        assert_ne!(h1.wrapping_sub(h0), 1);
+        assert_ne!(h2.wrapping_sub(h1), 1);
+
+        let min = h0.min(h1).min(h2);
+        let max = h0.max(h1).max(h2);
+        let spread = max - min;
+
+        assert!(
+            spread > u64::MAX / 4,
+            "Hash distribution seems too narrow: spread = {}",
+            spread
+        );
+    }
+
+    #[test]
+    fn test_point_location_does_not_affect_decision() {
+        let base_zoom = 14;
+        let zoom = 12;
+        let feature_index = 42;
+
+        let points = [
+            Point::new(0.0, 0.0),
+            Point::new(180.0, 90.0),
+            Point::new(-180.0, -90.0),
+            Point::new(37.7749, -122.4194),
+        ];
+
+        let first_result = should_drop_point(&points[0], zoom, base_zoom, feature_index);
+
+        for point in &points[1..] {
+            assert_eq!(
+                should_drop_point(point, zoom, base_zoom, feature_index),
+                first_result,
+                "Point location should not affect drop decision (for now)"
+            );
+        }
     }
 }
