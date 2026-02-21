@@ -39,6 +39,7 @@ pub mod clip;
 mod golden;
 pub mod mvt;
 pub mod pipeline;
+pub mod pmtiles_writer;
 pub mod simplify;
 pub mod tile;
 

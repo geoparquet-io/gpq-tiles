@@ -491,7 +491,7 @@ mod tests {
         let decoded = decode_tile(&first_tile.data).unwrap();
         assert_eq!(decoded.layers.len(), 1);
         assert_eq!(decoded.layers[0].name, "buildings");
-        assert!(decoded.layers[0].features.len() > 0);
+        assert!(!decoded.layers[0].features.is_empty());
 
         println!("Generated {} tiles at zoom 10", tiles.len());
     }
