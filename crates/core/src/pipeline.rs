@@ -28,6 +28,7 @@ use crate::feature_drop::{
     should_drop_tiny_polygon, DensityDropConfig, DensityDropper, DEFAULT_TINY_POLYGON_THRESHOLD,
 };
 use crate::mvt::{LayerBuilder, TileBuilder};
+use crate::property_filter::PropertyFilter;
 use crate::simplify::simplify_for_zoom;
 use crate::spatial_index::sort_geometries;
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
@@ -119,6 +120,10 @@ pub struct TilerConfig {
     /// When enabled, tiles within each zoom level are processed in parallel.
     /// Zoom levels are still processed sequentially to preserve feature dropping semantics.
     pub parallel: bool,
+    /// Property filter for controlling which attributes are included in output tiles.
+    /// Matches tippecanoe's -x (exclude), -y (include), and -X (exclude-all) flags.
+    /// Geometry columns are always preserved regardless of filter settings.
+    pub property_filter: PropertyFilter,
 }
 
 impl Default for TilerConfig {
@@ -141,6 +146,8 @@ impl Default for TilerConfig {
             use_hilbert: true,
             // Parallel processing is enabled by default for performance
             parallel: true,
+            // No property filtering by default - include all properties
+            property_filter: PropertyFilter::None,
         }
     }
 }
@@ -213,6 +220,50 @@ impl TilerConfig {
     pub fn with_parallel(mut self, parallel: bool) -> Self {
         self.parallel = parallel;
         self
+    }
+
+    /// Set the property filter for controlling which attributes are included.
+    ///
+    /// Matches tippecanoe's property filtering behavior:
+    /// - `PropertyFilter::Include(fields)` - only include specified fields (like `-y`)
+    /// - `PropertyFilter::Exclude(fields)` - exclude specified fields (like `-x`)
+    /// - `PropertyFilter::ExcludeAll` - exclude all attributes, keep only geometry (like `-X`)
+    ///
+    /// Geometry columns are always preserved regardless of filter settings.
+    pub fn with_property_filter(mut self, filter: PropertyFilter) -> Self {
+        self.property_filter = filter;
+        self
+    }
+
+    /// Set an include filter (whitelist) for properties.
+    ///
+    /// Only the specified fields will be included in output tiles.
+    /// This is equivalent to tippecanoe's `-y` flag.
+    pub fn with_include_properties<I, S>(self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.with_property_filter(PropertyFilter::include(fields))
+    }
+
+    /// Set an exclude filter (blacklist) for properties.
+    ///
+    /// The specified fields will be excluded from output tiles.
+    /// This is equivalent to tippecanoe's `-x` flag.
+    pub fn with_exclude_properties<I, S>(self, fields: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.with_property_filter(PropertyFilter::exclude(fields))
+    }
+
+    /// Exclude all properties, keeping only geometry.
+    ///
+    /// This is equivalent to tippecanoe's `-X` flag.
+    pub fn with_geometry_only(self) -> Self {
+        self.with_property_filter(PropertyFilter::ExcludeAll)
     }
 }
 
@@ -325,9 +376,20 @@ pub fn generate_tiles_with_bounds(
     config: &TilerConfig,
 ) -> Result<TileGeneration<impl Iterator<Item = Result<GeneratedTile>>>> {
     // Step 1: Extract field metadata from schema
-    let fields = extract_field_metadata(input_path).unwrap_or_default();
+    let all_fields = extract_field_metadata(input_path).unwrap_or_default();
 
-    // Step 2: Extract all geometries from the GeoParquet file
+    // Step 2: Apply property filter to field metadata
+    // This filters which fields appear in the JSON metadata
+    let fields = if config.property_filter.is_active() {
+        all_fields
+            .into_iter()
+            .filter(|(name, _)| config.property_filter.should_include(name))
+            .collect()
+    } else {
+        all_fields
+    };
+
+    // Step 3: Extract all geometries from the GeoParquet file
     // WARNING: This loads all geometries into memory. For large files,
     // we'll need a streaming approach in Phase 4.
     let geometries = extract_geometries(input_path)?;
@@ -341,10 +403,10 @@ pub fn generate_tiles_with_bounds(
         });
     }
 
-    // Step 3: Calculate bounding box from geometries
+    // Step 4: Calculate bounding box from geometries
     let bbox = calculate_bbox_from_geometries(&geometries);
 
-    // Step 4: Create tile iterator
+    // Step 5: Create tile iterator
     Ok(TileGeneration {
         tiles: TileIterator::new(geometries, bbox, config.clone()),
         bounds: bbox,
@@ -1571,5 +1633,152 @@ mod tests {
         }
 
         println!("Generated {} tiles in parallel mode", tiles.len());
+    }
+
+    // ========== Property Filter Config Tests ==========
+
+    #[test]
+    fn test_tiler_config_with_property_filter() {
+        let config = TilerConfig::new(0, 10)
+            .with_property_filter(PropertyFilter::include(vec!["name", "population"]));
+
+        match &config.property_filter {
+            PropertyFilter::Include(set) => {
+                assert!(set.contains("name"));
+                assert!(set.contains("population"));
+            }
+            _ => panic!("Expected Include filter"),
+        }
+    }
+
+    #[test]
+    fn test_tiler_config_with_include_properties() {
+        let config = TilerConfig::new(0, 10).with_include_properties(vec!["name", "area"]);
+
+        assert!(config.property_filter.should_include("name"));
+        assert!(config.property_filter.should_include("area"));
+        assert!(!config.property_filter.should_include("population"));
+    }
+
+    #[test]
+    fn test_tiler_config_with_exclude_properties() {
+        let config =
+            TilerConfig::new(0, 10).with_exclude_properties(vec!["internal_id", "temp_field"]);
+
+        assert!(!config.property_filter.should_include("internal_id"));
+        assert!(!config.property_filter.should_include("temp_field"));
+        assert!(config.property_filter.should_include("name"));
+        assert!(config.property_filter.should_include("population"));
+    }
+
+    #[test]
+    fn test_tiler_config_with_geometry_only() {
+        let config = TilerConfig::new(0, 10).with_geometry_only();
+
+        assert!(!config.property_filter.should_include("name"));
+        assert!(!config.property_filter.should_include("any_field"));
+        assert_eq!(config.property_filter, PropertyFilter::ExcludeAll);
+    }
+
+    #[test]
+    fn test_tiler_config_default_no_property_filter() {
+        let config = TilerConfig::default();
+
+        assert_eq!(config.property_filter, PropertyFilter::None);
+        assert!(!config.property_filter.is_active());
+    }
+
+    // ========== Property Filter with Real Fixture Tests ==========
+
+    #[test]
+    fn test_property_filter_field_metadata_include() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // First, get all fields without filter
+        let config_all = TilerConfig::new(10, 10);
+        let result_all = generate_tiles_with_bounds(fixture, &config_all)
+            .expect("Should create tile generation");
+        let all_fields: Vec<_> = result_all.fields.keys().cloned().collect();
+
+        println!("All fields: {:?}", all_fields);
+        assert!(!all_fields.is_empty(), "Should have some fields");
+
+        // Now test with include filter - only keep specific fields
+        // Use a field name that's likely to exist
+        if !all_fields.is_empty() {
+            let keep_field = &all_fields[0];
+            let config_filtered =
+                TilerConfig::new(10, 10).with_include_properties(vec![keep_field.clone()]);
+
+            let result_filtered = generate_tiles_with_bounds(fixture, &config_filtered)
+                .expect("Should create tile generation");
+
+            assert_eq!(
+                result_filtered.fields.len(),
+                1,
+                "Should only have one field"
+            );
+            assert!(
+                result_filtered.fields.contains_key(keep_field),
+                "Should contain the specified field"
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_filter_field_metadata_exclude() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // First, get all fields without filter
+        let config_all = TilerConfig::new(10, 10);
+        let result_all = generate_tiles_with_bounds(fixture, &config_all)
+            .expect("Should create tile generation");
+        let all_fields: Vec<_> = result_all.fields.keys().cloned().collect();
+
+        if all_fields.len() >= 2 {
+            let exclude_field = &all_fields[0];
+            let config_filtered =
+                TilerConfig::new(10, 10).with_exclude_properties(vec![exclude_field.clone()]);
+
+            let result_filtered = generate_tiles_with_bounds(fixture, &config_filtered)
+                .expect("Should create tile generation");
+
+            assert_eq!(
+                result_filtered.fields.len(),
+                all_fields.len() - 1,
+                "Should have one fewer field"
+            );
+            assert!(
+                !result_filtered.fields.contains_key(exclude_field),
+                "Should not contain the excluded field"
+            );
+        }
+    }
+
+    #[test]
+    fn test_property_filter_exclude_all() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(10, 10).with_geometry_only();
+
+        let result =
+            generate_tiles_with_bounds(fixture, &config).expect("Should create tile generation");
+
+        assert!(
+            result.fields.is_empty(),
+            "Should have no fields with ExcludeAll filter"
+        );
     }
 }

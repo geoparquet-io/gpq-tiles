@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gpq_tiles_core::{Config, Converter, DropDensity};
+use gpq_tiles_core::{Config, Converter, DropDensity, PropertyFilter};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -38,6 +38,23 @@ struct Args {
     #[arg(long)]
     layer_name: Option<String>,
 
+    /// Include only specified properties in output tiles (whitelist).
+    /// Can be specified multiple times. Matches tippecanoe's -y flag.
+    /// Example: --include name --include population
+    #[arg(short = 'y', long = "include", value_name = "FIELD")]
+    include: Vec<String>,
+
+    /// Exclude specified properties from output tiles (blacklist).
+    /// Can be specified multiple times. Matches tippecanoe's -x flag.
+    /// Example: --exclude internal_id --exclude temp_field
+    #[arg(short = 'x', long = "exclude", value_name = "FIELD")]
+    exclude: Vec<String>,
+
+    /// Exclude all properties, keeping only geometry.
+    /// Matches tippecanoe's -X flag.
+    #[arg(short = 'X', long = "exclude-all")]
+    exclude_all: bool,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -52,6 +69,30 @@ impl Args {
             _ => anyhow::bail!("Invalid drop density: {}", self.drop_density),
         }
     }
+
+    fn parse_property_filter(&self) -> Result<PropertyFilter> {
+        // Check for conflicting options
+        let has_include = !self.include.is_empty();
+        let has_exclude = !self.exclude.is_empty();
+
+        if self.exclude_all && (has_include || has_exclude) {
+            anyhow::bail!("Cannot use --exclude-all with --include or --exclude");
+        }
+
+        if has_include && has_exclude {
+            anyhow::bail!("Cannot use --include and --exclude together");
+        }
+
+        if self.exclude_all {
+            Ok(PropertyFilter::ExcludeAll)
+        } else if has_include {
+            Ok(PropertyFilter::include(self.include.clone()))
+        } else if has_exclude {
+            Ok(PropertyFilter::exclude(self.exclude.clone()))
+        } else {
+            Ok(PropertyFilter::None)
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -60,6 +101,11 @@ fn main() -> Result<()> {
     // Initialize logging
     let log_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
+
+    // Parse property filter first (before moving args fields)
+    let property_filter = args
+        .parse_property_filter()
+        .context("Failed to parse property filter")?;
 
     // Build configuration
     let config = Config {
@@ -70,6 +116,7 @@ fn main() -> Result<()> {
             .parse_drop_density()
             .context("Failed to parse drop density")?,
         layer_name: args.layer_name,
+        property_filter,
     };
 
     // Create converter and run

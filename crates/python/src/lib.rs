@@ -2,7 +2,7 @@
 //!
 //! This module exposes the gpq-tiles-core functionality to Python via pyo3.
 
-use gpq_tiles_core::{Config, Converter, DropDensity};
+use gpq_tiles_core::{Config, Converter, DropDensity, PropertyFilter};
 use pyo3::prelude::*;
 
 /// Convert GeoParquet to PMTiles
@@ -51,6 +51,8 @@ fn convert(
         max_zoom,
         extent: 4096,
         drop_density,
+        layer_name: None,
+        property_filter: PropertyFilter::None,
     };
 
     // Create converter and run

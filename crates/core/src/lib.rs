@@ -37,10 +37,14 @@ mod integration_tests;
 pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
+pub mod property_filter;
 pub mod simplify;
 pub mod spatial_index;
 pub mod tile;
 pub mod validate;
+
+// Re-export PropertyFilter for convenience
+pub use property_filter::PropertyFilter;
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
@@ -76,6 +80,9 @@ pub struct Config {
     pub drop_density: DropDensity,
     /// Layer name for the MVT output (None = derive from input filename)
     pub layer_name: Option<String>,
+    /// Property filter for controlling which attributes are included in output tiles.
+    /// Matches tippecanoe's -x (exclude), -y (include), and -X (exclude-all) flags.
+    pub property_filter: property_filter::PropertyFilter,
 }
 
 impl Default for Config {
@@ -86,6 +93,7 @@ impl Default for Config {
             extent: 4096,
             drop_density: DropDensity::Medium,
             layer_name: None,
+            property_filter: property_filter::PropertyFilter::None,
         }
     }
 }
@@ -148,7 +156,8 @@ impl Converter {
                 DropDensity::Low => 10,
                 DropDensity::Medium => 3,
                 DropDensity::High => 1,
-            });
+            })
+            .with_property_filter(self.config.property_filter.clone());
 
         // Generate tiles using the pipeline (with bounds for PMTiles header)
         let tile_gen = generate_tiles_with_bounds(input_path, &tiler_config)
