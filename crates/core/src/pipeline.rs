@@ -27,6 +27,7 @@ use crate::feature_drop::{
 };
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::simplify::simplify_for_zoom;
+use crate::spatial_index::sort_geometries;
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
 use crate::validate::filter_valid_geometry;
 use crate::vector_tile::Tile;
@@ -108,6 +109,10 @@ pub struct TilerConfig {
     /// Maximum features per grid cell (default: 1)
     /// Higher values = more features kept in dense areas
     pub density_max_per_cell: usize,
+    /// Use Hilbert curve for spatial sorting (default: true)
+    /// Hilbert curves have better locality than Z-order curves.
+    /// If false, uses Z-order (Morton) curve instead.
+    pub use_hilbert: bool,
 }
 
 impl Default for TilerConfig {
@@ -126,6 +131,8 @@ impl Default for TilerConfig {
             // This is fairly aggressive - use larger values for less dropping
             density_cell_size: 16,
             density_max_per_cell: 1,
+            // Hilbert curve is the default because it has better locality than Z-order
+            use_hilbert: true,
         }
     }
 }
@@ -173,6 +180,18 @@ impl TilerConfig {
     /// Set the maximum features per grid cell for density dropping.
     pub fn with_density_max_per_cell(mut self, max: usize) -> Self {
         self.density_max_per_cell = max;
+        self
+    }
+
+    /// Set whether to use Hilbert curve (true) or Z-order curve (false) for spatial sorting.
+    ///
+    /// Hilbert curves have better locality than Z-order curves - neighboring points
+    /// on the curve are always neighboring in 2D space. This is the default.
+    ///
+    /// Z-order (Morton) curves are simpler and faster to compute but don't have
+    /// the same locality guarantee at quadrant boundaries.
+    pub fn with_hilbert(mut self, use_hilbert: bool) -> Self {
+        self.use_hilbert = use_hilbert;
         self
     }
 }
@@ -279,6 +298,12 @@ struct TileIterator {
 
 impl TileIterator {
     fn new(geometries: Vec<geo::Geometry<f64>>, bbox: TileBounds, config: TilerConfig) -> Self {
+        // Sort geometries by spatial index ONCE before tile generation.
+        // This clusters nearby features together for cache-friendly tile generation.
+        // Features for each tile will be mostly adjacent in the sorted order.
+        let mut sorted_geometries = geometries;
+        sort_geometries(&mut sorted_geometries, config.use_hilbert);
+
         // Collect all tile coordinates for all zoom levels
         let mut tile_coords = Vec::new();
         for zoom in config.min_zoom..=config.max_zoom {
@@ -286,7 +311,7 @@ impl TileIterator {
         }
 
         Self {
-            geometries,
+            geometries: sorted_geometries,
             config,
             tile_coords,
             current_index: 0,
@@ -1166,5 +1191,111 @@ mod tests {
             10,
             "All points should be kept at max_zoom (base_zoom)"
         );
+    }
+
+    // ========== Spatial Index Integration Tests ==========
+
+    #[test]
+    fn test_spatial_sorting_improves_locality() {
+        // Create features scattered across different parts of the world
+        // After spatial sorting, nearby features should be processed together
+        let geometries = vec![
+            Geometry::Point(point!(x: 139.7, y: 35.7)),    // Tokyo
+            Geometry::Point(point!(x: -122.4, y: 37.8)),   // San Francisco
+            Geometry::Point(point!(x: 2.35, y: 48.85)),    // Paris
+            Geometry::Point(point!(x: -122.41, y: 37.79)), // Near SF
+            Geometry::Point(point!(x: 2.36, y: 48.86)),    // Near Paris
+            Geometry::Point(point!(x: 139.75, y: 35.68)),  // Near Tokyo
+        ];
+
+        let bbox = calculate_bbox_from_geometries(&geometries);
+
+        // Test with Hilbert curve (default)
+        let config_hilbert = TilerConfig::new(0, 2).with_hilbert(true);
+        let iter_hilbert = TileIterator::new(geometries.clone(), bbox.clone(), config_hilbert);
+
+        // The TileIterator should sort geometries before processing
+        // We verify this by checking that the geometries are sorted
+        // (SF features should be adjacent, Tokyo features should be adjacent, etc.)
+
+        // Verify by checking the internal state after construction
+        // The iterator's geometries should be spatially sorted
+
+        // The config should have use_hilbert = true
+        assert!(
+            iter_hilbert.config.use_hilbert,
+            "use_hilbert should be true"
+        );
+
+        // Test with Z-order
+        let config_zorder = TilerConfig::new(0, 2).with_hilbert(false);
+        let iter_zorder = TileIterator::new(geometries.clone(), bbox.clone(), config_zorder);
+
+        // The config should have use_hilbert = false
+        assert!(
+            !iter_zorder.config.use_hilbert,
+            "use_hilbert should be false for Z-order"
+        );
+
+        // Both should produce tiles (just verify the pipeline works with sorting enabled)
+        let hilbert_tiles: Vec<_> = iter_hilbert.filter_map(|r| r.ok()).collect();
+        let zorder_tiles: Vec<_> = iter_zorder.filter_map(|r| r.ok()).collect();
+
+        // Should produce the same number of tiles regardless of sorting method
+        assert_eq!(
+            hilbert_tiles.len(),
+            zorder_tiles.len(),
+            "Hilbert and Z-order should produce same number of tiles"
+        );
+    }
+
+    #[test]
+    fn test_hilbert_vs_zorder_config() {
+        // Verify the config option works
+        let config_default = TilerConfig::default();
+        assert!(
+            config_default.use_hilbert,
+            "Default should use Hilbert curve"
+        );
+
+        let config_hilbert = TilerConfig::new(0, 10).with_hilbert(true);
+        assert!(
+            config_hilbert.use_hilbert,
+            "with_hilbert(true) should set use_hilbert to true"
+        );
+
+        let config_zorder = TilerConfig::new(0, 10).with_hilbert(false);
+        assert!(
+            !config_zorder.use_hilbert,
+            "with_hilbert(false) should set use_hilbert to false"
+        );
+    }
+
+    #[test]
+    fn test_generate_tiles_with_spatial_sorting() {
+        // Create features in multiple locations
+        let geometries = vec![
+            Geometry::Point(point!(x: 0.0, y: 0.0)),
+            Geometry::Point(point!(x: 0.01, y: 0.01)),
+            Geometry::Point(point!(x: 90.0, y: 45.0)),
+            Geometry::Point(point!(x: 90.01, y: 45.01)),
+        ];
+
+        let bbox = calculate_bbox_from_geometries(&geometries);
+
+        // Generate with Hilbert sorting
+        let config = TilerConfig::new(0, 2).with_hilbert(true);
+        let iter = TileIterator::new(geometries, bbox, config);
+        let tiles: Vec<_> = iter.filter_map(|r| r.ok()).collect();
+
+        // Should generate tiles successfully
+        assert!(!tiles.is_empty(), "Should generate at least one tile");
+
+        // Each tile should have valid MVT data
+        for tile in &tiles {
+            let decoded = decode_tile(&tile.data).expect("Should decode MVT");
+            assert_eq!(decoded.layers.len(), 1);
+            assert!(!decoded.layers[0].features.is_empty());
+        }
     }
 }

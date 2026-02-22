@@ -55,7 +55,7 @@ Produce functional vector tiles:
 
 **Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
-**Current**: 250 tests (242 unit + 8 doc tests) after Phase 4 spatial indexing.
+**Current**: 258 tests (249 unit + 9 doc tests) after Phase 4 spatial indexing integration.
 
 #### Golden Comparison Results
 
@@ -145,11 +145,22 @@ Tippecanoe uses this approach because:
 3. **Streaming-ready** — can sort externally and process in passes
 4. **Parallel-friendly** — sorted stream partitions cleanly by spatial region
 
-**Implemented in `spatial_index.rs` (22 tests):**
+**Implemented in `spatial_index.rs` (26 tests):**
 - `encode_zorder()` / `decode_zorder()` — Morton curve (matches tippecanoe's `encode_quadkey`)
 - `encode_hilbert()` / `decode_hilbert()` — Hilbert curve (better locality, tippecanoe's `-ah` flag)
-- `sort_by_spatial_index()` — Sort features for efficient tile generation
+- `sort_by_spatial_index()` — Sort features with metadata for efficient tile generation
+- `sort_geometries()` — Sort geometries directly (used by pipeline)
 - `lng_lat_to_world_coords()` — Geographic to 32-bit world coordinates
+
+**Pipeline Integration (3 tests):**
+- `TilerConfig::with_hilbert(bool)` — Choose Hilbert (default) or Z-order curve
+- Sorting happens ONCE in `TileIterator::new()` before tile iteration
+- Features for the same tile are now clustered together in memory
+
+```rust
+// Example: use Z-order instead of Hilbert
+let config = TilerConfig::new(0, 14).with_hilbert(false);
+```
 
 #### Step 2: Rayon Parallelization 🔲 TODO
 

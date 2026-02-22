@@ -341,6 +341,44 @@ pub fn spatial_index_for_geometry(geom: &Geometry<f64>, use_hilbert: bool) -> u6
     }
 }
 
+/// Sort a vector of geometries by their spatial index for efficient tile generation.
+///
+/// This is a convenience function for sorting geometries without associated metadata.
+/// It wraps each geometry with its original index, sorts by spatial index, then
+/// returns the sorted geometries.
+///
+/// # Arguments
+///
+/// * `geometries` - Vector of geometries to sort
+/// * `use_hilbert` - If true, use Hilbert curve; if false, use Z-order (Morton)
+///
+/// # Example
+///
+/// ```
+/// use geo::{point, Geometry};
+/// use gpq_tiles_core::spatial_index::sort_geometries;
+///
+/// let mut geometries = vec![
+///     Geometry::Point(point!(x: 10.0, y: 20.0)),
+///     Geometry::Point(point!(x: -120.0, y: 45.0)),
+///     Geometry::Point(point!(x: 10.1, y: 20.1)),
+/// ];
+///
+/// sort_geometries(&mut geometries, true);
+///
+/// // Geometries near each other spatially are now adjacent in the list
+/// ```
+pub fn sort_geometries(geometries: &mut Vec<Geometry<f64>>, use_hilbert: bool) {
+    geometries.sort_by_cached_key(|geom| {
+        let (wx, wy) = geometry_world_coords(geom).unwrap_or((0, 0));
+        if use_hilbert {
+            encode_hilbert(wx, wy)
+        } else {
+            encode_zorder(wx, wy)
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -812,5 +850,79 @@ mod tests {
                 "Hilbert encode/decode should be consistent"
             );
         }
+    }
+
+    // ============================================================
+    // SORT_GEOMETRIES TESTS (for pipeline integration)
+    // ============================================================
+
+    #[test]
+    fn test_sort_geometries_clusters_nearby_features() {
+        // Create features in different parts of the world
+        let mut geometries = vec![
+            Geometry::Point(point!(x: 139.7, y: 35.7)),    // Tokyo
+            Geometry::Point(point!(x: -122.4, y: 37.8)),   // San Francisco
+            Geometry::Point(point!(x: 2.35, y: 48.85)),    // Paris
+            Geometry::Point(point!(x: -122.41, y: 37.79)), // Near SF
+            Geometry::Point(point!(x: 2.36, y: 48.86)),    // Near Paris
+            Geometry::Point(point!(x: 139.75, y: 35.68)),  // Near Tokyo
+        ];
+
+        // Record original positions for verification
+        let sf_orig = geometries[1].clone();
+        let sf_near_orig = geometries[3].clone();
+
+        sort_geometries(&mut geometries, true);
+
+        // Find positions of features after sorting
+        let sf_pos = geometries.iter().position(|g| *g == sf_orig).unwrap();
+        let sf_near_pos = geometries.iter().position(|g| *g == sf_near_orig).unwrap();
+
+        // SF and Near SF should be adjacent after sorting
+        assert!(
+            (sf_pos as i32 - sf_near_pos as i32).abs() <= 1,
+            "SF features should be adjacent after sorting: positions {} and {}",
+            sf_pos,
+            sf_near_pos
+        );
+    }
+
+    #[test]
+    fn test_sort_geometries_hilbert_vs_zorder() {
+        // Both should produce valid sorted results
+        let make_geometries = || {
+            vec![
+                Geometry::Point(point!(x: 0.0, y: 0.0)),
+                Geometry::Point(point!(x: 10.0, y: 10.0)),
+                Geometry::Point(point!(x: -10.0, y: -10.0)),
+                Geometry::Point(point!(x: 10.0, y: -10.0)),
+            ]
+        };
+
+        let mut hilbert_geoms = make_geometries();
+        let mut zorder_geoms = make_geometries();
+
+        sort_geometries(&mut hilbert_geoms, true);
+        sort_geometries(&mut zorder_geoms, false);
+
+        // Both should complete without error and maintain all features
+        assert_eq!(hilbert_geoms.len(), 4);
+        assert_eq!(zorder_geoms.len(), 4);
+
+        // They may have different orders, but both should have all 4 geometries
+    }
+
+    #[test]
+    fn test_sort_geometries_empty_vec() {
+        let mut geometries: Vec<Geometry<f64>> = vec![];
+        sort_geometries(&mut geometries, true);
+        assert!(geometries.is_empty());
+    }
+
+    #[test]
+    fn test_sort_geometries_single_element() {
+        let mut geometries = vec![Geometry::Point(point!(x: 0.0, y: 0.0))];
+        sort_geometries(&mut geometries, true);
+        assert_eq!(geometries.len(), 1);
     }
 }
