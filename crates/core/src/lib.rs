@@ -74,6 +74,8 @@ pub struct Config {
     pub extent: u32,
     /// Feature dropping density threshold
     pub drop_density: DropDensity,
+    /// Layer name for the MVT output (None = derive from input filename)
+    pub layer_name: Option<String>,
 }
 
 impl Default for Config {
@@ -83,6 +85,7 @@ impl Default for Config {
             max_zoom: 14,
             extent: 4096,
             drop_density: DropDensity::Medium,
+            layer_name: None,
         }
     }
 }
@@ -124,9 +127,19 @@ impl Converter {
             output_path.display()
         );
 
+        // Derive layer name from input filename if not specified
+        let layer_name = self.config.layer_name.clone().unwrap_or_else(|| {
+            input_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("layer")
+                .to_string()
+        });
+
         // Build TilerConfig from our Config
         let tiler_config = TilerConfig::new(self.config.min_zoom, self.config.max_zoom)
             .with_extent(self.config.extent)
+            .with_layer_name(&layer_name)
             .with_density_drop(matches!(
                 self.config.drop_density,
                 DropDensity::Medium | DropDensity::High

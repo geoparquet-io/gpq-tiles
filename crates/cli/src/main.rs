@@ -34,6 +34,10 @@ struct Args {
     #[arg(long, default_value = "medium")]
     drop_density: String,
 
+    /// Layer name for the output tiles (default: derived from input filename)
+    #[arg(long)]
+    layer_name: Option<String>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -65,6 +69,7 @@ fn main() -> Result<()> {
         drop_density: args
             .parse_drop_density()
             .context("Failed to parse drop density")?,
+        layer_name: args.layer_name,
     };
 
     // Create converter and run
