@@ -273,7 +273,13 @@ pub fn decode_varint(data: &[u8]) -> Option<(u64, usize)> {
 /// Encode directory entries in PMTiles columnar format with delta encoding
 ///
 /// Format: count, delta_tile_ids[], run_lengths[], lengths[], offsets[]
-/// All values are varints. Tile IDs and offsets use delta encoding.
+/// All values are varints. Tile IDs use simple delta encoding.
+///
+/// Offset encoding follows the PMTiles v3 spec:
+/// - If offset equals expected position (contiguous), encode as 0
+/// - Otherwise, encode as offset + 1
+///
+/// This allows efficient representation of contiguous tile data (common case).
 pub fn encode_directory(entries: &[DirEntry]) -> Vec<u8> {
     let mut buf = Vec::new();
 
@@ -301,14 +307,21 @@ pub fn encode_directory(entries: &[DirEntry]) -> Vec<u8> {
         encode_varint(entry.length as u64, &mut buf);
     }
 
-    // Delta-encoded offsets (relative to expected position)
-    // For clustered tiles, offsets increase sequentially
-    let mut last_offset = 0u64;
-    for entry in entries {
-        // Spec: offset is delta from expected position (last_offset + last_length)
-        encode_varint(entry.offset.wrapping_sub(last_offset), &mut buf);
+    // Offset encoding per PMTiles v3 spec:
+    // - For contiguous entries (offset == expected_offset): encode 0
+    // - Otherwise: encode offset + 1
+    let mut expected_offset = 0u64;
+    for (i, entry) in entries.iter().enumerate() {
+        let is_contiguous = i > 0 && entry.offset == expected_offset;
+        if is_contiguous {
+            encode_varint(0, &mut buf);
+        } else {
+            encode_varint(entry.offset + 1, &mut buf);
+        }
+
+        // Update expected offset for next entry (only if this entry has data)
         if entry.run_length > 0 {
-            last_offset = entry.offset + entry.length as u64;
+            expected_offset = entry.offset + entry.length as u64;
         }
     }
 
@@ -335,6 +348,7 @@ pub struct PmtilesWriter {
     min_zoom: u8,
     max_zoom: u8,
     bounds: TileBounds,
+    layer_name: String,
 }
 
 impl PmtilesWriter {
@@ -345,7 +359,13 @@ impl PmtilesWriter {
             min_zoom: 255,
             max_zoom: 0,
             bounds: TileBounds::empty(),
+            layer_name: "layer".to_string(),
         }
+    }
+
+    /// Set the layer name for vector_layers metadata
+    pub fn set_layer_name(&mut self, name: &str) {
+        self.layer_name = name.to_string();
     }
 
     /// Add a tile (will be gzip compressed)
@@ -419,9 +439,22 @@ impl PmtilesWriter {
         let compressed_dir = gzip_compress(&dir_bytes)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to compress directory: {}", e)))?;
 
-        // Minimal JSON metadata (DIVERGENCE FROM TIPPECANOE: tippecanoe writes full layer metadata)
-        let metadata = b"{}";
-        let compressed_metadata = gzip_compress(metadata)
+        // JSON metadata with vector_layers (required by many PMTiles viewers)
+        let min_z = if self.min_zoom == 255 {
+            0
+        } else {
+            self.min_zoom
+        };
+        let max_z = if self.max_zoom == 0 && self.tiles.is_empty() {
+            0
+        } else {
+            self.max_zoom
+        };
+        let metadata = format!(
+            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{{}}}}],"format":"pbf","generator":"gpq-tiles"}}"#,
+            self.layer_name, min_z, max_z
+        );
+        let compressed_metadata = gzip_compress(metadata.as_bytes())
             .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
 
         // Calculate section offsets

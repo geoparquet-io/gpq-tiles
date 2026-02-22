@@ -237,6 +237,19 @@ impl GeneratedTile {
     }
 }
 
+/// Result of tile generation: tiles iterator plus metadata.
+///
+/// This struct bundles the tile iterator with metadata needed for
+/// writing valid PMTiles headers (bounds, layer name, etc.).
+pub struct TileGeneration<I: Iterator<Item = Result<GeneratedTile>>> {
+    /// Iterator yielding generated tiles
+    pub tiles: I,
+    /// Geographic bounding box of the input data
+    pub bounds: TileBounds,
+    /// Layer name used in the MVT tiles
+    pub layer_name: String,
+}
+
 /// Generate vector tiles from a GeoParquet file.
 ///
 /// This function reads geometries from the input file, iterates over all tiles
@@ -272,20 +285,59 @@ pub fn generate_tiles(
     input_path: &Path,
     config: &TilerConfig,
 ) -> Result<impl Iterator<Item = Result<GeneratedTile>>> {
+    let result = generate_tiles_with_bounds(input_path, config)?;
+    Ok(result.tiles)
+}
+
+/// Generate vector tiles from a GeoParquet file, returning bounds too.
+///
+/// Like `generate_tiles()`, but also returns the geographic bounding box
+/// of the input data. Use this when you need bounds for PMTiles headers.
+///
+/// # Example
+///
+/// ```no_run
+/// use gpq_tiles_core::pipeline::{generate_tiles_with_bounds, TilerConfig};
+/// use gpq_tiles_core::pmtiles_writer::PmtilesWriter;
+/// use std::path::Path;
+///
+/// let config = TilerConfig::new(0, 10);
+/// let result = generate_tiles_with_bounds(Path::new("input.parquet"), &config).unwrap();
+///
+/// let mut writer = PmtilesWriter::new();
+/// writer.set_bounds(&result.bounds);
+///
+/// for tile_result in result.tiles {
+///     let tile = tile_result.unwrap();
+///     writer.add_tile(tile.coord.z, tile.coord.x, tile.coord.y, &tile.data).unwrap();
+/// }
+/// ```
+pub fn generate_tiles_with_bounds(
+    input_path: &Path,
+    config: &TilerConfig,
+) -> Result<TileGeneration<impl Iterator<Item = Result<GeneratedTile>>>> {
     // Step 1: Extract all geometries from the GeoParquet file
     // WARNING: This loads all geometries into memory. For large files,
     // we'll need a streaming approach in Phase 4.
     let geometries = extract_geometries(input_path)?;
 
     if geometries.is_empty() {
-        return Ok(TileIterator::empty());
+        return Ok(TileGeneration {
+            tiles: TileIterator::empty(),
+            bounds: TileBounds::empty(),
+            layer_name: config.layer_name.clone(),
+        });
     }
 
     // Step 2: Calculate bounding box from geometries
     let bbox = calculate_bbox_from_geometries(&geometries);
 
     // Step 3: Create tile iterator
-    Ok(TileIterator::new(geometries, bbox, config.clone()))
+    Ok(TileGeneration {
+        tiles: TileIterator::new(geometries, bbox, config.clone()),
+        bounds: bbox,
+        layer_name: config.layer_name.clone(),
+    })
 }
 
 /// Generate vector tiles from pre-loaded geometries.

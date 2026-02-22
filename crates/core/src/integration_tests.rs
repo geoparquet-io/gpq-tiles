@@ -48,6 +48,12 @@ mod tests {
             return None;
         }
 
+        // Decode bounds (i32 * 10_000_000 -> f64)
+        let decode_coord = |offset: usize| -> f64 {
+            let val = i32::from_le_bytes(data[offset..offset + 4].try_into().unwrap());
+            val as f64 / 10_000_000.0
+        };
+
         Some(PmtilesHeader {
             root_dir_offset: u64::from_le_bytes(data[8..16].try_into().unwrap()),
             root_dir_length: u64::from_le_bytes(data[16..24].try_into().unwrap()),
@@ -60,6 +66,10 @@ mod tests {
             max_zoom: data[101],
             tile_type: data[99],
             tile_compression: data[98],
+            min_lon: decode_coord(102),
+            min_lat: decode_coord(106),
+            max_lon: decode_coord(110),
+            max_lat: decode_coord(114),
         })
     }
 
@@ -77,6 +87,27 @@ mod tests {
         max_zoom: u8,
         tile_type: u8,
         tile_compression: u8,
+        // Bounds fields (bytes 102-117)
+        min_lon: f64,
+        min_lat: f64,
+        max_lon: f64,
+        max_lat: f64,
+    }
+
+    impl PmtilesHeader {
+        /// Check if bounds are valid geographic coordinates
+        fn has_valid_bounds(&self) -> bool {
+            self.min_lon >= -180.0
+                && self.min_lon <= 180.0
+                && self.max_lon >= -180.0
+                && self.max_lon <= 180.0
+                && self.min_lat >= -90.0
+                && self.min_lat <= 90.0
+                && self.max_lat >= -90.0
+                && self.max_lat <= 90.0
+                && self.min_lon <= self.max_lon
+                && self.min_lat <= self.max_lat
+        }
     }
 
     // ========================================================================
@@ -522,5 +553,86 @@ mod tests {
             "High zoom recall test: {} features at z10/516/377",
             decoded.layers[0].features.len()
         );
+    }
+
+    /// Test: Converter API produces PMTiles with valid geographic bounds.
+    ///
+    /// This test verifies that the high-level Converter::convert() API
+    /// automatically calculates and sets valid bounds in the PMTiles header.
+    /// Invalid bounds (like f64::INFINITY overflow) cause renderers to fail.
+    ///
+    /// Bug: Without this fix, bounds were f64::INFINITY which overflows to
+    /// i32::MAX (2147483647 / 10_000_000 = 214.748365°) - invalid coordinates.
+    #[test]
+    fn test_converter_sets_valid_bounds_in_pmtiles() {
+        use crate::{Config, Converter};
+
+        ensure_output_dir();
+
+        let input_path = Path::new(FIXTURE_DIR).join("open-buildings.parquet");
+        if !input_path.exists() {
+            eprintln!("Skipping test: fixture not found at {:?}", input_path);
+            return;
+        }
+
+        let output_path = Path::new(OUTPUT_DIR).join("converter-bounds-test.pmtiles");
+        let _ = fs::remove_file(&output_path);
+
+        // Use the high-level Converter API (not manual set_bounds)
+        let config = Config {
+            min_zoom: 8,
+            max_zoom: 10,
+            ..Default::default()
+        };
+        let converter = Converter::new(config);
+        converter
+            .convert(&input_path, &output_path)
+            .expect("Conversion should succeed");
+
+        // Verify the PMTiles has valid bounds
+        let header = read_pmtiles_header(&output_path).expect("Should parse PMTiles header");
+
+        println!("=== Bounds Validation Test ===");
+        println!(
+            "Bounds: ({}, {}) to ({}, {})",
+            header.min_lon, header.min_lat, header.max_lon, header.max_lat
+        );
+
+        // The key assertion: bounds must be valid geographic coordinates
+        assert!(
+            header.has_valid_bounds(),
+            "PMTiles must have valid geographic bounds, got: min=({}, {}), max=({}, {})",
+            header.min_lon,
+            header.min_lat,
+            header.max_lon,
+            header.max_lat
+        );
+
+        // For open-buildings.parquet (Andorra), bounds should be roughly:
+        // lon: 1.4 to 1.8, lat: 42.4 to 42.7
+        // Check we're in the right ballpark (not infinity, not zero)
+        assert!(
+            header.min_lon > 1.0 && header.min_lon < 2.0,
+            "min_lon should be ~1.4 (Andorra), got {}",
+            header.min_lon
+        );
+        assert!(
+            header.max_lon > 1.0 && header.max_lon < 2.0,
+            "max_lon should be ~1.8 (Andorra), got {}",
+            header.max_lon
+        );
+        assert!(
+            header.min_lat > 42.0 && header.min_lat < 43.0,
+            "min_lat should be ~42.4 (Andorra), got {}",
+            header.min_lat
+        );
+        assert!(
+            header.max_lat > 42.0 && header.max_lat < 43.0,
+            "max_lat should be ~42.7 (Andorra), got {}",
+            header.max_lat
+        );
+
+        // Clean up
+        let _ = fs::remove_file(&output_path);
     }
 }
