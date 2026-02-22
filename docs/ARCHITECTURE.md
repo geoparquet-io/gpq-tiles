@@ -26,17 +26,17 @@ Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (Andorra, ~1
 
 | Zoom | Tippecanoe Features | gpq-tiles Features | Ratio | Notes |
 |------|--------------------|--------------------|-------|-------|
-| Z5 | 1 | 1000 | - | tippecanoe drops aggressively |
-| Z8 | 97 | 1000 | 10.3x | tippecanoe drops 90% at this zoom |
-| Z10 | 484 | 684 | 1.41x | Acceptable baseline |
+| Z5 | 1 | 1000 | - | tippecanoe uses density-based dropping |
+| Z8 | 97 | 1000 | 10.3x | tippecanoe uses density-based dropping |
+| Z10 | 484 | **392** | **0.81x** | ✅ Feature dropping working! |
 
 **Analysis:**
-- At high zoom (Z10), within 1.5x of tippecanoe - acceptable baseline
-- At low zoom (Z5-Z8), tippecanoe's feature dropping dominates - addressed in Phase 3
+- At high zoom (Z10), we now drop **more** features than tippecanoe (0.81x ratio) due to diffuse probability for tiny polygons
+- At low zoom (Z5-Z8), tippecanoe's density-based dropping still dominates (deferred feature)
 - Area preservation after clip+simplify: 88% - good fidelity
 - All zoom levels produce valid MVT tiles
 
-**After Phase 3 integration**, the ratios should improve significantly as our dropping algorithms match tippecanoe's behavior.
+**Phase 3 integration complete**: Tiny polygon, line dropping, and point thinning are all working. Density-based dropping deferred.
 
 ## Critical Issues (Resolved)
 

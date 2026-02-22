@@ -17,8 +17,14 @@ use std::path::Path;
 
 use prost::Message;
 
+use geo::Geometry;
+
 use crate::batch_processor::extract_geometries;
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
+use crate::feature_drop::{
+    should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_multiline,
+    should_drop_tiny_polygon, DEFAULT_TINY_POLYGON_THRESHOLD,
+};
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::simplify::simplify_for_zoom;
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
@@ -31,6 +37,54 @@ pub const DEFAULT_BUFFER_PIXELS: u32 = 8;
 
 /// Default tile extent (4096 as per MVT spec)
 pub const DEFAULT_EXTENT: u32 = 4096;
+
+/// Determine if a geometry should be dropped based on zoom level and geometry type.
+///
+/// This function dispatches to the appropriate dropping predicate based on geometry type:
+/// - **Points**: Thinned using 1/2.5 drop rate per zoom level below base_zoom
+/// - **Lines**: Dropped if all vertices collapse to the same tile pixel
+/// - **Polygons**: Dropped probabilistically if area < 4 square pixels (diffuse probability)
+///
+/// # Arguments
+///
+/// * `geom` - The geometry to check
+/// * `zoom` - Current zoom level being generated
+/// * `base_zoom` - The zoom level where all features are kept (typically max_zoom)
+/// * `extent` - Tile extent (typically 4096)
+/// * `tile_bounds` - Geographic bounds of the tile
+/// * `feature_index` - Unique index of this feature for deterministic selection
+///
+/// # Returns
+///
+/// `true` if the geometry should be dropped, `false` if it should be kept.
+fn should_drop_geometry(
+    geom: &Geometry<f64>,
+    zoom: u8,
+    base_zoom: u8,
+    extent: u32,
+    tile_bounds: &TileBounds,
+    feature_index: u64,
+) -> bool {
+    match geom {
+        Geometry::Point(p) => should_drop_point(p, zoom, base_zoom, feature_index),
+        Geometry::MultiPoint(mp) => should_drop_multipoint(mp, zoom, base_zoom, feature_index),
+        Geometry::LineString(ls) => should_drop_tiny_line(ls, zoom, extent, tile_bounds),
+        Geometry::MultiLineString(mls) => {
+            should_drop_tiny_multiline(mls, zoom, extent, tile_bounds)
+        }
+        Geometry::Polygon(poly) => {
+            should_drop_tiny_polygon(poly, tile_bounds, extent, DEFAULT_TINY_POLYGON_THRESHOLD)
+        }
+        Geometry::MultiPolygon(mp) => {
+            // Drop if ALL polygons would be dropped
+            mp.0.iter().all(|p| {
+                should_drop_tiny_polygon(p, tile_bounds, extent, DEFAULT_TINY_POLYGON_THRESHOLD)
+            })
+        }
+        // GeometryCollection and other types are not dropped
+        _ => false,
+    }
+}
 
 /// Configuration for the tiling pipeline.
 #[derive(Debug, Clone)]
@@ -234,6 +288,19 @@ impl TileIterator {
                 // Validate geometry - filter out degenerate geometries post-simplification
                 // (e.g., polygons with < 4 points, zero-area polygons, linestrings with < 2 points)
                 if let Some(valid_geom) = filter_valid_geometry(&simplified) {
+                    // Apply feature dropping based on zoom level and geometry type
+                    // base_zoom is max_zoom: at max_zoom all features are kept
+                    if should_drop_geometry(
+                        &valid_geom,
+                        coord.z,
+                        self.config.max_zoom,
+                        self.config.extent,
+                        &bounds,
+                        idx as u64,
+                    ) {
+                        continue;
+                    }
+
                     // Add to layer (no properties for now)
                     layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);
                     feature_count += 1;
@@ -311,6 +378,19 @@ pub fn generate_single_tile(
 
             // Validate geometry - filter out degenerate geometries post-simplification
             if let Some(valid_geom) = filter_valid_geometry(&simplified) {
+                // Apply feature dropping based on zoom level and geometry type
+                // base_zoom is max_zoom: at max_zoom all features are kept
+                if should_drop_geometry(
+                    &valid_geom,
+                    coord.z,
+                    config.max_zoom,
+                    config.extent,
+                    &bounds,
+                    idx as u64,
+                ) {
+                    continue;
+                }
+
                 layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);
                 feature_count += 1;
             }
@@ -816,6 +896,195 @@ mod tests {
         assert!(
             result.is_none(),
             "Tile with all degenerate geometries should return None"
+        );
+    }
+
+    // ========== Feature Dropping Integration Tests ==========
+
+    #[test]
+    fn test_point_thinning_reduces_features_at_lower_zoom() {
+        // Create many points spread across the tile
+        // At max_zoom (base_zoom), all should be kept
+        // At lower zooms, some should be dropped
+        let mut geometries = Vec::new();
+        for i in 0..1000 {
+            // Spread points across the world tile (z0)
+            let lng = -180.0 + (i as f64) * 0.36;
+            let lat = -85.0 + (i as f64) * 0.17;
+            geometries.push(Geometry::Point(point!(x: lng, y: lat)));
+        }
+
+        let coord_z0 = TileCoord::new(0, 0, 0);
+
+        // Test 1: Generate at z0 with max_zoom=0 (base_zoom=current, no thinning)
+        // All points should be kept at base_zoom
+        let config_base = TilerConfig::new(0, 0);
+        let tile_base = generate_single_tile(&geometries, coord_z0, &config_base)
+            .unwrap()
+            .expect("Should have features at base_zoom");
+
+        let decoded_base = decode_tile(&tile_base.data).unwrap();
+        let features_base = decoded_base.layers[0].features.len();
+
+        // At base_zoom, all points should be kept
+        assert_eq!(
+            features_base, 1000,
+            "At base_zoom (max_zoom=0, generating z0), all 1000 points should be kept"
+        );
+
+        // Test 2: Generate at z0 with max_zoom=2 (base_zoom=2, current=0)
+        // Expected retention: 0.4^2 = 0.16 = 16% (should keep ~160 points)
+        let config_low = TilerConfig::new(0, 2);
+        let tile_z0_result = generate_single_tile(&geometries, coord_z0, &config_low).unwrap();
+
+        // With 1000 points and 16% retention, we expect ~160 points (with variance)
+        let features_z0 = if let Some(tile) = tile_z0_result {
+            let decoded = decode_tile(&tile.data).unwrap();
+            decoded.layers[0].features.len()
+        } else {
+            0
+        };
+
+        // At z0 with base_zoom=2, fewer features should appear due to thinning
+        // Expected ~160 (16% of 1000), allow variance
+        assert!(
+            features_z0 < 300,
+            "At z0 (2 levels below base_zoom), should have ~16% retention. Got {} features (expected ~160)",
+            features_z0
+        );
+        assert!(
+            features_z0 > 50,
+            "At z0, should still have some features (statistical unlikelihood if 0). Got {} features",
+            features_z0
+        );
+
+        // Verify thinning happened
+        assert!(
+            features_z0 < features_base,
+            "z0 with base_zoom=2 ({}) should have fewer features than z0 with base_zoom=0 ({})",
+            features_z0,
+            features_base
+        );
+    }
+
+    #[test]
+    fn test_tiny_polygon_dropped_at_low_zoom() {
+        // Create a tiny polygon that should be dropped at low zoom
+        // but kept at high zoom where it has sufficient pixel area
+        let tiny_poly = Geometry::Polygon(polygon![
+            (x: 0.0001, y: 0.0001),
+            (x: 0.0002, y: 0.0001),
+            (x: 0.0002, y: 0.0002),
+            (x: 0.0001, y: 0.0002),
+            (x: 0.0001, y: 0.0001),
+        ]);
+
+        // Also add a large polygon that should always be kept
+        let large_poly = Geometry::Polygon(polygon![
+            (x: -10.0, y: -10.0),
+            (x: 10.0, y: -10.0),
+            (x: 10.0, y: 10.0),
+            (x: -10.0, y: 10.0),
+            (x: -10.0, y: -10.0),
+        ]);
+
+        let geometries = vec![tiny_poly, large_poly];
+
+        let config = TilerConfig::new(0, 0);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .expect("Should have at least the large polygon");
+
+        let decoded = decode_tile(&tile.data).unwrap();
+
+        // The tiny polygon should be dropped (< 4 sq pixels at z0)
+        // The large polygon should be kept
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            1,
+            "Tiny polygon should be dropped at z0, only large polygon kept"
+        );
+    }
+
+    #[test]
+    fn test_tiny_line_dropped_when_collapses_to_single_pixel() {
+        // At z0, the tile is 360 degrees wide with 4096 pixels
+        // Each pixel spans ~0.088 degrees (360/4096)
+        // Create a tiny line that's smaller than 1 pixel at z0
+        // The line must be purely horizontal or vertical to stay in same pixel
+
+        // A tiny horizontal line at a position where it stays within one pixel
+        // x changes by 0.01 degrees (much less than 0.088 degrees per pixel)
+        let tiny_line = Geometry::LineString(line_string![
+            (x: 0.0, y: 0.0),
+            (x: 0.01, y: 0.0),  // Horizontal only, stays in same pixel
+        ]);
+
+        // Also add a line that spans significant distance
+        let large_line = Geometry::LineString(line_string![
+            (x: -90.0, y: 0.0),
+            (x: 90.0, y: 0.0),
+        ]);
+
+        let geometries = vec![tiny_line.clone(), large_line.clone()];
+
+        let coord = TileCoord::new(0, 0, 0);
+        let bounds = coord.bounds();
+
+        // Verify the tiny line collapses to same pixel
+        let tiny_should_drop = should_drop_geometry(&tiny_line, 0, 0, 4096, &bounds, 0);
+        let large_should_drop = should_drop_geometry(&large_line, 0, 0, 4096, &bounds, 1);
+
+        // The tiny line should be dropped
+        assert!(
+            tiny_should_drop,
+            "Tiny line should be marked for dropping (both points in same pixel)"
+        );
+        assert!(
+            !large_should_drop,
+            "Large line should NOT be marked for dropping"
+        );
+
+        let config = TilerConfig::new(0, 0);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .expect("Should have at least the large line");
+
+        let decoded = decode_tile(&tile.data).unwrap();
+
+        // The tiny line should be dropped (collapses to single pixel)
+        // The large line should be kept
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            1,
+            "Tiny line should be dropped at z0, only large line kept"
+        );
+    }
+
+    #[test]
+    fn test_all_features_kept_at_max_zoom() {
+        // At max_zoom, all features should be kept (no dropping)
+        let point = Geometry::Point(point!(x: 1.55, y: 42.55));
+        let geometries = vec![point.clone(); 10];
+
+        // Generate at zoom 14 (which is also max_zoom)
+        let config = TilerConfig::new(14, 14);
+        let coord = crate::tile::lng_lat_to_tile(1.55, 42.55, 14);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .expect("Should have features");
+
+        let decoded = decode_tile(&tile.data).unwrap();
+
+        // All 10 points should be kept at max_zoom
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            10,
+            "All points should be kept at max_zoom (base_zoom)"
         );
     }
 }
