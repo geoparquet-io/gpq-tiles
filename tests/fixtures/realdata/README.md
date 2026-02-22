@@ -13,7 +13,7 @@ Production data samples for testing gpq-tiles tiling performance.
 
 ## Attribution
 
-- **FieldMaps data** courtesy of Maxym Malchenko ([fieldmaps.io](https://fieldmaps.io)) — edge-matched humanitarian admin boundaries
+- **FieldMaps data** courtesy of Maxym Malynowsky ([fieldmaps.io](https://fieldmaps.io)) — edge-matched humanitarian admin boundaries
 - **Google Open Buildings** — CC BY 4.0
 - **Road detections** — derived from ML model outputs
 
