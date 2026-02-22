@@ -27,6 +27,7 @@ rstar = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 flate2 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [build-dependencies]
 prost-build = { workspace = true }

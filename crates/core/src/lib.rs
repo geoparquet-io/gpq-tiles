@@ -29,6 +29,7 @@ pub mod vector_tile {
 
 pub mod batch_processor;
 pub mod clip;
+pub mod dedup;
 pub mod feature_drop;
 #[cfg(test)]
 mod golden;
@@ -156,6 +157,7 @@ impl Converter {
 
         // Write tiles to PMTiles with proper bounds, layer name, and field metadata
         let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true); // Enable deduplication by default
         writer.set_bounds(&tile_gen.bounds);
         writer.set_layer_name(&tile_gen.layer_name);
         writer.set_fields(tile_gen.fields);
@@ -176,6 +178,17 @@ impl Converter {
         }
 
         log::info!("Generated {} tiles", tile_count);
+
+        // Log deduplication stats
+        let dedup_stats = writer.dedup_stats();
+        if dedup_stats.duplicates_eliminated > 0 {
+            log::info!(
+                "Deduplication: {} unique tiles, {} duplicates eliminated ({:.1}% savings)",
+                dedup_stats.unique_tiles,
+                dedup_stats.duplicates_eliminated,
+                dedup_stats.savings_percent()
+            );
+        }
 
         // Write to file
         writer

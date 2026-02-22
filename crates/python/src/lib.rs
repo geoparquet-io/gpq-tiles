@@ -51,6 +51,7 @@ fn convert(
         max_zoom,
         extent: 4096,
         drop_density,
+        layer_name: None, // Derived from input filename
     };
 
     // Create converter and run

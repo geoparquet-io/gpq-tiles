@@ -2,7 +2,7 @@
 
 Production-grade GeoParquet → PMTiles converter in Rust.
 
-**Current:** 286 tests (266 unit + 11 doc + 9 Python). 1.4x faster than tippecanoe.
+**Current:** 307 tests (280 unit + 11 doc + 9 Python + 7 dedup). 1.4x faster than tippecanoe.
 
 ## Phase Summary
 
@@ -13,6 +13,38 @@ Production-grade GeoParquet → PMTiles converter in Rust.
 | 3. Feature Dropping | ✅ | 226 | Tiny polygon, line, point, density dropping |
 | 4. Parallelism | ✅ | 262 | Space-filling curves, Rayon, benchmarks |
 | 5. Python | ✅ | 10 | pyo3 bindings |
+| 6. Deduplication | ✅ | 27 | Tile dedup via XXH3 + run_length encoding |
+
+## Phase 6: Tile Deduplication ✅ COMPLETE
+
+Identical tiles (e.g., ocean, empty areas) are stored once and referenced via PMTiles' `run_length` feature:
+
+```rust
+// Deduplication is enabled by default in Converter
+let mut writer = PmtilesWriter::new();
+writer.enable_deduplication(true);
+
+// Identical tiles share storage
+writer.add_tile(1, 0, 0, &ocean_tile)?;  // Stored
+writer.add_tile(1, 0, 1, &ocean_tile)?;  // Referenced (duplicate)
+writer.add_tile(1, 1, 1, &ocean_tile)?;  // Referenced (duplicate)
+
+// Stats available after conversion
+let stats = writer.dedup_stats();
+println!("{} unique, {} duplicates ({:.1}% savings)",
+    stats.unique_tiles, stats.duplicates_eliminated, stats.savings_percent());
+```
+
+**Implementation (following tippecanoe):**
+- XXH3-64 hash of uncompressed MVT bytes (fast, non-cryptographic)
+- Hash → offset lookup for deduplication
+- Run-length encoding for consecutive identical tiles
+- PMTiles header stats: `addressed_tiles_count` vs `tile_contents_count`
+
+**Use cases:**
+- Ocean/empty tiles in global datasets
+- Uniform areas at low zoom levels
+- Adjacent tiles with identical features
 
 ## Phase 4: Parallelism ✅ COMPLETE
 
