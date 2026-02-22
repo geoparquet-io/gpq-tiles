@@ -91,13 +91,16 @@ converter.convert("input.parquet", "output.pmtiles")?;
 4. **Extract**: ✅ Extract geometries from GeoArrow arrays (`batch_processor.rs`)
 5. **Clip**: ✅ Bbox clipping with `geo` crate (`clip.rs`)
 6. **Simplify**: ✅ RDP simplification tuned per zoom level (`simplify.rs`)
-7. **Encode**: ✅ MVT encoding with delta coordinates and command packing (`mvt.rs`)
-8. **Write**: ✅ Custom PMTiles v3 writer with Hilbert ordering (`pmtiles_writer.rs`)
+7. **Validate**: ✅ Filter degenerate geometries, correct winding order (`validate.rs`)
+8. **Encode**: ✅ MVT encoding with delta coordinates and command packing (`mvt.rs`)
+9. **Write**: ✅ Custom PMTiles v3 writer with Hilbert ordering (`pmtiles_writer.rs`)
 
 **The library prioritizes:**
 - Exact MVT command encoding (zigzag-encoded delta coordinates)
 - Hilbert curve tile ordering for spatial locality in PMTiles
 - Golden comparison tests against tippecanoe output
+- Automatic polygon winding order correction for MVT compliance
+- Degenerate geometry validation and filtering
 - Parallel tile generation with Rayon (Phase 4)
 - Density-based feature dropping to prevent cluttered maps (Phase 3)
 
@@ -227,7 +230,7 @@ Contributions are welcome! Please:
 This project follows a layered testing approach:
 
 1. **Unit tests**: Fast, focused tests for algorithmic correctness
-   - **Current**: 122 tests passing across all modules
+   - **Current**: 203 tests passing across all modules
 2. **Property-based tests**: `proptest` for edge cases (geometry round-trips, tile coordinate invariants)
 3. **Integration tests**: GeoParquet → PMTiles pipelines with golden file comparison
    - Semantic comparison against tippecanoe output (not byte-exact)

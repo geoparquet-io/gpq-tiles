@@ -45,6 +45,7 @@ pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod simplify;
 pub mod tile;
+pub mod validate;
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]

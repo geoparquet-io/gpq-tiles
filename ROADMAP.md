@@ -55,7 +55,7 @@ Produce functional vector tiles:
 
 **Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
-**Current**: 164 tests (159 unit + 5 doc tests) after Phase 3 feature dropping implementation.
+**Current**: 209 tests (203 unit + 6 doc tests) after Phase 3 feature dropping algorithms and quality fixes.
 
 #### Golden Comparison Results
 
@@ -78,10 +78,10 @@ The pipeline is validated against tippecanoe-generated tiles:
 |----------|-------|-------------|
 | ~~**Critical**~~ | ~~Simplification coordinate space~~ | ✅ **FIXED** - Now uses `simplify_in_tile_coords()` with pixel-based tolerance |
 | ~~**Critical**~~ | ~~Antimeridian crossing~~ | ✅ **FIXED** - `tiles_for_bbox()` now splits bbox at 180° |
-| **Medium** | Degenerate geometry handling | No validation post-simplification; degenerate polygons silently dropped. |
+| ~~**Medium**~~ | ~~No polygon winding validation~~ | ✅ **FIXED** - MVT encoding now auto-corrects winding order via `orient_polygon_for_mvt()` |
+| ~~**Medium**~~ | ~~Degenerate geometry handling~~ | ✅ **FIXED** - New `validate.rs` module filters invalid geometries post-simplification |
+| ~~**Low**~~ | ~~Value deduplication uses Debug~~ | ✅ **FIXED** - `PropertyValue` now implements proper `Hash`/`Eq` traits |
 | **Medium** | Memory for large files | `extract_geometries` loads all into `Vec`, defeating Arrow zero-copy. |
-| **Medium** | No polygon winding validation | Could produce invalid MVT tiles. |
-| **Low** | Value deduplication uses Debug | `LayerBuilder` uses `format!("{:?}", value)` for hash keys; fragile. |
 
 ### Phase 3: Feature Dropping 🚧 IN PROGRESS
 
@@ -135,8 +135,7 @@ convert(
 These features are planned but not required for initial release:
 
 - **Advanced polygon clipping** (Sutherland-Hodgman algorithm with buffers)
-- **Winding order correction** for strict renderer compatibility
-- **Degenerate geometry handling** (self-intersecting polygons, zero-area features)
+- **Self-intersecting polygon repair** (complex topology fixes beyond simple validation)
 - **Coalesce/cluster strategies** (tippecanoe-style aggregation modes)
 - **Streaming processing** for files larger than available memory
 - **Attribute filtering** and property selection

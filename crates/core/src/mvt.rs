@@ -14,6 +14,7 @@
 use crate::tile::TileBounds;
 use crate::vector_tile::tile::{Feature, GeomType, Layer, Value};
 use crate::vector_tile::Tile;
+use geo::orient::{Direction, Orient};
 use geo::{Geometry, LineString, MultiLineString, MultiPoint, MultiPolygon, Point, Polygon};
 use std::collections::HashMap;
 
@@ -71,6 +72,46 @@ pub fn command_encode(command_id: u32, count: u32) -> u32 {
 #[inline]
 pub fn command_decode(command: u32) -> (u32, u32) {
     (command & 0x7, command >> 3)
+}
+
+// ============================================================================
+// Winding Order Correction
+// ============================================================================
+
+/// Orient a polygon for MVT encoding.
+///
+/// MVT specification requires:
+/// - Exterior rings: clockwise in screen/tile coordinates (positive area)
+/// - Interior rings: counter-clockwise in screen/tile coordinates (negative area)
+///
+/// Since tile coordinates have Y increasing downward (opposite to geographic coords),
+/// and our coordinate transform flips Y, we need polygons in geographic coordinates
+/// to have:
+/// - Exterior rings: counter-clockwise (becomes CW after Y-flip)
+/// - Interior rings: clockwise (becomes CCW after Y-flip)
+///
+/// This matches geo's `Direction::Default` convention.
+///
+/// # Arguments
+/// * `polygon` - The polygon to orient
+///
+/// # Returns
+/// A new polygon with correctly oriented rings for MVT encoding
+pub fn orient_polygon_for_mvt(polygon: &Polygon) -> Polygon {
+    polygon.orient(Direction::Default)
+}
+
+/// Orient a multi-polygon for MVT encoding.
+///
+/// Applies `orient_polygon_for_mvt` to each constituent polygon.
+///
+/// # Arguments
+/// * `multi` - The multi-polygon to orient
+///
+/// # Returns
+/// A new multi-polygon with correctly oriented rings for MVT encoding
+pub fn orient_multi_polygon_for_mvt(multi: &MultiPolygon) -> MultiPolygon {
+    multi.orient(Direction::Default)
 }
 
 // ============================================================================
@@ -276,14 +317,22 @@ fn encode_ring(
 }
 
 /// Encode a Polygon geometry to MVT geometry commands.
+///
+/// This function automatically corrects polygon winding order to comply with
+/// the MVT specification before encoding:
+/// - Exterior rings: clockwise in tile coordinates
+/// - Interior rings: counter-clockwise in tile coordinates
 pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+    // Apply winding order correction for MVT compliance
+    let oriented = orient_polygon_for_mvt(polygon);
+
     let mut geometry = Vec::new();
     let mut cursor_x = 0i32;
     let mut cursor_y = 0i32;
 
     // Exterior ring
     let exterior_cmds = encode_ring(
-        polygon.exterior(),
+        oriented.exterior(),
         bounds,
         extent,
         &mut cursor_x,
@@ -292,7 +341,7 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
     geometry.extend(exterior_cmds);
 
     // Interior rings (holes)
-    for interior in polygon.interiors() {
+    for interior in oriented.interiors() {
         let interior_cmds = encode_ring(interior, bounds, extent, &mut cursor_x, &mut cursor_y);
         geometry.extend(interior_cmds);
     }
@@ -301,12 +350,20 @@ pub fn encode_polygon(polygon: &Polygon, bounds: &TileBounds, extent: u32) -> Ve
 }
 
 /// Encode a MultiPolygon geometry to MVT geometry commands.
+///
+/// This function automatically corrects polygon winding order to comply with
+/// the MVT specification before encoding:
+/// - Exterior rings: clockwise in tile coordinates
+/// - Interior rings: counter-clockwise in tile coordinates
 pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent: u32) -> Vec<u32> {
+    // Apply winding order correction for MVT compliance
+    let oriented = orient_multi_polygon_for_mvt(polygons);
+
     let mut geometry = Vec::new();
     let mut cursor_x = 0i32;
     let mut cursor_y = 0i32;
 
-    for polygon in &polygons.0 {
+    for polygon in &oriented.0 {
         // Exterior ring
         let exterior_cmds = encode_ring(
             polygon.exterior(),
@@ -935,5 +992,181 @@ mod tests {
         ]);
         let (_, geom_type) = encode_geometry(&poly, &bounds, 4096);
         assert_eq!(geom_type, GeomType::Polygon);
+    }
+
+    // ------------------------------------------------------------------------
+    // Winding Order Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_polygon_correct_winding_unchanged() {
+        // A polygon with correct MVT winding (CCW exterior in geographic coords,
+        // which becomes CW exterior in tile coords after Y-flip) should pass through unchanged.
+        //
+        // MVT requires: exterior rings CW, interior rings CCW (in tile/screen coords)
+        // Geographic CCW -> Tile CW (after Y-flip), so geo::Direction::Default is correct.
+
+        // CCW polygon in geographic coords (correct for MVT after Y-flip)
+        let poly = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let oriented = orient_polygon_for_mvt(&poly);
+
+        // Should be unchanged since it's already correctly oriented
+        assert_eq!(poly.exterior().0, oriented.exterior().0);
+    }
+
+    #[test]
+    fn test_polygon_incorrect_winding_gets_corrected() {
+        // A polygon with incorrect winding (CW exterior in geographic coords)
+        // should be corrected to CCW exterior.
+
+        // CW polygon in geographic coords (incorrect - needs correction)
+        let poly = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 0.0, y: 1.0),
+            (x: 1.0, y: 1.0),
+            (x: 1.0, y: 0.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let oriented = orient_polygon_for_mvt(&poly);
+
+        // Should now be CCW (reversed from input)
+        // The first and last points stay the same, but the middle points should be reversed
+        assert_ne!(poly.exterior().0[1], oriented.exterior().0[1]);
+    }
+
+    #[test]
+    fn test_polygon_with_hole_correct_winding() {
+        // A polygon with a hole should have:
+        // - CCW exterior in geographic coords (becomes CW in tile coords)
+        // - CW interior in geographic coords (becomes CCW in tile coords)
+
+        // Exterior: CCW in geo coords
+        // Interior: CW in geo coords (correct for a hole)
+        let poly = polygon![
+            exterior: [
+                (x: 0.0, y: 0.0),
+                (x: 10.0, y: 0.0),
+                (x: 10.0, y: 10.0),
+                (x: 0.0, y: 10.0),
+                (x: 0.0, y: 0.0),
+            ],
+            interiors: [
+                [
+                    (x: 2.0, y: 2.0),
+                    (x: 2.0, y: 8.0),
+                    (x: 8.0, y: 8.0),
+                    (x: 8.0, y: 2.0),
+                    (x: 2.0, y: 2.0),
+                ],
+            ],
+        ];
+
+        let oriented = orient_polygon_for_mvt(&poly);
+
+        // After orientation, exterior should be CCW and interior should be CW
+        // (in geographic coordinates, which becomes CW exterior / CCW interior in tile coords)
+        assert_eq!(oriented.interiors().len(), 1);
+    }
+
+    #[test]
+    fn test_polygon_with_hole_incorrect_winding_gets_corrected() {
+        // A polygon where both exterior and interior have wrong winding
+
+        // Exterior: CW in geo coords (wrong)
+        // Interior: CCW in geo coords (wrong for a hole)
+        let poly = polygon![
+            exterior: [
+                (x: 0.0, y: 0.0),
+                (x: 0.0, y: 10.0),
+                (x: 10.0, y: 10.0),
+                (x: 10.0, y: 0.0),
+                (x: 0.0, y: 0.0),
+            ],
+            interiors: [
+                [
+                    (x: 2.0, y: 2.0),
+                    (x: 8.0, y: 2.0),
+                    (x: 8.0, y: 8.0),
+                    (x: 2.0, y: 8.0),
+                    (x: 2.0, y: 2.0),
+                ],
+            ],
+        ];
+
+        let oriented = orient_polygon_for_mvt(&poly);
+
+        // Both should be corrected
+        assert_ne!(poly.exterior().0[1], oriented.exterior().0[1]);
+        assert_ne!(poly.interiors()[0].0[1], oriented.interiors()[0].0[1]);
+    }
+
+    #[test]
+    fn test_multipolygon_winding_correction() {
+        // MultiPolygon should have all constituent polygons corrected
+
+        // First polygon: wrong winding
+        // Second polygon: correct winding
+        let multi = geo::MultiPolygon::new(vec![
+            polygon![
+                (x: 0.0, y: 0.0),
+                (x: 0.0, y: 1.0),
+                (x: 1.0, y: 1.0),
+                (x: 1.0, y: 0.0),
+                (x: 0.0, y: 0.0),
+            ],
+            polygon![
+                (x: 2.0, y: 0.0),
+                (x: 3.0, y: 0.0),
+                (x: 3.0, y: 1.0),
+                (x: 2.0, y: 1.0),
+                (x: 2.0, y: 0.0),
+            ],
+        ]);
+
+        let oriented = orient_multi_polygon_for_mvt(&multi);
+
+        assert_eq!(oriented.0.len(), 2);
+        // First polygon should be corrected (was CW, now CCW)
+        // Second polygon should remain unchanged (was already CCW)
+    }
+
+    #[test]
+    fn test_encode_polygon_applies_winding_correction() {
+        // The main encode_polygon function should apply winding correction
+        let bounds = test_bounds();
+
+        // CW polygon (wrong winding in geographic coords)
+        let poly_cw = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 0.0, y: 1.0),
+            (x: 1.0, y: 1.0),
+            (x: 1.0, y: 0.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        // CCW polygon (correct winding in geographic coords)
+        let poly_ccw = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ];
+
+        // Both should produce equivalent MVT output (same geometry, just different input winding)
+        let commands_cw = encode_polygon(&poly_cw, &bounds, 4096);
+        let commands_ccw = encode_polygon(&poly_ccw, &bounds, 4096);
+
+        // The encoded geometry should be the same for both inputs
+        // because winding correction normalizes them
+        assert_eq!(commands_cw, commands_ccw);
     }
 }

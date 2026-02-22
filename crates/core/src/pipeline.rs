@@ -3,13 +3,14 @@
 //! This module provides the core tiling pipeline that:
 //! 1. Reads geometries from GeoParquet
 //! 2. Iterates tiles for the data's bounding box at each zoom level
-//! 3. For each tile: clips, simplifies, and encodes to MVT format
+//! 3. For each tile: clips, simplifies, validates, and encodes to MVT format
 //!
 //! # Tippecanoe Alignment
 //!
 //! This pipeline matches tippecanoe's approach:
 //! - Buffer: 8 pixels (configurable)
 //! - Simplification: Douglas-Peucker to tile resolution at each zoom
+//! - Degenerate geometry filtering: drop invalid geometries post-simplification
 //! - Empty tiles are skipped (not written)
 
 use std::path::Path;
@@ -21,6 +22,7 @@ use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::simplify::simplify_for_zoom;
 use crate::tile::{tiles_for_bbox, TileBounds, TileCoord};
+use crate::validate::filter_valid_geometry;
 use crate::vector_tile::Tile;
 use crate::{Error, Result};
 
@@ -229,9 +231,13 @@ impl TileIterator {
                 // Simplify for zoom level
                 let simplified = simplify_for_zoom(&clipped, coord.z, self.config.extent);
 
-                // Add to layer (no properties for now)
-                layer_builder.add_feature(Some(idx as u64), &simplified, &[], &bounds);
-                feature_count += 1;
+                // Validate geometry - filter out degenerate geometries post-simplification
+                // (e.g., polygons with < 4 points, zero-area polygons, linestrings with < 2 points)
+                if let Some(valid_geom) = filter_valid_geometry(&simplified) {
+                    // Add to layer (no properties for now)
+                    layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);
+                    feature_count += 1;
+                }
             }
         }
 
@@ -302,8 +308,12 @@ pub fn generate_single_tile(
     for (idx, geom) in geometries.iter().enumerate() {
         if let Some(clipped) = clip_geometry(geom, &bounds, buffer) {
             let simplified = simplify_for_zoom(&clipped, coord.z, config.extent);
-            layer_builder.add_feature(Some(idx as u64), &simplified, &[], &bounds);
-            feature_count += 1;
+
+            // Validate geometry - filter out degenerate geometries post-simplification
+            if let Some(valid_geom) = filter_valid_geometry(&simplified) {
+                layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);
+                feature_count += 1;
+            }
         }
     }
 
@@ -328,7 +338,7 @@ pub fn decode_tile(data: &[u8]) -> Result<Tile> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo::{point, polygon, Geometry};
+    use geo::{line_string, point, polygon, Geometry};
     use std::path::Path;
 
     // ========== TilerConfig Tests ==========
@@ -647,6 +657,165 @@ mod tests {
             decoded.layers[0].features.len(),
             2,
             "Should have both point and polygon"
+        );
+    }
+
+    // ========== Degenerate Geometry Validation Tests ==========
+
+    #[test]
+    fn test_pipeline_filters_degenerate_linestring() {
+        use geo::LineString;
+
+        // Create a linestring with only 1 point (degenerate after simplification scenario)
+        // Note: A real scenario would have simplification reduce points,
+        // but we can test the validation directly with a degenerate input.
+        let degenerate_line =
+            Geometry::LineString(LineString::new(vec![geo::Coord { x: 0.5, y: 0.5 }]));
+
+        let valid_point = Geometry::Point(point!(x: 0.5, y: 0.5));
+
+        let geometries = vec![degenerate_line, valid_point];
+
+        let config = TilerConfig::new(0, 0);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .unwrap();
+
+        let decoded = decode_tile(&tile.data).unwrap();
+        // Should only have the valid point, degenerate linestring filtered out
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            1,
+            "Should filter out degenerate linestring"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_filters_degenerate_polygon_too_few_points() {
+        // A polygon with only 3 points (2 unique + closing) is degenerate
+        let degenerate_poly = Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::new(vec![
+                geo::Coord { x: 0.0, y: 0.0 },
+                geo::Coord { x: 1.0, y: 0.0 },
+                geo::Coord { x: 0.0, y: 0.0 }, // closing
+            ]),
+            vec![],
+        ));
+
+        let valid_point = Geometry::Point(point!(x: 0.5, y: 0.5));
+
+        let geometries = vec![degenerate_poly, valid_point];
+
+        let config = TilerConfig::new(0, 0);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .unwrap();
+
+        let decoded = decode_tile(&tile.data).unwrap();
+        // Should only have the valid point
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            1,
+            "Should filter out degenerate polygon with too few points"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_filters_zero_area_polygon() {
+        // A polygon where all points are collinear (zero area)
+        let zero_area_poly = Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::new(vec![
+                geo::Coord { x: 0.0, y: 0.0 },
+                geo::Coord { x: 1.0, y: 0.0 },
+                geo::Coord { x: 2.0, y: 0.0 },
+                geo::Coord { x: 3.0, y: 0.0 },
+                geo::Coord { x: 0.0, y: 0.0 }, // closing
+            ]),
+            vec![],
+        ));
+
+        let valid_point = Geometry::Point(point!(x: 0.5, y: 0.5));
+
+        let geometries = vec![zero_area_poly, valid_point];
+
+        let config = TilerConfig::new(0, 0);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .unwrap();
+
+        let decoded = decode_tile(&tile.data).unwrap();
+        // Should only have the valid point
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            1,
+            "Should filter out zero-area polygon"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_keeps_valid_geometries() {
+        // All valid geometries should pass through
+        let valid_point = Geometry::Point(point!(x: 0.5, y: 0.5));
+        let valid_line = Geometry::LineString(line_string![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+        ]);
+        let valid_poly = Geometry::Polygon(polygon![
+            (x: 0.0, y: 0.0),
+            (x: 1.0, y: 0.0),
+            (x: 1.0, y: 1.0),
+            (x: 0.0, y: 1.0),
+            (x: 0.0, y: 0.0),
+        ]);
+
+        let geometries = vec![valid_point, valid_line, valid_poly];
+
+        let config = TilerConfig::new(0, 0);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let tile = generate_single_tile(&geometries, coord, &config)
+            .unwrap()
+            .unwrap();
+
+        let decoded = decode_tile(&tile.data).unwrap();
+        assert_eq!(
+            decoded.layers[0].features.len(),
+            3,
+            "All valid geometries should be kept"
+        );
+    }
+
+    #[test]
+    fn test_pipeline_all_degenerate_returns_empty_tile() {
+        // If all geometries are degenerate, tile should be empty (None)
+        let degenerate_line =
+            Geometry::LineString(geo::LineString::new(vec![geo::Coord { x: 0.5, y: 0.5 }]));
+
+        let degenerate_poly = Geometry::Polygon(geo::Polygon::new(
+            geo::LineString::new(vec![
+                geo::Coord { x: 0.0, y: 0.0 },
+                geo::Coord { x: 1.0, y: 0.0 },
+                geo::Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+
+        let geometries = vec![degenerate_line, degenerate_poly];
+
+        let config = TilerConfig::new(0, 0);
+        let coord = TileCoord::new(0, 0, 0);
+
+        let result = generate_single_tile(&geometries, coord, &config).unwrap();
+        // Should return None because all geometries were filtered out
+        assert!(
+            result.is_none(),
+            "Tile with all degenerate geometries should return None"
         );
     }
 }

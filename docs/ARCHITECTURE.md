@@ -44,14 +44,15 @@ Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (Andorra, ~1
 |-------|--------|------------|
 | Simplification coordinate space | ✅ FIXED | `simplify_in_tile_coords()` with pixel-based tolerance |
 | Antimeridian crossing | ✅ FIXED | `tiles_for_bbox()` splits bbox at 180° |
+| Polygon winding validation | ✅ FIXED | `orient_polygon_for_mvt()` auto-corrects winding order |
+| Degenerate geometry handling | ✅ FIXED | `validate.rs` module filters invalid geometries post-simplification |
+| Value deduplication | ✅ FIXED | `PropertyValue` implements proper `Hash`/`Eq` traits |
 
-## Remaining Medium-Priority Issues
+## Remaining Issues
 
 | Issue | Description | Workaround |
 |-------|-------------|------------|
-| Degenerate geometry handling | No validation post-simplification | Silently dropped in MVT encoding |
 | Memory for large files | `extract_geometries` loads all into Vec | Document limitation; Phase 4 adds streaming |
-| Polygon winding order | No validation for MVT spec compliance | Most renderers handle gracefully |
 
 ## Feature Dropping Algorithms
 
@@ -95,7 +96,8 @@ crates/core/src/
 ├── tile.rs             # TileCoord, TileBounds, coordinate math
 ├── clip.rs             # Geometry clipping with buffer
 ├── simplify.rs         # RDP simplification in tile coordinates
-├── mvt.rs              # MVT protobuf encoding
+├── validate.rs         # Geometry validation (degenerate detection, winding order)
+├── mvt.rs              # MVT protobuf encoding (with auto winding correction)
 ├── pmtiles_writer.rs   # Custom PMTiles v3 writer
 ├── feature_drop.rs     # Tippecanoe-compatible dropping algorithms
 ├── pipeline.rs         # Tile generation orchestration
