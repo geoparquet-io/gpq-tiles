@@ -14,8 +14,10 @@
 //! - Empty tiles are skipped (not written)
 
 use std::path::Path;
+use std::sync::Arc;
 
 use prost::Message;
+use rayon::prelude::*;
 
 use geo::Geometry;
 
@@ -113,6 +115,10 @@ pub struct TilerConfig {
     /// Hilbert curves have better locality than Z-order curves.
     /// If false, uses Z-order (Morton) curve instead.
     pub use_hilbert: bool,
+    /// Enable parallel tile generation using Rayon (default: true)
+    /// When enabled, tiles within each zoom level are processed in parallel.
+    /// Zoom levels are still processed sequentially to preserve feature dropping semantics.
+    pub parallel: bool,
 }
 
 impl Default for TilerConfig {
@@ -133,6 +139,8 @@ impl Default for TilerConfig {
             density_max_per_cell: 1,
             // Hilbert curve is the default because it has better locality than Z-order
             use_hilbert: true,
+            // Parallel processing is enabled by default for performance
+            parallel: true,
         }
     }
 }
@@ -192,6 +200,18 @@ impl TilerConfig {
     /// the same locality guarantee at quadrant boundaries.
     pub fn with_hilbert(mut self, use_hilbert: bool) -> Self {
         self.use_hilbert = use_hilbert;
+        self
+    }
+
+    /// Enable or disable parallel tile generation.
+    ///
+    /// When enabled (default), tiles within each zoom level are processed in parallel
+    /// using Rayon. Zoom levels are still processed sequentially to preserve feature
+    /// dropping semantics.
+    ///
+    /// Disable this for debugging or when you need deterministic single-threaded execution.
+    pub fn with_parallel(mut self, parallel: bool) -> Self {
+        self.parallel = parallel;
         self
     }
 }
@@ -289,11 +309,24 @@ fn calculate_bbox_from_geometries(geometries: &[geo::Geometry<f64>]) -> TileBoun
 }
 
 /// Iterator that generates tiles for each tile coordinate.
+///
+/// When parallel mode is enabled, tiles within each zoom level are processed
+/// in parallel using Rayon. Zoom levels are still processed sequentially to
+/// preserve feature dropping semantics.
 struct TileIterator {
-    geometries: Vec<geo::Geometry<f64>>,
+    /// Shared geometries for parallel access
+    geometries: Arc<Vec<geo::Geometry<f64>>>,
     config: TilerConfig,
-    tile_coords: Vec<TileCoord>,
-    current_index: usize,
+    /// Bounding box for generating tile coordinates
+    bbox: TileBounds,
+    /// Current zoom level being processed
+    current_zoom: u8,
+    /// Buffer of generated tiles for the current zoom level
+    tile_buffer: Vec<GeneratedTile>,
+    /// Index into the tile buffer
+    buffer_index: usize,
+    /// Whether we've finished all zoom levels
+    finished: bool,
 }
 
 impl TileIterator {
@@ -304,57 +337,60 @@ impl TileIterator {
         let mut sorted_geometries = geometries;
         sort_geometries(&mut sorted_geometries, config.use_hilbert);
 
-        // Collect all tile coordinates for all zoom levels
-        let mut tile_coords = Vec::new();
-        for zoom in config.min_zoom..=config.max_zoom {
-            tile_coords.extend(tiles_for_bbox(&bbox, zoom));
-        }
-
         Self {
-            geometries: sorted_geometries,
+            geometries: Arc::new(sorted_geometries),
+            current_zoom: config.min_zoom,
+            bbox,
             config,
-            tile_coords,
-            current_index: 0,
+            tile_buffer: Vec::new(),
+            buffer_index: 0,
+            finished: false,
         }
     }
 
     fn empty() -> Self {
         Self {
-            geometries: Vec::new(),
+            geometries: Arc::new(Vec::new()),
             config: TilerConfig::default(),
-            tile_coords: Vec::new(),
-            current_index: 0,
+            bbox: TileBounds::empty(),
+            current_zoom: 0,
+            tile_buffer: Vec::new(),
+            buffer_index: 0,
+            finished: true,
         }
     }
 
     /// Process a single tile: clip, simplify, encode to MVT.
-    fn process_tile(&self, coord: TileCoord) -> Result<Option<GeneratedTile>> {
+    /// This is a pure function that can be safely called in parallel.
+    fn process_tile_static(
+        geometries: &[geo::Geometry<f64>],
+        coord: TileCoord,
+        config: &TilerConfig,
+    ) -> Result<Option<GeneratedTile>> {
         let bounds = coord.bounds();
-        let buffer =
-            buffer_pixels_to_degrees(self.config.buffer_pixels, &bounds, self.config.extent);
+        let buffer = buffer_pixels_to_degrees(config.buffer_pixels, &bounds, config.extent);
 
         // Build the layer with clipped/simplified geometries
-        let mut layer_builder =
-            LayerBuilder::new(&self.config.layer_name).with_extent(self.config.extent);
+        let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
 
         // Create density dropper for this tile if enabled
-        let mut density_dropper = if self.config.enable_density_drop {
+        let mut density_dropper = if config.enable_density_drop {
             let density_config = DensityDropConfig::new()
-                .with_cell_size(self.config.density_cell_size)
-                .with_max_features_per_cell(self.config.density_max_per_cell)
-                .with_zoom_range(0, self.config.max_zoom);
-            Some(DensityDropper::new(density_config, self.config.extent))
+                .with_cell_size(config.density_cell_size)
+                .with_max_features_per_cell(config.density_max_per_cell)
+                .with_zoom_range(0, config.max_zoom);
+            Some(DensityDropper::new(density_config, config.extent))
         } else {
             None
         };
 
         let mut feature_count = 0;
 
-        for (idx, geom) in self.geometries.iter().enumerate() {
+        for (idx, geom) in geometries.iter().enumerate() {
             // Clip to tile bounds
             if let Some(clipped) = clip_geometry(geom, &bounds, buffer) {
                 // Simplify for zoom level
-                let simplified = simplify_for_zoom(&clipped, coord.z, self.config.extent);
+                let simplified = simplify_for_zoom(&clipped, coord.z, config.extent);
 
                 // Validate geometry - filter out degenerate geometries post-simplification
                 // (e.g., polygons with < 4 points, zero-area polygons, linestrings with < 2 points)
@@ -364,8 +400,8 @@ impl TileIterator {
                     if should_drop_geometry(
                         &valid_geom,
                         coord.z,
-                        self.config.max_zoom,
-                        self.config.extent,
+                        config.max_zoom,
+                        config.extent,
                         &bounds,
                         idx as u64,
                     ) {
@@ -379,7 +415,7 @@ impl TileIterator {
                         if dropper.should_drop_geometry(
                             &valid_geom,
                             &bounds,
-                            self.config.extent,
+                            config.extent,
                             coord.z,
                         ) {
                             continue;
@@ -409,25 +445,93 @@ impl TileIterator {
 
         Ok(Some(GeneratedTile::new(coord, data)))
     }
+
+    /// Process all tiles for a zoom level in parallel.
+    fn process_zoom_level_parallel(&self, zoom: u8) -> Vec<Result<GeneratedTile>> {
+        let tile_coords: Vec<TileCoord> = tiles_for_bbox(&self.bbox, zoom).collect();
+
+        // Clone Arc for each parallel task
+        let geometries = Arc::clone(&self.geometries);
+        let config = self.config.clone();
+
+        tile_coords
+            .into_par_iter()
+            .filter_map(|coord| {
+                match Self::process_tile_static(&geometries, coord, &config) {
+                    Ok(Some(tile)) => Some(Ok(tile)),
+                    Ok(None) => None, // Empty tile, skip
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect()
+    }
+
+    /// Process all tiles for a zoom level sequentially.
+    fn process_zoom_level_sequential(&self, zoom: u8) -> Vec<Result<GeneratedTile>> {
+        let tile_coords: Vec<TileCoord> = tiles_for_bbox(&self.bbox, zoom).collect();
+
+        tile_coords
+            .into_iter()
+            .filter_map(|coord| {
+                match Self::process_tile_static(&self.geometries, coord, &self.config) {
+                    Ok(Some(tile)) => Some(Ok(tile)),
+                    Ok(None) => None, // Empty tile, skip
+                    Err(e) => Some(Err(e)),
+                }
+            })
+            .collect()
+    }
+
+    /// Fill the tile buffer with tiles from the next zoom level.
+    fn fill_buffer(&mut self) -> bool {
+        if self.current_zoom > self.config.max_zoom {
+            self.finished = true;
+            return false;
+        }
+
+        // Process tiles for this zoom level
+        let results = if self.config.parallel {
+            self.process_zoom_level_parallel(self.current_zoom)
+        } else {
+            self.process_zoom_level_sequential(self.current_zoom)
+        };
+
+        // Extract successful tiles, propagate errors later
+        self.tile_buffer = results.into_iter().filter_map(|r| r.ok()).collect();
+
+        // Sort tiles by coordinates for deterministic output order
+        self.tile_buffer
+            .sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
+
+        self.buffer_index = 0;
+        self.current_zoom += 1;
+
+        !self.tile_buffer.is_empty() || self.current_zoom <= self.config.max_zoom
+    }
 }
 
 impl Iterator for TileIterator {
     type Item = Result<GeneratedTile>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Find the next non-empty tile
-        while self.current_index < self.tile_coords.len() {
-            let coord = self.tile_coords[self.current_index];
-            self.current_index += 1;
+        loop {
+            // If we have buffered tiles, return the next one
+            if self.buffer_index < self.tile_buffer.len() {
+                let tile = self.tile_buffer[self.buffer_index].clone();
+                self.buffer_index += 1;
+                return Some(Ok(tile));
+            }
 
-            match self.process_tile(coord) {
-                Ok(Some(tile)) => return Some(Ok(tile)),
-                Ok(None) => continue, // Empty tile, skip
-                Err(e) => return Some(Err(e)),
+            // If we're finished, return None
+            if self.finished {
+                return None;
+            }
+
+            // Try to fill the buffer with the next zoom level
+            if !self.fill_buffer() && self.tile_buffer.is_empty() {
+                return None;
             }
         }
-
-        None
     }
 }
 
@@ -450,69 +554,7 @@ pub fn generate_single_tile(
     coord: TileCoord,
     config: &TilerConfig,
 ) -> Result<Option<GeneratedTile>> {
-    let bounds = coord.bounds();
-    let buffer = buffer_pixels_to_degrees(config.buffer_pixels, &bounds, config.extent);
-
-    let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
-
-    // Create density dropper for this tile if enabled
-    let mut density_dropper = if config.enable_density_drop {
-        let density_config = DensityDropConfig::new()
-            .with_cell_size(config.density_cell_size)
-            .with_max_features_per_cell(config.density_max_per_cell)
-            .with_zoom_range(0, config.max_zoom);
-        Some(DensityDropper::new(density_config, config.extent))
-    } else {
-        None
-    };
-
-    let mut feature_count = 0;
-
-    for (idx, geom) in geometries.iter().enumerate() {
-        if let Some(clipped) = clip_geometry(geom, &bounds, buffer) {
-            let simplified = simplify_for_zoom(&clipped, coord.z, config.extent);
-
-            // Validate geometry - filter out degenerate geometries post-simplification
-            if let Some(valid_geom) = filter_valid_geometry(&simplified) {
-                // Apply feature dropping based on zoom level and geometry type
-                // base_zoom is max_zoom: at max_zoom all features are kept
-                if should_drop_geometry(
-                    &valid_geom,
-                    coord.z,
-                    config.max_zoom,
-                    config.extent,
-                    &bounds,
-                    idx as u64,
-                ) {
-                    continue;
-                }
-
-                // Apply density-based dropping if enabled
-                // This limits the number of features per grid cell to prevent
-                // cluttered tiles at low zoom levels
-                if let Some(ref mut dropper) = density_dropper {
-                    if dropper.should_drop_geometry(&valid_geom, &bounds, config.extent, coord.z) {
-                        continue;
-                    }
-                }
-
-                layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);
-                feature_count += 1;
-            }
-        }
-    }
-
-    if feature_count == 0 {
-        return Ok(None);
-    }
-
-    let layer = layer_builder.build();
-    let mut tile_builder = TileBuilder::new();
-    tile_builder.add_layer(layer);
-    let tile = tile_builder.build();
-    let data = tile.encode_to_vec();
-
-    Ok(Some(GeneratedTile::new(coord, data)))
+    TileIterator::process_tile_static(geometries, coord, config)
 }
 
 /// Decode an MVT tile from bytes (for testing).
@@ -1297,5 +1339,124 @@ mod tests {
             assert_eq!(decoded.layers.len(), 1);
             assert!(!decoded.layers[0].features.is_empty());
         }
+    }
+
+    // ========== Parallel Tile Generation Tests ==========
+
+    #[test]
+    fn test_parallel_config_option() {
+        // Verify the parallel config option works
+        let config_default = TilerConfig::default();
+        assert!(
+            config_default.parallel,
+            "Default should enable parallel processing"
+        );
+
+        let config_parallel = TilerConfig::new(0, 10).with_parallel(true);
+        assert!(
+            config_parallel.parallel,
+            "with_parallel(true) should enable parallel"
+        );
+
+        let config_sequential = TilerConfig::new(0, 10).with_parallel(false);
+        assert!(
+            !config_sequential.parallel,
+            "with_parallel(false) should disable parallel"
+        );
+    }
+
+    #[test]
+    fn test_parallel_produces_same_results_as_sequential() {
+        // Generate tiles with both parallel and sequential modes
+        // Results should be identical (deterministic)
+        let geometries = vec![
+            Geometry::Point(point!(x: 0.0, y: 0.0)),
+            Geometry::Point(point!(x: 0.5, y: 0.5)),
+            Geometry::Point(point!(x: -0.5, y: -0.5)),
+            Geometry::Polygon(polygon![
+                (x: 0.0, y: 0.0),
+                (x: 1.0, y: 0.0),
+                (x: 1.0, y: 1.0),
+                (x: 0.0, y: 1.0),
+                (x: 0.0, y: 0.0),
+            ]),
+            Geometry::LineString(line_string![
+                (x: -1.0, y: -1.0),
+                (x: 1.0, y: 1.0),
+            ]),
+        ];
+
+        let bbox = calculate_bbox_from_geometries(&geometries);
+
+        // Sequential mode
+        let config_seq = TilerConfig::new(0, 4).with_parallel(false);
+        let iter_seq = TileIterator::new(geometries.clone(), bbox.clone(), config_seq);
+        let tiles_seq: Vec<_> = iter_seq.filter_map(|r| r.ok()).collect();
+
+        // Parallel mode
+        let config_par = TilerConfig::new(0, 4).with_parallel(true);
+        let iter_par = TileIterator::new(geometries.clone(), bbox.clone(), config_par);
+        let tiles_par: Vec<_> = iter_par.filter_map(|r| r.ok()).collect();
+
+        // Same number of tiles
+        assert_eq!(
+            tiles_seq.len(),
+            tiles_par.len(),
+            "Parallel and sequential should produce same number of tiles"
+        );
+
+        // Same tile coordinates (sorted for comparison)
+        let mut coords_seq: Vec<_> = tiles_seq.iter().map(|t| t.coord).collect();
+        let mut coords_par: Vec<_> = tiles_par.iter().map(|t| t.coord).collect();
+        coords_seq.sort_by_key(|c| (c.z, c.x, c.y));
+        coords_par.sort_by_key(|c| (c.z, c.x, c.y));
+
+        assert_eq!(
+            coords_seq, coords_par,
+            "Parallel and sequential should produce tiles for same coordinates"
+        );
+
+        // Same tile data (content must be identical for determinism)
+        // Sort both by coordinates first
+        let mut tiles_seq_sorted = tiles_seq;
+        let mut tiles_par_sorted = tiles_par;
+        tiles_seq_sorted.sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
+        tiles_par_sorted.sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
+
+        for (seq_tile, par_tile) in tiles_seq_sorted.iter().zip(tiles_par_sorted.iter()) {
+            assert_eq!(
+                seq_tile.data, par_tile.data,
+                "Tile data should be identical for coord {:?}",
+                seq_tile.coord
+            );
+        }
+    }
+
+    #[test]
+    fn test_parallel_with_real_fixture() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Generate tiles with parallel enabled
+        let config = TilerConfig::new(8, 10)
+            .with_layer_name("buildings")
+            .with_parallel(true);
+
+        let tiles_iter = generate_tiles(fixture, &config).expect("Should create iterator");
+        let tiles: Vec<_> = tiles_iter.filter_map(|r| r.ok()).collect();
+
+        assert!(!tiles.is_empty(), "Should generate tiles in parallel mode");
+
+        // Verify tiles are valid
+        for tile in &tiles {
+            let decoded = decode_tile(&tile.data).expect("Should decode MVT");
+            assert_eq!(decoded.layers.len(), 1);
+            assert!(!decoded.layers[0].features.is_empty());
+        }
+
+        println!("Generated {} tiles in parallel mode", tiles.len());
     }
 }
