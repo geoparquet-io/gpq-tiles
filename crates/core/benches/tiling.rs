@@ -1,8 +1,12 @@
 // Benchmark suite for tiling performance
 //
-// Uses the golden data fixtures (open-buildings.parquet) for realistic benchmarks.
+// Uses real-world GeoParquet fixtures for realistic benchmarks.
 //
 // Run with: cargo bench --package gpq-tiles-core
+//
+// Fixtures:
+// - open-buildings.parquet (1K features) - quick tests
+// - fieldmaps-madagascar-adm4.parquet (17K features) - parallelization benchmarks
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use gpq_tiles_core::batch_processor::extract_geometries;
@@ -10,16 +14,26 @@ use gpq_tiles_core::pipeline::{generate_single_tile, generate_tiles_from_geometr
 use gpq_tiles_core::tile::TileCoord;
 use std::path::Path;
 
-// Path to the golden fixture (relative to crates/core/)
-const FIXTURE_PATH: &str = "../../tests/fixtures/realdata/open-buildings.parquet";
+// Path to fixtures (relative to crates/core/)
+const FIXTURE_SMALL: &str = "../../tests/fixtures/realdata/open-buildings.parquet";
+const FIXTURE_LARGE: &str = "../../tests/fixtures/realdata/fieldmaps-madagascar-adm4.parquet";
 
-/// Load geometries from the golden fixture file
-fn load_fixture_geometries() -> Vec<geo::Geometry<f64>> {
-    let path = Path::new(FIXTURE_PATH);
+/// Load geometries from the small fixture (1K features)
+fn load_small_fixture() -> Vec<geo::Geometry<f64>> {
+    load_fixture(FIXTURE_SMALL)
+}
+
+/// Load geometries from the large fixture (17K features)
+fn load_large_fixture() -> Vec<geo::Geometry<f64>> {
+    load_fixture(FIXTURE_LARGE)
+}
+
+fn load_fixture(fixture_path: &str) -> Vec<geo::Geometry<f64>> {
+    let path = Path::new(fixture_path);
     if !path.exists() {
         panic!(
-            "Fixture file not found at {}. Run from crates/core/ or project root.",
-            FIXTURE_PATH
+            "Fixture file not found at {}. Run `git lfs pull` if using LFS fixtures.",
+            fixture_path
         );
     }
     extract_geometries(path).expect("Failed to load fixture geometries")
@@ -27,7 +41,7 @@ fn load_fixture_geometries() -> Vec<geo::Geometry<f64>> {
 
 /// Benchmark single tile generation at various zoom levels
 fn bench_single_tile(c: &mut Criterion) {
-    let geometries = load_fixture_geometries();
+    let geometries = load_small_fixture();
     let config = TilerConfig::new(0, 14);
 
     let mut group = c.benchmark_group("single_tile");
@@ -50,7 +64,7 @@ fn bench_single_tile(c: &mut Criterion) {
 
 /// Benchmark full pipeline at various zoom ranges
 fn bench_full_pipeline(c: &mut Criterion) {
-    let geometries = load_fixture_geometries();
+    let geometries = load_small_fixture();
 
     let mut group = c.benchmark_group("full_pipeline");
     group.throughput(Throughput::Elements(geometries.len() as u64));
@@ -77,7 +91,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
 /// Benchmark parallel vs sequential tile generation
 fn bench_parallel_vs_sequential(c: &mut Criterion) {
-    let geometries = load_fixture_geometries();
+    let geometries = load_small_fixture();
 
     let mut group = c.benchmark_group("parallel_vs_sequential");
     group.throughput(Throughput::Elements(geometries.len() as u64));
@@ -109,7 +123,7 @@ fn bench_parallel_vs_sequential(c: &mut Criterion) {
 
 /// Benchmark with density dropping enabled vs disabled
 fn bench_density_dropping(c: &mut Criterion) {
-    let geometries = load_fixture_geometries();
+    let geometries = load_small_fixture();
 
     let mut group = c.benchmark_group("density_dropping");
     group.throughput(Throughput::Elements(geometries.len() as u64));
@@ -144,7 +158,7 @@ fn bench_density_dropping(c: &mut Criterion) {
 
 /// Benchmark Hilbert vs Z-order sorting
 fn bench_hilbert_vs_zorder(c: &mut Criterion) {
-    let geometries = load_fixture_geometries();
+    let geometries = load_small_fixture();
 
     let mut group = c.benchmark_group("hilbert_vs_zorder");
     group.throughput(Throughput::Elements(geometries.len() as u64));
@@ -174,6 +188,68 @@ fn bench_hilbert_vs_zorder(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark parallel vs sequential on LARGE fixture (17K features)
+/// This is the main benchmark for demonstrating parallelization speedup.
+fn bench_large_parallel_vs_sequential(c: &mut Criterion) {
+    let geometries = load_large_fixture();
+
+    let mut group = c.benchmark_group("large_parallel_vs_sequential");
+    group.throughput(Throughput::Elements(geometries.len() as u64));
+    // Increase sample size for more accurate results on larger dataset
+    group.sample_size(20);
+
+    // Sequential - expect ~2-3 seconds
+    let config_seq = TilerConfig::new(0, 10).with_parallel(false);
+    group.bench_function("sequential_17k_z0_10", |b| {
+        b.iter(|| {
+            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_seq)
+                .expect("generate_tiles failed")
+                .collect();
+            black_box(tiles)
+        })
+    });
+
+    // Parallel - expect significant speedup (4-8x on multi-core)
+    let config_par = TilerConfig::new(0, 10).with_parallel(true);
+    group.bench_function("parallel_17k_z0_10", |b| {
+        b.iter(|| {
+            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_par)
+                .expect("generate_tiles failed")
+                .collect();
+            black_box(tiles)
+        })
+    });
+
+    group.finish();
+}
+
+/// Benchmark full pipeline on large fixture at different zoom ranges
+fn bench_large_full_pipeline(c: &mut Criterion) {
+    let geometries = load_large_fixture();
+
+    let mut group = c.benchmark_group("large_full_pipeline");
+    group.throughput(Throughput::Elements(geometries.len() as u64));
+    group.sample_size(10);
+
+    for max_zoom in [8, 10, 12] {
+        let config = TilerConfig::new(0, max_zoom);
+        group.bench_with_input(
+            BenchmarkId::new("max_zoom", max_zoom),
+            &config,
+            |b, config| {
+                b.iter(|| {
+                    let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), config)
+                        .expect("generate_tiles failed")
+                        .collect();
+                    black_box(tiles)
+                })
+            },
+        );
+    }
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_single_tile,
@@ -182,4 +258,11 @@ criterion_group!(
     bench_density_dropping,
     bench_hilbert_vs_zorder,
 );
-criterion_main!(benches);
+
+criterion_group!(
+    name = large_benches;
+    config = Criterion::default().sample_size(20);
+    targets = bench_large_parallel_vs_sequential, bench_large_full_pipeline
+);
+
+criterion_main!(benches, large_benches);

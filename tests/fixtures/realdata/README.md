@@ -1,7 +1,26 @@
 # Real-World Test Fixtures
 
-Production data samples for testing Portolan's orchestration layer.
+Production data samples for testing gpq-tiles tiling performance.
 
-**Full documentation:** [`context/shared/documentation/test-fixtures.md`](../../../context/shared/documentation/test-fixtures.md)
+## Fixtures
 
-**Key point:** Portolan orchestrates — it does not validate geometry. These fixtures test orchestration, not upstream library behavior.
+| File | Features | Size | Source | Use Case |
+|------|----------|------|--------|----------|
+| `open-buildings.parquet` | 1,000 | 143KB | Google Open Buildings | Quick tests, golden comparisons |
+| `fieldmaps-madagascar-adm4.parquet` | 17,465 | 28MB | [FieldMaps](https://fieldmaps.io) | **Parallelization benchmarks** |
+| `fieldmaps-boundaries.parquet` | 3 | 2.2MB | FieldMaps | Large polygon tests |
+| `road-detections.parquet` | ~1,000 | 90KB | Road detection ML | LineString tests |
+
+## Attribution
+
+- **FieldMaps data** courtesy of Maxym Malchenko ([fieldmaps.io](https://fieldmaps.io)) — edge-matched humanitarian admin boundaries
+- **Google Open Buildings** — CC BY 4.0
+- **Road detections** — derived from ML model outputs
+
+## Git LFS
+
+Large fixtures are tracked with Git LFS. After cloning:
+
+```bash
+git lfs pull
+```
