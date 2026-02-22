@@ -351,6 +351,10 @@ pub struct PmtilesWriter {
     layer_name: String,
     /// Field metadata: field name -> MVT type ("String", "Number", "Boolean")
     fields: HashMap<String, String>,
+    /// Total feature count across all tiles
+    total_features: u64,
+    /// Feature count per zoom level
+    features_per_zoom: HashMap<u8, u64>,
 }
 
 impl PmtilesWriter {
@@ -363,6 +367,8 @@ impl PmtilesWriter {
             bounds: TileBounds::empty(),
             layer_name: "layer".to_string(),
             fields: HashMap::new(),
+            total_features: 0,
+            features_per_zoom: HashMap::new(),
         }
     }
 
@@ -396,10 +402,39 @@ impl PmtilesWriter {
         format!("{{{}}}", field_strings.join(","))
     }
 
+    /// Build the tilestats JSON fragment
+    fn build_tilestats_json(&self) -> String {
+        if self.total_features == 0 {
+            return String::new();
+        }
+
+        format!(
+            r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
+            self.layer_name,
+            self.total_features,
+            self.fields.len()
+        )
+    }
+
     /// Add a tile (will be gzip compressed)
     ///
     /// The tile data should be uncompressed MVT bytes.
+    /// Use `add_tile_with_count` if you have feature count available.
     pub fn add_tile(&mut self, z: u8, x: u32, y: u32, data: &[u8]) -> std::io::Result<()> {
+        self.add_tile_with_count(z, x, y, data, 0)
+    }
+
+    /// Add a tile with feature count for tilestats
+    ///
+    /// The tile data should be uncompressed MVT bytes.
+    pub fn add_tile_with_count(
+        &mut self,
+        z: u8,
+        x: u32,
+        y: u32,
+        data: &[u8],
+        feature_count: usize,
+    ) -> std::io::Result<()> {
         let compressed = gzip_compress(data)?;
         let id = tile_id(z, x, y);
         self.tiles.insert(id, compressed);
@@ -407,6 +442,10 @@ impl PmtilesWriter {
         // Track zoom range
         self.min_zoom = self.min_zoom.min(z);
         self.max_zoom = self.max_zoom.max(z);
+
+        // Track feature counts for tilestats
+        self.total_features += feature_count as u64;
+        *self.features_per_zoom.entry(z).or_insert(0) += feature_count as u64;
 
         Ok(())
     }
@@ -467,7 +506,7 @@ impl PmtilesWriter {
         let compressed_dir = gzip_compress(&dir_bytes)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to compress directory: {}", e)))?;
 
-        // JSON metadata with vector_layers (required by many PMTiles viewers)
+        // JSON metadata with vector_layers and tilestats
         let min_z = if self.min_zoom == 255 {
             0
         } else {
@@ -479,9 +518,10 @@ impl PmtilesWriter {
             self.max_zoom
         };
         let fields_json = self.build_fields_json();
+        let tilestats_json = self.build_tilestats_json();
         let metadata = format!(
-            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],"format":"pbf","generator":"gpq-tiles"}}"#,
-            self.layer_name, min_z, max_z, fields_json
+            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"gpq-tiles"}}"#,
+            self.layer_name, min_z, max_z, fields_json, tilestats_json
         );
         let compressed_metadata = gzip_compress(metadata.as_bytes())
             .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;

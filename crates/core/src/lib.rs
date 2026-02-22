@@ -164,7 +164,13 @@ impl Converter {
         for tile_result in tile_gen.tiles {
             let tile = tile_result.map_err(|e| Error::MvtEncoding(e.to_string()))?;
             writer
-                .add_tile(tile.coord.z, tile.coord.x, tile.coord.y, &tile.data)
+                .add_tile_with_count(
+                    tile.coord.z,
+                    tile.coord.x,
+                    tile.coord.y,
+                    &tile.data,
+                    tile.feature_count,
+                )
                 .map_err(|e| Error::PMTilesWrite(e.to_string()))?;
             tile_count += 1;
         }

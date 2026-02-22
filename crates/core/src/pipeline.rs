@@ -223,12 +223,18 @@ pub struct GeneratedTile {
     pub coord: TileCoord,
     /// The MVT protobuf bytes
     pub data: Vec<u8>,
+    /// Number of features in this tile
+    pub feature_count: usize,
 }
 
 impl GeneratedTile {
     /// Create a new generated tile.
-    pub fn new(coord: TileCoord, data: Vec<u8>) -> Self {
-        Self { coord, data }
+    pub fn new(coord: TileCoord, data: Vec<u8>, feature_count: usize) -> Self {
+        Self {
+            coord,
+            data,
+            feature_count,
+        }
     }
 
     /// Check if the tile is empty (no data).
@@ -549,7 +555,7 @@ impl TileIterator {
         // Serialize to protobuf bytes
         let data = tile.encode_to_vec();
 
-        Ok(Some(GeneratedTile::new(coord, data)))
+        Ok(Some(GeneratedTile::new(coord, data, feature_count)))
     }
 
     /// Process all tiles for a zoom level in parallel.
@@ -707,17 +713,18 @@ mod tests {
     fn test_generated_tile_creation() {
         let coord = TileCoord::new(1, 2, 3);
         let data = vec![1, 2, 3, 4];
-        let tile = GeneratedTile::new(coord, data.clone());
+        let tile = GeneratedTile::new(coord, data.clone(), 5);
 
         assert_eq!(tile.coord, coord);
         assert_eq!(tile.data, data);
+        assert_eq!(tile.feature_count, 5);
         assert!(!tile.is_empty());
     }
 
     #[test]
     fn test_generated_tile_empty() {
         let coord = TileCoord::new(0, 0, 0);
-        let tile = GeneratedTile::new(coord, vec![]);
+        let tile = GeneratedTile::new(coord, vec![], 0);
 
         assert!(tile.is_empty());
     }
