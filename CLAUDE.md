@@ -6,6 +6,25 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
+**Status:** Phase 4 complete (262 tests). See `ROADMAP.md` for details.
+
+## Documentation Philosophy
+
+**Prefer concise, DRY documentation. One doc, one purpose.**
+
+| Document | Purpose | When to Update |
+|----------|---------|----------------|
+| `README.md` | Quick start, links to other docs | Major user-facing changes |
+| `ROADMAP.md` | Implementation phases, progress tracking | Phase milestones, test counts |
+| `docs/ARCHITECTURE.md` | Design decisions, tippecanoe divergences | Algorithm changes, new divergences |
+| `CLAUDE.md` | AI assistant instructions | Process changes, new pitfalls |
+
+**Rules:**
+- Keep README lean — link out, don't duplicate
+- Never duplicate content across docs
+- Delete docs that serve no unique purpose
+- Update test counts in ROADMAP.md, not elsewhere
+
 ## Critical Constraints
 
 ### 1. Test-Driven Development (TDD) is MANDATORY
@@ -13,14 +32,11 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 Every feature follows: **failing test → implementation → refactor**
 
 ```bash
-# Workflow
 cargo test --package gpq-tiles-core <module> -- --nocapture  # Verify red
 # Implement
 cargo test --package gpq-tiles-core <module> -- --nocapture  # Verify green
 git commit -m "feat: implement X (TDD green)"
 ```
-
-Do NOT write implementation code without a failing test first.
 
 ### 2. Arrow/GeoArrow is the Data Layer
 
@@ -31,7 +47,6 @@ DO:
 // Process geometries within Arrow batch lifetime
 for batch in reader {
     let geom_col = batch.column(geom_idx);
-    // Use geoarrow accessors - no heap allocation per feature
     let polygon_array = PolygonArray::try_from(geom_col)?;
     for i in 0..polygon_array.len() {
         let poly_ref = polygon_array.value(i);  // Borrows from batch
@@ -47,40 +62,23 @@ let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
 geometries.push((geom, row_offset + i));  // Heap allocation per feature!
 ```
 
-**Exception:** Complex operations (boolean clipping) may require temporary `geo::Geometry` conversion, but this should be minimized and documented.
+**Exception:** Complex operations (boolean clipping) may require temporary `geo::Geometry` conversion.
 
 ### 3. Reference Implementations (CRITICAL)
 
 **All algorithms MUST match tippecanoe behavior as closely as possible.**
 
-Reference implementations in priority order:
-1. **tippecanoe** (https://github.com/felt/tippecanoe) - PRIMARY reference for all algorithms
-2. **planetiler** (https://github.com/onthegomap/planetiler) - Secondary reference for architecture patterns
-
-**Decision hierarchy:**
-- Where tippecanoe and planetiler agree → follow that approach
-- Where they diverge → prefer tippecanoe
-- Where tippecanoe's approach isn't feasible in Rust → document the deviation explicitly in the code AND in `docs/plans/` with rationale
-
-**Key tippecanoe behaviors to match:**
-
-| Algorithm | Tippecanoe Approach |
-|-----------|---------------------|
-| Simplification | Douglas-Peucker to tile resolution at each zoom level |
-| Tiny polygons | Diffuse probability for polygons < 4 square subpixels |
-| Line dropping | Drop lines too small to render at zoom level |
-| Point thinning | Drop 1/2.5 of points per zoom above base zoom |
-| Clipping buffer | 8 pixels default (`--buffer`) |
+- **tippecanoe** (https://github.com/felt/tippecanoe) - PRIMARY reference
+- **planetiler** (https://github.com/onthegomap/planetiler) - Secondary reference
 
 **When deviating from tippecanoe:**
 ```rust
 // DIVERGENCE FROM TIPPECANOE: [reason]
 // Tippecanoe does X (see tile.cpp:L312)
 // We do Y because [Rust limitation / performance / etc.]
-// Tracking issue: #NNN (if applicable)
 ```
 
-Document all divergences in the Known Divergences table in `docs/ARCHITECTURE.md`.
+Document all divergences in `docs/ARCHITECTURE.md`.
 
 ## Architecture
 
@@ -96,114 +94,31 @@ crates/
 ## Key Types
 
 ```rust
-// Tile coordinates (Web Mercator)
-TileCoord { x: u32, y: u32, z: u8 }
-
-// Geographic bounds
-TileBounds { lng_min, lat_min, lng_max, lat_max }
-
-// Converter configuration
-Config { min_zoom, max_zoom, extent, drop_density }
+TileCoord { x: u32, y: u32, z: u8 }           // Tile coordinates (Web Mercator)
+TileBounds { lng_min, lat_min, lng_max, lat_max }  // Geographic bounds
+TilerConfig { min_zoom, max_zoom, ... }       // Pipeline configuration
 ```
-
-## Testing
-
-```bash
-# Fast iteration
-cargo watch -x "test --lib"
-
-# Full suite
-cargo test
-
-# Specific module
-cargo test --package gpq-tiles-core <module> -- --nocapture
-
-# With coverage
-cargo tarpaulin --out html
-```
-
-### Test Fixtures
-
-- `tests/fixtures/realdata/` - Real GeoParquet files for integration tests
-- `tests/fixtures/golden/` - tippecanoe-generated PMTiles for comparison
-
-### Property-Based Tests
-
-Use `proptest` for geometry operations:
-- MVT round-trip (encode → decode ≈ original)
-- Tile coordinate invariants
-- Simplification validity
-
-## Dependencies
-
-| Crate | Purpose |
-|-------|---------|
-| `geoarrow` | Zero-copy geometry access from Arrow |
-| `geoparquet` | GeoParquet metadata parsing |
-| `geo` | Geometry algorithms (clipping, simplification) |
-| `prost` | MVT protobuf encoding |
-| `rayon` | Parallel tile generation (Phase 4) |
-| `rstar` | R-tree spatial indexing |
-
-**Note:** The `pmtiles` crate is READ-ONLY. We implement our own PMTiles v3 writer.
-
-## Common Pitfalls
-
-1. **geozero vs geoarrow**: Don't use geozero for bulk geometry extraction. It defeats Arrow's zero-copy benefits.
-
-2. **BooleanOps signature**: `polygon.clip(&linestring)`, not `linestring.clip(&polygon)`
-
-3. **PMTiles crate**: Read-only - must write custom PMTiles v3 writer from spec
-
-4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
-
-## Current Status
-
-**Phase 2: Complete** (122 tests) - Full tiling pipeline works
-**Phase 3: In Progress** (164 tests) - Feature dropping algorithms implemented, pipeline integration pending
-
-See `ROADMAP.md` for phase details.
-
-### Feature Dropping (Phase 3)
-
-The `feature_drop` module implements tippecanoe-compatible dropping:
-
-```rust
-use gpq_tiles_core::feature_drop::{
-    should_drop_tiny_polygon,  // Diffuse probability for < 4 sq pixels
-    should_drop_tiny_line,     // Coordinate quantization collapse
-    should_drop_point,         // 1/2.5 per zoom above base
-    retention_rate,            // Utility for logging
-};
-```
-
-All algorithms match tippecanoe behavior exactly (verified against source).
-
-## Setup
-
-After cloning, configure git to use the project's hooks:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-This enables the pre-commit hook that runs `cargo fmt --check` before each commit.
 
 ## Commands
 
 ```bash
-# Build
-cargo build
+cargo build                   # Build
+cargo test                    # Test (262 tests)
+cargo bench                   # Benchmarks
+cargo fmt --all               # Format (required before commit)
+cargo run --package gpq-tiles -- input.parquet output.pmtiles
+```
 
-# Test
-cargo test
+## Common Pitfalls
 
-# Run CLI
-cargo run --package gpq-tiles-cli -- input.parquet output.pmtiles
+1. **geozero vs geoarrow**: Don't use geozero for bulk geometry extraction
+2. **BooleanOps signature**: `polygon.clip(&linestring)`, not reverse
+3. **PMTiles crate**: Read-only — we implement our own v3 writer
+4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
+5. **rstar**: Listed in deps but we use space-filling curves for spatial indexing instead
 
-# Benchmarks
-cargo bench
+## Setup
 
-# Format code (required before commit)
-cargo fmt --all
+```bash
+git config core.hooksPath .githooks  # Enable pre-commit hooks
 ```

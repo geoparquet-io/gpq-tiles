@@ -2,259 +2,86 @@
 
 [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
-[![Crates.io](https://img.shields.io/crates/v/gpq-tiles.svg)](https://crates.io/crates/gpq-tiles)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-A Rust library and CLI tool for converting GeoParquet files into PMTiles vector tile archives. Designed as a faster, more correct replacement for `gpio-pmtiles`, with native Python bindings for integration into the [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) ecosystem.
+Fast GeoParquet → PMTiles converter in Rust. 1.4x faster than tippecanoe on typical workflows.
+
+## Quick Start
+
+```bash
+# Install
+cargo install gpq-tiles
+
+# Convert
+gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+```
+
+**Python:**
+```python
+from gpq_tiles import convert
+convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
+```
+
+**Rust:**
+```rust
+use gpq_tiles_core::pipeline::{generate_tiles, TilerConfig};
+let config = TilerConfig::new(0, 14);
+let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
+```
 
 ## Features
 
-- **Fast**: Parallelized tile generation using Rayon
-- **Correct**: MVT encoding follows the Mapbox Vector Tile specification exactly
-- **Smart**: Density-based feature dropping prevents cluttered maps at low zoom levels
-- **Flexible**: Use as a Rust library, CLI tool, or Python package
-
-## Installation
-
-### Rust CLI
-
-```bash
-cargo install gpq-tiles
-```
-
-### Python
-
-```bash
-pip install gpq-tiles
-```
-
-### From Source
-
-```bash
-git clone git@github.com:geoparquet-io/gpq-tiles.git
-cd gpq-tiles
-cargo build --release
-```
-
-The compiled binary will be in `target/release/gpq-tiles`.
-
-## Usage
-
-### CLI
-
-```bash
-# Basic usage
-gpq-tiles input.parquet output.pmtiles
-
-# With zoom levels
-gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
-
-# With feature dropping control
-gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14 --drop-density low
-```
-
-### Python
-
-```python
-from gpq-tiles import convert
-
-convert(
-    input="buildings.parquet",
-    output="buildings.pmtiles",
-    min_zoom=0,
-    max_zoom=14,
-)
-```
-
-### Rust Library
-
-```rust
-use gpq_tiles_core::{Converter, Config};
-
-let config = Config {
-    min_zoom: 0,
-    max_zoom: 14,
-    ..Default::default()
-};
-
-let converter = Converter::new(config);
-converter.convert("input.parquet", "output.pmtiles")?;
-```
-
-## How It Works
-
-**Current Implementation (Phase 2 complete):**
-
-1. **Read**: ✅ Loads GeoParquet using `geoparquet` crate
-2. **Iterate**: ✅ Processes features in batches via Apache Arrow RecordBatch
-3. **Tile Math**: ✅ Web Mercator projection (lng/lat ↔ tile x/y/z)
-4. **Extract**: ✅ Extract geometries from GeoArrow arrays (`batch_processor.rs`)
-5. **Clip**: ✅ Bbox clipping with `geo` crate (`clip.rs`)
-6. **Simplify**: ✅ RDP simplification tuned per zoom level (`simplify.rs`)
-7. **Validate**: ✅ Filter degenerate geometries, correct winding order (`validate.rs`)
-8. **Encode**: ✅ MVT encoding with delta coordinates and command packing (`mvt.rs`)
-9. **Write**: ✅ Custom PMTiles v3 writer with Hilbert ordering (`pmtiles_writer.rs`)
-
-**The library prioritizes:**
-- Exact MVT command encoding (zigzag-encoded delta coordinates)
-- Hilbert curve tile ordering for spatial locality in PMTiles
-- Golden comparison tests against tippecanoe output
-- Automatic polygon winding order correction for MVT compliance
-- Degenerate geometry validation and filtering
-- Parallel tile generation with Rayon (Phase 4)
-- Density-based feature dropping to prevent cluttered maps (Phase 3)
-
-## Development
-
-### Prerequisites
-
-- Rust 1.75+ (`rustup install stable`)
-- protoc (Protocol Buffers compiler)
-  - macOS: `brew install protobuf`
-  - Ubuntu: `apt-get install protobuf-compiler`
-  - Other: https://grpc.io/docs/protoc-installation/
-
-### Building
-
-```bash
-# Full workspace
-cargo build
-
-# Just the core library
-cargo build -p gpq-tiles-core
-
-# Release build with optimizations
-cargo build --release
-```
-
-### Testing
-
-```bash
-# Run all tests
-cargo test
-
-# Run tests with coverage
-cargo tarpaulin --out html
-
-# Run benchmarks
-cargo bench
-
-# Run mutation tests (slow!)
-cargo mutants
-```
-
-### Useful Commands
-
-```bash
-# Auto-run tests on file changes
-cargo install cargo-watch
-cargo watch -x "test --lib"
-
-# Format code
-cargo fmt
-
-# Lint
-cargo clippy -- -D warnings
-
-# Check documentation
-cargo doc --open
-```
+- **Fast** — Parallel tile generation with Rayon, space-filling curve sorting
+- **Correct** — MVT spec compliance, golden tests against tippecanoe v2.49.0
+- **Smart** — Density-based feature dropping, tiny polygon removal, point thinning
 
 ## Project Structure
 
 ```
-gpq-tiles/
-├── crates/
-│   ├── core/          # Core library (gpq-tiles-core)
-│   ├── cli/           # CLI binary (gpq-tiles)
-│   └── python/        # Python bindings (pyo3)
-├── tests/
-│   └── fixtures/      # Test GeoParquet files and expected outputs
-├── benches/           # Criterion benchmarks
-└── Cargo.toml         # Workspace configuration
+crates/
+├── core/     # All tiling logic (gpq-tiles-core)
+├── cli/      # Thin wrapper (gpq-tiles)
+└── python/   # pyo3 bindings
 ```
 
-## Comparison to Tippecanoe
+## Development
 
-`gpq-tiles` is inspired by [Tippecanoe](https://github.com/felt/tippecanoe) but optimized for the GeoParquet → PMTiles workflow:
+```bash
+git clone git@github.com:geoparquet-io/gpq-tiles.git && cd gpq-tiles
+git config core.hooksPath .githooks  # Enable pre-commit hooks
+cargo build && cargo test
+```
 
-| Feature | gpq-tiles | Tippecanoe |
-|---------|-----------|------------|
-| Input format | GeoParquet | GeoJSON, CSV |
-| Output format | PMTiles | PMTiles, MBTiles |
-| Language | Rust | C++ |
-| Feature dropping | Density-based (MVP) | Multiple strategies |
-| Spatial indexing | Hilbert/Z-order curves | Hilbert/Z-order curves |
-| Parallelism | Per-tile (Rayon) | Per-zoom |
-| Python bindings | Native (pyo3) | CLI wrapper |
+**Prerequisites:** Rust 1.75+, protoc (`brew install protobuf` / `apt install protobuf-compiler`)
 
-## Roadmap
+**Key commands:**
+```bash
+cargo test                    # Run all tests (262 tests)
+cargo bench                   # Run benchmarks
+cargo fmt && cargo clippy     # Format and lint
+cargo tarpaulin --out html    # Coverage report
+```
 
-- [x] **Phase 1: Skeleton** - Read GeoParquet → write empty PMTiles ✅
-  - [x] Workspace setup with core/CLI/Python crates
-  - [x] Protobuf integration for MVT encoding
-  - [x] Basic tests passing
+## Documentation
 
-- [x] **Phase 2: Naive Tiling** - Full tile generation pipeline ✅
-  - [x] GeoParquet reading with `geoparquet` crate
-  - [x] Feature iteration via RecordBatch
-  - [x] Tile coordinate math (Web Mercator projection)
-  - [x] Extract geometries from GeoArrow arrays
-  - [x] Bbox clipping with `geo` crate (15 tests)
-  - [x] RDP simplification (7 tests)
-  - [x] MVT encoding (delta coordinates, command packing, zigzag) (28 tests)
-  - [x] Custom PMTiles v3 writer with Hilbert ordering (24 tests)
-  - [x] Golden comparison tests against tippecanoe (6 tests)
-  - [x] CI/CD with coverage, benchmarks, mutation testing
-
-- [x] **Phase 3: Feature Dropping** - Density-based optimization ✅
-  - [x] Tiny polygon dropping (diffuse probability)
-  - [x] Line dropping (coordinate quantization)
-  - [x] Point thinning (1/2.5 per zoom)
-  - [x] Density-based dropping (grid-cell limiting)
-
-- [ ] **Phase 4: Parallelism** - Space-filling curves + Rayon 🚧
-  - [x] Spatial indexing via Hilbert/Z-order curves (22 tests)
-  - [ ] Rayon parallel tile generation
-
-- [ ] **Phase 5: Python Integration** - Production-ready bindings
-
-See the full [development roadmap](ROADMAP.md) for details.
+| Document | Purpose |
+|----------|---------|
+| [ROADMAP.md](ROADMAP.md) | Implementation phases and progress |
+| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, tippecanoe divergences |
+| [CLAUDE.md](CLAUDE.md) | AI assistant instructions |
 
 ## Contributing
 
-Contributions are welcome! Please:
+1. Fork → branch → make changes with tests → `cargo test && cargo fmt && cargo clippy`
+2. Push → open PR with clear description
+3. All logic goes in `crates/core`, not CLI/Python
 
-1. Fork the repository
-2. Create a feature branch (`git checkout -b feature/amazing-feature`)
-3. Make your changes with tests
-4. Run the test suite (`cargo test`)
-5. Format and lint (`cargo fmt && cargo clippy`)
-6. Commit your changes (`git commit -m 'Add amazing feature'`)
-7. Push to your branch (`git push origin feature/amazing-feature`)
-8. Open a Pull Request
-
-### Testing Philosophy
-
-This project follows a layered testing approach:
-
-1. **Unit tests**: Fast, focused tests for algorithmic correctness
-   - **Current**: 250 tests passing (242 unit + 8 doc tests)
-2. **Property-based tests**: `proptest` for edge cases (geometry round-trips, tile coordinate invariants)
-3. **Integration tests**: GeoParquet → PMTiles pipelines with golden file comparison
-   - Semantic comparison against tippecanoe output (not byte-exact)
-   - Feature count ratios verified at each zoom level
-4. **Benchmarks**: `criterion` for performance regression detection
-5. **Mutation tests**: `cargo-mutants` to find test suite gaps (weekly CI schedule)
-
-See the [testing documentation](TESTING.md) for details.
+**Commit format:** `feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `perf:`, `chore:`
 
 ## License
 
-Licensed under the Apache License, Version 2.0. See [LICENSE](LICENSE) for details.
+Apache License 2.0. See [LICENSE](LICENSE).
 
 ## Acknowledgments
 
-- Inspired by [Tippecanoe](https://github.com/felt/tippecanoe) by Mapbox/Felt
-- Built on [geoarrow](https://github.com/geoarrow/geoarrow-rs), [pmtiles](https://github.com/stadiamaps/pmtiles-rs), and the Rust geospatial ecosystem
-- Part of the [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) project
+Built on [tippecanoe](https://github.com/felt/tippecanoe) algorithms, [geoarrow-rs](https://github.com/geoarrow/geoarrow-rs), and the Rust geospatial ecosystem. Part of [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io).
