@@ -30,6 +30,7 @@ pub mod vector_tile {
 pub mod batch_processor;
 pub mod clip;
 pub mod compression;
+pub mod dedup;
 pub mod feature_drop;
 #[cfg(test)]
 mod golden;
@@ -169,8 +170,9 @@ impl Converter {
         let tile_gen = generate_tiles_with_bounds(input_path, &tiler_config)
             .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
 
-        // Write tiles to PMTiles with proper bounds, layer name, field metadata, and compression
+        // Write tiles to PMTiles with proper bounds, layer name, field metadata, compression, and deduplication
         let mut writer = PmtilesWriter::with_compression(self.config.compression);
+        writer.enable_deduplication(true); // Enable deduplication by default
         writer.set_bounds(&tile_gen.bounds);
         writer.set_layer_name(&tile_gen.layer_name);
         writer.set_fields(tile_gen.fields);
@@ -191,6 +193,17 @@ impl Converter {
         }
 
         log::info!("Generated {} tiles", tile_count);
+
+        // Log deduplication stats
+        let dedup_stats = writer.dedup_stats();
+        if dedup_stats.duplicates_eliminated > 0 {
+            log::info!(
+                "Deduplication: {} unique tiles, {} duplicates eliminated ({:.1}% savings)",
+                dedup_stats.unique_tiles,
+                dedup_stats.duplicates_eliminated,
+                dedup_stats.savings_percent()
+            );
+        }
 
         // Write to file
         writer

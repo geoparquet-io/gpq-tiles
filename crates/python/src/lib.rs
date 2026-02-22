@@ -62,7 +62,7 @@ fn convert(
         max_zoom,
         extent: 4096,
         drop_density,
-        layer_name: None,
+        layer_name: None, // Derived from input filename
         property_filter: PropertyFilter::None,
         compression,
     };

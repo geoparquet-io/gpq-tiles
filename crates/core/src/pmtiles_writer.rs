@@ -9,6 +9,7 @@
 //! - Clustered mode for efficient sequential reads
 
 use crate::compression::{self, Compression};
+use crate::dedup::{DeduplicationCache, DeduplicationStats, TileHasher};
 use crate::tile::TileBounds;
 use crate::{Error, Result};
 use std::collections::{BTreeMap, HashMap};
@@ -327,12 +328,27 @@ pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
 // Task 9: Full PMTiles Writer
 // ============================================================================
 
+/// Tile entry with hash for deduplication
+#[derive(Debug, Clone)]
+struct TileEntry {
+    /// Compressed tile data (only stored for unique tiles)
+    data: Option<Vec<u8>>,
+    /// Hash of uncompressed content (for deduplication)
+    hash: u64,
+    /// Uncompressed size (for stats)
+    uncompressed_size: u32,
+}
+
 /// PMTiles v3 writer
 ///
 /// Accumulates tiles in memory (sorted by tile_id via BTreeMap),
 /// then writes the complete archive on finalize.
+///
+/// Supports tile deduplication: identical tiles are stored once and
+/// referenced via PMTiles' `run_length` feature.
 pub struct PmtilesWriter {
-    tiles: BTreeMap<u64, Vec<u8>>, // tile_id -> compressed tile data
+    /// tile_id -> tile entry (data + hash)
+    tiles: BTreeMap<u64, TileEntry>,
     min_zoom: u8,
     max_zoom: u8,
     bounds: TileBounds,
@@ -347,10 +363,17 @@ pub struct PmtilesWriter {
     tile_compression: Compression,
     /// Compression algorithm for internal data (directories, metadata)
     internal_compression: Compression,
+    /// Whether deduplication is enabled
+    dedup_enabled: bool,
+    /// Deduplication cache for tracking seen tiles
+    dedup_cache: DeduplicationCache,
 }
 
 impl PmtilesWriter {
     /// Create a new PMTiles writer with default gzip compression
+    ///
+    /// Deduplication is disabled by default for backward compatibility.
+    /// Call `enable_deduplication(true)` to enable it.
     pub fn new() -> Self {
         Self {
             tiles: BTreeMap::new(),
@@ -363,13 +386,15 @@ impl PmtilesWriter {
             features_per_zoom: HashMap::new(),
             tile_compression: Compression::Gzip,
             internal_compression: Compression::Gzip,
+            dedup_enabled: false,
+            dedup_cache: DeduplicationCache::new(),
         }
     }
 
     /// Create a new PMTiles writer with specified compression
     ///
     /// Both tile data and internal data (directories, metadata) will use
-    /// the same compression algorithm.
+    /// the same compression algorithm. Deduplication is disabled by default.
     pub fn with_compression(compression: Compression) -> Self {
         Self {
             tiles: BTreeMap::new(),
@@ -382,7 +407,14 @@ impl PmtilesWriter {
             features_per_zoom: HashMap::new(),
             tile_compression: compression,
             internal_compression: compression,
+            dedup_enabled: false,
+            dedup_cache: DeduplicationCache::new(),
         }
+    }
+
+    /// Enable or disable tile deduplication
+    pub fn enable_deduplication(&mut self, enabled: bool) {
+        self.dedup_enabled = enabled;
     }
 
     /// Set the compression algorithm for tile data
@@ -403,6 +435,16 @@ impl PmtilesWriter {
     /// Get the current internal compression setting
     pub fn internal_compression(&self) -> Compression {
         self.internal_compression
+    }
+
+    /// Check if deduplication is enabled
+    pub fn is_dedup_enabled(&self) -> bool {
+        self.dedup_enabled
+    }
+
+    /// Get current deduplication statistics
+    pub fn dedup_stats(&self) -> &DeduplicationStats {
+        self.dedup_cache.stats()
     }
 
     /// Set the layer name for vector_layers metadata
@@ -460,6 +502,9 @@ impl PmtilesWriter {
     /// Add a tile with feature count for tilestats
     ///
     /// The tile data should be uncompressed MVT bytes.
+    ///
+    /// If deduplication is enabled, identical tiles will be stored once
+    /// and referenced via PMTiles' `run_length` feature.
     pub fn add_tile_with_count(
         &mut self,
         z: u8,
@@ -468,9 +513,8 @@ impl PmtilesWriter {
         data: &[u8],
         feature_count: usize,
     ) -> std::io::Result<()> {
-        let compressed = compression::compress(data, self.tile_compression)?;
         let id = tile_id(z, x, y);
-        self.tiles.insert(id, compressed);
+        let uncompressed_size = data.len() as u32;
 
         // Track zoom range
         self.min_zoom = self.min_zoom.min(z);
@@ -480,12 +524,61 @@ impl PmtilesWriter {
         self.total_features += feature_count as u64;
         *self.features_per_zoom.entry(z).or_insert(0) += feature_count as u64;
 
+        if self.dedup_enabled {
+            // Hash uncompressed data for deduplication
+            let hash = TileHasher::hash(data);
+
+            if self.dedup_cache.check(hash).is_some() {
+                // Duplicate tile - store reference only (no data)
+                self.dedup_cache.record_duplicate(uncompressed_size);
+                self.tiles.insert(
+                    id,
+                    TileEntry {
+                        data: None, // No data stored for duplicates
+                        hash,
+                        uncompressed_size,
+                    },
+                );
+            } else {
+                // New unique tile - compress using configured algorithm and store
+                let compressed = compression::compress(data, self.tile_compression)?;
+                let compressed_len = compressed.len() as u32;
+
+                // Record in cache (offset will be calculated at write time)
+                self.dedup_cache
+                    .record_new(hash, 0, compressed_len, uncompressed_size);
+
+                self.tiles.insert(
+                    id,
+                    TileEntry {
+                        data: Some(compressed),
+                        hash,
+                        uncompressed_size,
+                    },
+                );
+            }
+        } else {
+            // No deduplication - store every tile
+            let compressed = compression::compress(data, self.tile_compression)?;
+            let hash = TileHasher::hash(data);
+            self.tiles.insert(
+                id,
+                TileEntry {
+                    data: Some(compressed),
+                    hash,
+                    uncompressed_size,
+                },
+            );
+        }
+
         Ok(())
     }
 
     /// Add a pre-compressed tile
     ///
     /// Use this if the tile data is already gzip compressed.
+    /// Note: Deduplication is not available for pre-compressed tiles
+    /// since we cannot hash the original content.
     pub fn add_tile_compressed(
         &mut self,
         z: u8,
@@ -494,7 +587,17 @@ impl PmtilesWriter {
         compressed_data: Vec<u8>,
     ) -> std::io::Result<()> {
         let id = tile_id(z, x, y);
-        self.tiles.insert(id, compressed_data);
+        // For pre-compressed tiles, use a unique hash based on the compressed data
+        // This won't deduplicate as effectively but preserves the API
+        let hash = TileHasher::hash(&compressed_data);
+        self.tiles.insert(
+            id,
+            TileEntry {
+                data: Some(compressed_data),
+                hash,
+                uncompressed_size: 0, // Unknown
+            },
+        );
 
         self.min_zoom = self.min_zoom.min(z);
         self.max_zoom = self.max_zoom.max(z);
@@ -515,23 +618,71 @@ impl PmtilesWriter {
     /// Write the PMTiles archive to a file
     ///
     /// Layout: [Header (127)] [Root Directory] [Metadata] [Tile Data]
+    ///
+    /// When deduplication is enabled, identical tiles share storage and
+    /// consecutive identical tiles use run_length encoding in the directory.
     pub fn write_to_file(&self, path: &Path) -> Result<()> {
         let file = File::create(path)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to create file: {}", e)))?;
         let mut writer = BufWriter::new(file);
 
-        // Build tile data buffer and directory entries
+        // Build tile data buffer and directory entries with deduplication
         let mut tile_data_buf = Vec::new();
         let mut entries = Vec::new();
 
-        for (&id, data) in &self.tiles {
-            entries.push(DirEntry {
-                tile_id: id,
-                offset: tile_data_buf.len() as u64,
-                length: data.len() as u32,
-                run_length: 1, // Each tile is unique (no deduplication yet)
-            });
-            tile_data_buf.extend_from_slice(data);
+        // Map hash -> (offset, length) for deduplication
+        let mut hash_to_offset: HashMap<u64, (u64, u32)> = HashMap::new();
+        let mut unique_contents = 0u64;
+
+        if self.dedup_enabled {
+            // With deduplication: store unique tiles, reference duplicates
+            for (&id, entry) in &self.tiles {
+                let (offset, length) = if let Some(ref data) = entry.data {
+                    // Unique tile - write to buffer and record location
+                    let offset = tile_data_buf.len() as u64;
+                    let length = data.len() as u32;
+                    tile_data_buf.extend_from_slice(data);
+                    hash_to_offset.insert(entry.hash, (offset, length));
+                    unique_contents += 1;
+                    (offset, length)
+                } else {
+                    // Duplicate tile - look up existing location
+                    *hash_to_offset.get(&entry.hash).expect("Hash must exist")
+                };
+
+                // Check if this can extend the previous entry's run_length
+                // (same offset = same content, consecutive tile_id)
+                if let Some(last) = entries.last_mut() {
+                    let last_entry: &mut DirEntry = last;
+                    if last_entry.offset == offset
+                        && id == last_entry.tile_id + last_entry.run_length as u64
+                    {
+                        // Extend run_length instead of adding new entry
+                        last_entry.run_length += 1;
+                        continue;
+                    }
+                }
+
+                entries.push(DirEntry {
+                    tile_id: id,
+                    offset,
+                    length,
+                    run_length: 1,
+                });
+            }
+        } else {
+            // Without deduplication: store every tile
+            for (&id, entry) in &self.tiles {
+                let data = entry.data.as_ref().expect("Non-dedup tiles must have data");
+                entries.push(DirEntry {
+                    tile_id: id,
+                    offset: tile_data_buf.len() as u64,
+                    length: data.len() as u32,
+                    run_length: 1,
+                });
+                tile_data_buf.extend_from_slice(data);
+                unique_contents += 1;
+            }
         }
 
         // Encode and compress directory using configured internal compression
@@ -580,7 +731,7 @@ impl PmtilesWriter {
             tile_data_length,
             addressed_tiles_count: self.tiles.len() as u64,
             tile_entries_count: entries.len() as u64,
-            tile_contents_count: self.tiles.len() as u64,
+            tile_contents_count: unique_contents,
             clustered: true,
             internal_compression: self.internal_compression,
             tile_compression: self.tile_compression,
@@ -1251,6 +1402,190 @@ mod tests {
         // Check compression bytes in header
         assert_eq!(data[97], Compression::Gzip as u8); // internal
         assert_eq!(data[98], Compression::Zstd as u8); // tile
+
+        let _ = fs::remove_file(path);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tile Deduplication Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_writer_dedup_identical_tiles() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        // Add 3 identical tiles at consecutive positions
+        let ocean_tile = vec![0x1a, 0x00]; // Same content
+        writer.add_tile(1, 0, 0, &ocean_tile).unwrap();
+        writer.add_tile(1, 0, 1, &ocean_tile).unwrap();
+        writer.add_tile(1, 1, 1, &ocean_tile).unwrap();
+
+        // 3 tiles addressed, but only 1 unique content
+        assert_eq!(writer.tile_count(), 3);
+
+        let stats = writer.dedup_stats();
+        assert_eq!(stats.total_tiles, 3);
+        assert_eq!(stats.unique_tiles, 1);
+        assert_eq!(stats.duplicates_eliminated, 2);
+    }
+
+    #[test]
+    fn test_writer_dedup_mixed_tiles() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        // Add tiles: A, A, B, A, B, B
+        let tile_a = vec![0x1a, 0x01];
+        let tile_b = vec![0x1a, 0x02];
+
+        writer.add_tile(0, 0, 0, &tile_a).unwrap();
+        writer.add_tile(1, 0, 0, &tile_a).unwrap(); // dup
+        writer.add_tile(1, 0, 1, &tile_b).unwrap();
+        writer.add_tile(1, 1, 1, &tile_a).unwrap(); // dup
+        writer.add_tile(1, 1, 0, &tile_b).unwrap(); // dup
+        writer.add_tile(2, 0, 0, &tile_b).unwrap(); // dup
+
+        let stats = writer.dedup_stats();
+        assert_eq!(stats.total_tiles, 6);
+        assert_eq!(stats.unique_tiles, 2);
+        assert_eq!(stats.duplicates_eliminated, 4);
+    }
+
+    #[test]
+    fn test_writer_dedup_disabled_by_default() {
+        let writer = PmtilesWriter::new();
+        // Deduplication should be disabled by default for backward compatibility
+        assert!(!writer.is_dedup_enabled());
+    }
+
+    #[test]
+    fn test_writer_dedup_file_size_reduction() {
+        // Test with deduplication
+        let mut writer_dedup = PmtilesWriter::new();
+        writer_dedup.enable_deduplication(true);
+
+        let ocean_tile = vec![0x1a, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05];
+        for z in 0..3u8 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    writer_dedup.add_tile(z, x, y, &ocean_tile).unwrap();
+                }
+            }
+        }
+
+        let path_dedup = Path::new("/tmp/test-pmtiles-dedup-enabled.pmtiles");
+        let _ = fs::remove_file(path_dedup);
+        writer_dedup.write_to_file(path_dedup).unwrap();
+        let size_dedup = fs::metadata(path_dedup).unwrap().len();
+
+        // Test without deduplication
+        let mut writer_no_dedup = PmtilesWriter::new();
+        // Dedup disabled by default
+
+        for z in 0..3u8 {
+            let n = 1u32 << z;
+            for x in 0..n {
+                for y in 0..n {
+                    writer_no_dedup.add_tile(z, x, y, &ocean_tile).unwrap();
+                }
+            }
+        }
+
+        let path_no_dedup = Path::new("/tmp/test-pmtiles-dedup-disabled.pmtiles");
+        let _ = fs::remove_file(path_no_dedup);
+        writer_no_dedup.write_to_file(path_no_dedup).unwrap();
+        let size_no_dedup = fs::metadata(path_no_dedup).unwrap().len();
+
+        // Deduplicated file should be smaller
+        assert!(
+            size_dedup < size_no_dedup,
+            "Deduplicated file ({} bytes) should be smaller than non-deduplicated ({} bytes)",
+            size_dedup,
+            size_no_dedup
+        );
+
+        let _ = fs::remove_file(path_dedup);
+        let _ = fs::remove_file(path_no_dedup);
+    }
+
+    #[test]
+    fn test_writer_dedup_run_length_consecutive() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        // Add consecutive tiles with same content (should use run_length)
+        let tile = vec![0x1a, 0x10];
+        // Zoom 1 tiles: IDs 1, 2, 3, 4 (consecutive in Hilbert order)
+        writer.add_tile(1, 0, 0, &tile).unwrap(); // ID 1
+        writer.add_tile(1, 0, 1, &tile).unwrap(); // ID 2
+        writer.add_tile(1, 1, 1, &tile).unwrap(); // ID 3
+        writer.add_tile(1, 1, 0, &tile).unwrap(); // ID 4
+
+        let path = Path::new("/tmp/test-pmtiles-runlength.pmtiles");
+        let _ = fs::remove_file(path);
+        writer.write_to_file(path).unwrap();
+
+        let data = fs::read(path).unwrap();
+
+        // Verify header counts
+        let addressed_count = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let entries_count = u64::from_le_bytes(data[80..88].try_into().unwrap());
+        let contents_count = u64::from_le_bytes(data[88..96].try_into().unwrap());
+
+        // 4 tiles addressed
+        assert_eq!(addressed_count, 4);
+        // But only 1 directory entry (run_length = 4)
+        assert_eq!(entries_count, 1);
+        // And only 1 unique content
+        assert_eq!(contents_count, 1);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_writer_dedup_header_stats() {
+        let mut writer = PmtilesWriter::new();
+        writer.enable_deduplication(true);
+
+        // 10 tiles, 3 unique contents
+        let tile_a = vec![0x1a, 0x01];
+        let tile_b = vec![0x1a, 0x02];
+        let tile_c = vec![0x1a, 0x03];
+
+        // Pattern: A A A B B C A B C C
+        for _ in 0..3 {
+            writer.add_tile(0, 0, 0, &tile_a).unwrap(); // Will deduplicate
+        }
+        // Only first A is added at z=0, rest are different coords
+        // Actually, let me use different coords properly:
+        let mut writer2 = PmtilesWriter::new();
+        writer2.enable_deduplication(true);
+
+        // Add 10 tiles with 3 unique contents at zoom 0-2
+        writer2.add_tile(0, 0, 0, &tile_a).unwrap();
+        writer2.add_tile(1, 0, 0, &tile_a).unwrap(); // dup A
+        writer2.add_tile(1, 0, 1, &tile_a).unwrap(); // dup A
+        writer2.add_tile(1, 1, 1, &tile_b).unwrap();
+        writer2.add_tile(1, 1, 0, &tile_b).unwrap(); // dup B
+        writer2.add_tile(2, 0, 0, &tile_c).unwrap();
+        writer2.add_tile(2, 0, 1, &tile_a).unwrap(); // dup A
+        writer2.add_tile(2, 1, 0, &tile_b).unwrap(); // dup B
+        writer2.add_tile(2, 1, 1, &tile_c).unwrap(); // dup C
+        writer2.add_tile(2, 2, 0, &tile_c).unwrap(); // dup C
+
+        let path = Path::new("/tmp/test-pmtiles-header-stats.pmtiles");
+        let _ = fs::remove_file(path);
+        writer2.write_to_file(path).unwrap();
+
+        let data = fs::read(path).unwrap();
+
+        let addressed_count = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        let contents_count = u64::from_le_bytes(data[88..96].try_into().unwrap());
+
+        assert_eq!(addressed_count, 10, "Should address 10 tiles");
+        assert_eq!(contents_count, 3, "Should have 3 unique contents");
 
         let _ = fs::remove_file(path);
     }

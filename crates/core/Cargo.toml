@@ -29,6 +29,7 @@ log = { workspace = true }
 flate2 = "1"
 brotli = "7"
 zstd = "0.13"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
 
 [build-dependencies]
 prost-build = { workspace = true }
