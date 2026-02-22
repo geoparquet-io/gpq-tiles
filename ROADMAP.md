@@ -2,7 +2,7 @@
 
 Production-grade GeoParquet → PMTiles converter in Rust.
 
-**Current:** 272 tests (252 unit + 10 doc + 10 Python). 1.4x faster than tippecanoe.
+**Current:** 286 tests (266 unit + 11 doc + 9 Python). 1.4x faster than tippecanoe.
 
 ## Phase Summary
 
