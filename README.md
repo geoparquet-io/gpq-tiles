@@ -56,7 +56,7 @@ cargo build && cargo test
 
 **Key commands:**
 ```bash
-cargo test                    # Run all tests (262 tests)
+cargo test                    # Run all tests (262 Rust + 10 Python)
 cargo bench                   # Run benchmarks
 cargo fmt && cargo clippy     # Format and lint
 cargo tarpaulin --out html    # Coverage report
@@ -67,6 +67,7 @@ cargo tarpaulin --out html    # Coverage report
 | Document | Purpose |
 |----------|---------|
 | [ROADMAP.md](ROADMAP.md) | Implementation phases and progress |
+| [DEVELOPMENT.md](DEVELOPMENT.md) | Development workflow, Python setup |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, tippecanoe divergences |
 | [CLAUDE.md](CLAUDE.md) | AI assistant instructions |
 

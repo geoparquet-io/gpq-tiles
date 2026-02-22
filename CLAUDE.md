@@ -6,7 +6,7 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
-**Status:** Phase 4 complete (262 tests). See `ROADMAP.md` for details.
+**Status:** Phase 5 complete (272 tests). See `ROADMAP.md` for details.
 
 ## Documentation Philosophy
 
@@ -17,6 +17,7 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 | `README.md` | Quick start, links to other docs | Major user-facing changes |
 | `ROADMAP.md` | Implementation phases, progress tracking | Phase milestones, test counts |
 | `docs/ARCHITECTURE.md` | Design decisions, tippecanoe divergences | Algorithm changes, new divergences |
+| `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup | New tools, workflow changes |
 | `CLAUDE.md` | AI assistant instructions | Process changes, new pitfalls |
 
 **Rules:**
@@ -103,7 +104,7 @@ TilerConfig { min_zoom, max_zoom, ... }       // Pipeline configuration
 
 ```bash
 cargo build                   # Build
-cargo test                    # Test (262 tests)
+cargo test                    # Test (262 Rust tests)
 cargo bench                   # Benchmarks
 cargo fmt --all               # Format (required before commit)
 cargo run --package gpq-tiles -- input.parquet output.pmtiles

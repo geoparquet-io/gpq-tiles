@@ -2,7 +2,7 @@
 
 Production-grade GeoParquet → PMTiles converter in Rust.
 
-**Current:** 262 tests (252 unit + 10 doc). 1.4x faster than tippecanoe.
+**Current:** 272 tests (252 unit + 10 doc + 10 Python). 1.4x faster than tippecanoe.
 
 ## Phase Summary
 
@@ -12,7 +12,7 @@ Production-grade GeoParquet → PMTiles converter in Rust.
 | 2. Naive Tiling | ✅ | 122 | Full pipeline: clip → simplify → MVT → PMTiles |
 | 3. Feature Dropping | ✅ | 226 | Tiny polygon, line, point, density dropping |
 | 4. Parallelism | ✅ | 262 | Space-filling curves, Rayon, benchmarks |
-| 5. Python | 🔲 | - | pyo3 bindings |
+| 5. Python | ✅ | 10 | pyo3 bindings |
 
 ## Phase 4: Parallelism ✅ COMPLETE
 
@@ -85,7 +85,7 @@ Full pipeline implemented:
 7. MVT encoding (zigzag delta coordinates)
 8. PMTiles v3 writing (Hilbert ordering)
 
-## Phase 5: Python Integration 🔲 TODO
+## Phase 5: Python Integration ✅ COMPLETE
 
 ```python
 from gpq_tiles import convert
@@ -95,8 +95,24 @@ convert(
     output="buildings.pmtiles",
     min_zoom=0,
     max_zoom=14,
+    drop_density="medium",  # "low", "medium", or "high"
 )
 ```
+
+### Build & Install
+
+```bash
+cd crates/python
+uv venv && uv pip install maturin && uv sync --group dev
+uv run maturin develop        # Development install
+uv run maturin build --release # Build wheel
+```
+
+### Tests (10 Python tests)
+
+- Function signature and docstring validation
+- Error handling (invalid inputs, nonexistent files)
+- Integration tests with real GeoParquet fixtures
 
 ## Known Issues
 

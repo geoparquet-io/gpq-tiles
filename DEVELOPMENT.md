@@ -139,16 +139,85 @@ cargo check
 
 ## Python Development
 
+Uses **uv** for fast dependency management and **ruff** for linting.
+
+### Quick Start
+
 ```bash
-# Install maturin (builds Python wheels)
-pip install maturin
-
-# Develop mode (installs in editable mode)
 cd crates/python
-maturin develop
 
-# Test Python bindings
-python -c "from gpq-tiles import convert; print(convert.__doc__)"
+# Create venv and install dev dependencies (uv auto-detects pyproject.toml)
+uv venv
+uv pip install maturin
+uv sync --group dev
+
+# Build Rust extension and install in development mode
+uv run maturin develop
+
+# Verify installation
+uv run python -c "from gpq_tiles import convert; print(convert.__doc__)"
+```
+
+### Running Python Tests
+
+```bash
+cd crates/python
+
+# Run tests
+uv run pytest tests/ -v
+
+# Run with coverage
+uv run pytest tests/ -v --cov=gpq_tiles
+```
+
+### Linting
+
+```bash
+cd crates/python
+
+# Check
+uv run ruff check tests/
+
+# Fix auto-fixable issues
+uv run ruff check --fix tests/
+
+# Format
+uv run ruff format tests/
+```
+
+### Building Wheels
+
+```bash
+cd crates/python
+
+# Build wheel for current platform
+uv run maturin build --release
+
+# Wheel will be in target/wheels/
+ls ../../target/wheels/
+```
+
+### Usage Example
+
+```python
+from gpq_tiles import convert
+
+# Basic conversion
+convert(
+    input="buildings.parquet",
+    output="buildings.pmtiles",
+    min_zoom=0,
+    max_zoom=14,
+)
+
+# With feature dropping options
+convert(
+    input="buildings.parquet",
+    output="buildings.pmtiles",
+    min_zoom=0,
+    max_zoom=14,
+    drop_density="high",  # "low", "medium", or "high"
+)
 ```
 
 ## Debugging
