@@ -13,7 +13,7 @@ Design decisions and tippecanoe divergences.
 
 | Area | Our Approach | Tippecanoe | Notes |
 |------|--------------|------------|-------|
-| Metadata | Empty `{}` JSON | Full layer/field metadata | Future enhancement |
+| Metadata | Basic `vector_layers` | Full layer/field/tilestats | Field metadata planned |
 | Simplification | Custom tolerance formula | `tile.cpp` | Tuned to match output quality |
 | Density dropping | Grid-cell limiting | Hilbert-gap selection | Simpler, similar results |
 
