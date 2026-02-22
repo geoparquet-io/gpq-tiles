@@ -12,14 +12,22 @@ Fast GeoParquet → PMTiles converter in Rust. 1.4x faster than tippecanoe on ty
 # Install
 cargo install gpq-tiles
 
-# Convert
+# Basic conversion
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
+
+# With property filtering (matches tippecanoe -y/-x/-X flags)
+gpq-tiles input.parquet output.pmtiles --include name --include population
+gpq-tiles input.parquet output.pmtiles --exclude internal_id
+gpq-tiles input.parquet output.pmtiles --exclude-all  # geometry only
+
+# With compression options
+gpq-tiles input.parquet output.pmtiles --compression zstd  # fastest decompression
 ```
 
 **Python:**
 ```python
 from gpq_tiles import convert
-convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
+convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14, compression="zstd")
 ```
 
 **Rust:**
@@ -34,6 +42,8 @@ let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
 - **Fast** — Parallel tile generation with Rayon, space-filling curve sorting
 - **Correct** — MVT spec compliance, golden tests against tippecanoe v2.49.0
 - **Smart** — Density-based feature dropping, tiny polygon removal, point thinning
+- **Flexible** — Property filtering (`--include`/`--exclude`), compression options (gzip/brotli/zstd)
+- **Efficient** — Tile deduplication via XXH3 hashing and run_length encoding
 
 ## Project Structure
 
@@ -56,7 +66,7 @@ cargo build && cargo test
 
 **Key commands:**
 ```bash
-cargo test                    # Run all tests (262 Rust + 10 Python)
+cargo test                    # Run all tests (335 total)
 cargo bench                   # Run benchmarks
 cargo fmt && cargo clippy     # Format and lint
 cargo tarpaulin --out html    # Coverage report

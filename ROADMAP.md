@@ -2,7 +2,7 @@
 
 Production-grade GeoParquet → PMTiles converter in Rust.
 
-**Current:** 307 tests (280 unit + 11 doc + 9 Python + 7 dedup). 1.4x faster than tippecanoe.
+**Current:** 335 tests (324 unit + 11 doc). 1.4x faster than tippecanoe.
 
 ## Phase Summary
 
@@ -14,6 +14,47 @@ Production-grade GeoParquet → PMTiles converter in Rust.
 | 4. Parallelism | ✅ | 262 | Space-filling curves, Rayon, benchmarks |
 | 5. Python | ✅ | 10 | pyo3 bindings |
 | 6. Deduplication | ✅ | 27 | Tile dedup via XXH3 + run_length encoding |
+| 7. Property Filtering | ✅ | 20 | Include/exclude fields (--include/-y, --exclude/-x, --exclude-all/-X) |
+| 8. Compression Options | ✅ | 20 | gzip (default), brotli, zstd, none |
+
+## Phase 8: Compression Options ✅ COMPLETE
+
+Configurable compression algorithms for tile data:
+
+```bash
+gpq-tiles input.parquet output.pmtiles --compression gzip   # default, universal support
+gpq-tiles input.parquet output.pmtiles --compression brotli # better ratio
+gpq-tiles input.parquet output.pmtiles --compression zstd   # fastest decompression
+gpq-tiles input.parquet output.pmtiles --compression none   # no compression
+```
+
+**PMTiles v3 compression codes:**
+| Algorithm | Code | Pros |
+|-----------|------|------|
+| none | 0 | No CPU overhead |
+| gzip | 2 | Universal browser support |
+| brotli | 3 | Best compression ratio |
+| zstd | 4 | Fastest decompression |
+
+## Phase 7: Property Filtering ✅ COMPLETE
+
+Control which attributes are included in output tiles (matches tippecanoe flags):
+
+```bash
+# Include only specific fields (whitelist) - matches tippecanoe -y
+gpq-tiles input.parquet output.pmtiles --include name --include population
+
+# Exclude specific fields (blacklist) - matches tippecanoe -x
+gpq-tiles input.parquet output.pmtiles --exclude internal_id --exclude temp_field
+
+# Exclude all properties, geometry only - matches tippecanoe -X
+gpq-tiles input.parquet output.pmtiles --exclude-all
+```
+
+**Benefits:**
+- Smaller tile sizes
+- Faster rendering
+- Privacy (exclude sensitive fields)
 
 ## Phase 6: Tile Deduplication ✅ COMPLETE
 
