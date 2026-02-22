@@ -5,13 +5,12 @@
 //! Key design decisions:
 //! - Uses Hilbert curve ordering for tile IDs (spatial locality)
 //! - Delta-encoded directories for better compression
-//! - Gzip compression for both directories and tiles
+//! - Configurable compression (gzip, brotli, zstd) for both directories and tiles
 //! - Clustered mode for efficient sequential reads
 
+use crate::compression::{self, Compression};
 use crate::tile::TileBounds;
 use crate::{Error, Result};
-use flate2::write::GzEncoder;
-use flate2::Compression as GzCompression;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
@@ -33,16 +32,7 @@ pub enum TileType {
     Avif = 5,
 }
 
-/// Compression type enumeration (bytes 97-98 in header)
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum Compression {
-    Unknown = 0,
-    None = 1,
-    Gzip = 2,
-    Brotli = 3,
-    Zstd = 4,
-}
+// Compression enum is now imported from crate::compression
 
 /// PMTiles v3 header (127 bytes)
 ///
@@ -328,11 +318,9 @@ pub fn encode_directory(entries: &[DirEntry]) -> Vec<u8> {
     buf
 }
 
-/// Compress data with gzip
+/// Compress data with gzip (backward compatibility wrapper)
 pub fn gzip_compress(data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut encoder = GzEncoder::new(Vec::new(), GzCompression::default());
-    encoder.write_all(data)?;
-    encoder.finish()
+    compression::compress(data, Compression::Gzip)
 }
 
 // ============================================================================
@@ -355,10 +343,14 @@ pub struct PmtilesWriter {
     total_features: u64,
     /// Feature count per zoom level
     features_per_zoom: HashMap<u8, u64>,
+    /// Compression algorithm for tile data
+    tile_compression: Compression,
+    /// Compression algorithm for internal data (directories, metadata)
+    internal_compression: Compression,
 }
 
 impl PmtilesWriter {
-    /// Create a new PMTiles writer
+    /// Create a new PMTiles writer with default gzip compression
     pub fn new() -> Self {
         Self {
             tiles: BTreeMap::new(),
@@ -369,7 +361,48 @@ impl PmtilesWriter {
             fields: HashMap::new(),
             total_features: 0,
             features_per_zoom: HashMap::new(),
+            tile_compression: Compression::Gzip,
+            internal_compression: Compression::Gzip,
         }
+    }
+
+    /// Create a new PMTiles writer with specified compression
+    ///
+    /// Both tile data and internal data (directories, metadata) will use
+    /// the same compression algorithm.
+    pub fn with_compression(compression: Compression) -> Self {
+        Self {
+            tiles: BTreeMap::new(),
+            min_zoom: 255,
+            max_zoom: 0,
+            bounds: TileBounds::empty(),
+            layer_name: "layer".to_string(),
+            fields: HashMap::new(),
+            total_features: 0,
+            features_per_zoom: HashMap::new(),
+            tile_compression: compression,
+            internal_compression: compression,
+        }
+    }
+
+    /// Set the compression algorithm for tile data
+    pub fn set_tile_compression(&mut self, compression: Compression) {
+        self.tile_compression = compression;
+    }
+
+    /// Set the compression algorithm for internal data (directories, metadata)
+    pub fn set_internal_compression(&mut self, compression: Compression) {
+        self.internal_compression = compression;
+    }
+
+    /// Get the current tile compression setting
+    pub fn tile_compression(&self) -> Compression {
+        self.tile_compression
+    }
+
+    /// Get the current internal compression setting
+    pub fn internal_compression(&self) -> Compression {
+        self.internal_compression
     }
 
     /// Set the layer name for vector_layers metadata
@@ -435,7 +468,7 @@ impl PmtilesWriter {
         data: &[u8],
         feature_count: usize,
     ) -> std::io::Result<()> {
-        let compressed = gzip_compress(data)?;
+        let compressed = compression::compress(data, self.tile_compression)?;
         let id = tile_id(z, x, y);
         self.tiles.insert(id, compressed);
 
@@ -501,9 +534,9 @@ impl PmtilesWriter {
             tile_data_buf.extend_from_slice(data);
         }
 
-        // Encode and compress directory
+        // Encode and compress directory using configured internal compression
         let dir_bytes = encode_directory(&entries);
-        let compressed_dir = gzip_compress(&dir_bytes)
+        let compressed_dir = compression::compress(&dir_bytes, self.internal_compression)
             .map_err(|e| Error::PMTilesWrite(format!("Failed to compress directory: {}", e)))?;
 
         // JSON metadata with vector_layers and tilestats
@@ -523,8 +556,9 @@ impl PmtilesWriter {
             r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"gpq-tiles"}}"#,
             self.layer_name, min_z, max_z, fields_json, tilestats_json
         );
-        let compressed_metadata = gzip_compress(metadata.as_bytes())
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+        let compressed_metadata =
+            compression::compress(metadata.as_bytes(), self.internal_compression)
+                .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
 
         // Calculate section offsets
         let root_dir_offset = 127u64;
@@ -548,8 +582,8 @@ impl PmtilesWriter {
             tile_entries_count: entries.len() as u64,
             tile_contents_count: self.tiles.len() as u64,
             clustered: true,
-            internal_compression: Compression::Gzip,
-            tile_compression: Compression::Gzip,
+            internal_compression: self.internal_compression,
+            tile_compression: self.tile_compression,
             tile_type: TileType::Mvt,
             min_zoom: if self.min_zoom == 255 {
                 0
@@ -1091,6 +1125,132 @@ mod tests {
         assert!(metadata_json.contains(r#""height":"Number""#));
         assert!(metadata_json.contains(r#""name":"String""#));
         assert!(metadata_json.contains(r#""id":"buildings""#));
+
+        let _ = fs::remove_file(path);
+    }
+
+    // -------------------------------------------------------------------------
+    // Compression Configuration Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_writer_with_compression_constructor() {
+        let writer = PmtilesWriter::with_compression(Compression::Brotli);
+        assert_eq!(writer.tile_compression(), Compression::Brotli);
+        assert_eq!(writer.internal_compression(), Compression::Brotli);
+    }
+
+    #[test]
+    fn test_writer_set_compression() {
+        let mut writer = PmtilesWriter::new();
+        assert_eq!(writer.tile_compression(), Compression::Gzip); // default
+
+        writer.set_tile_compression(Compression::Zstd);
+        assert_eq!(writer.tile_compression(), Compression::Zstd);
+
+        writer.set_internal_compression(Compression::Brotli);
+        assert_eq!(writer.internal_compression(), Compression::Brotli);
+    }
+
+    #[test]
+    fn test_writer_brotli_compression() {
+        let mut writer = PmtilesWriter::with_compression(Compression::Brotli);
+        let mvt_data = vec![0x1a; 100]; // Compressible data
+
+        writer.add_tile(0, 0, 0, &mvt_data).unwrap();
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let path = Path::new("/tmp/test-pmtiles-brotli.pmtiles");
+        let _ = fs::remove_file(path);
+
+        writer
+            .write_to_file(path)
+            .expect("Should write file with brotli");
+
+        let data = fs::read(path).unwrap();
+
+        // Verify header
+        assert_eq!(&data[0..7], b"PMTiles");
+        assert_eq!(data[7], 3);
+
+        // Check compression bytes in header (97 = internal, 98 = tile)
+        assert_eq!(data[97], Compression::Brotli as u8);
+        assert_eq!(data[98], Compression::Brotli as u8);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_writer_zstd_compression() {
+        let mut writer = PmtilesWriter::with_compression(Compression::Zstd);
+        let mvt_data = vec![0x1a; 100];
+
+        writer.add_tile(0, 0, 0, &mvt_data).unwrap();
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let path = Path::new("/tmp/test-pmtiles-zstd.pmtiles");
+        let _ = fs::remove_file(path);
+
+        writer
+            .write_to_file(path)
+            .expect("Should write file with zstd");
+
+        let data = fs::read(path).unwrap();
+
+        // Check compression bytes in header
+        assert_eq!(data[97], Compression::Zstd as u8);
+        assert_eq!(data[98], Compression::Zstd as u8);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_writer_no_compression() {
+        let mut writer = PmtilesWriter::with_compression(Compression::None);
+        let mvt_data = vec![0x1a, 0x00];
+
+        writer.add_tile(0, 0, 0, &mvt_data).unwrap();
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let path = Path::new("/tmp/test-pmtiles-none.pmtiles");
+        let _ = fs::remove_file(path);
+
+        writer
+            .write_to_file(path)
+            .expect("Should write file without compression");
+
+        let data = fs::read(path).unwrap();
+
+        // Check compression bytes in header
+        assert_eq!(data[97], Compression::None as u8);
+        assert_eq!(data[98], Compression::None as u8);
+
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn test_writer_mixed_compression() {
+        // Test different compression for internal vs tile data
+        let mut writer = PmtilesWriter::new();
+        writer.set_internal_compression(Compression::Gzip);
+        writer.set_tile_compression(Compression::Zstd);
+
+        let mvt_data = vec![0x1a; 100];
+        writer.add_tile(0, 0, 0, &mvt_data).unwrap();
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let path = Path::new("/tmp/test-pmtiles-mixed.pmtiles");
+        let _ = fs::remove_file(path);
+
+        writer
+            .write_to_file(path)
+            .expect("Should write file with mixed compression");
+
+        let data = fs::read(path).unwrap();
+
+        // Check compression bytes in header
+        assert_eq!(data[97], Compression::Gzip as u8); // internal
+        assert_eq!(data[98], Compression::Zstd as u8); // tile
 
         let _ = fs::remove_file(path);
     }
