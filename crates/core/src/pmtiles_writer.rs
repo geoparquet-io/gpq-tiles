@@ -12,7 +12,7 @@ use crate::tile::TileBounds;
 use crate::{Error, Result};
 use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -349,6 +349,8 @@ pub struct PmtilesWriter {
     max_zoom: u8,
     bounds: TileBounds,
     layer_name: String,
+    /// Field metadata: field name -> MVT type ("String", "Number", "Boolean")
+    fields: HashMap<String, String>,
 }
 
 impl PmtilesWriter {
@@ -360,12 +362,38 @@ impl PmtilesWriter {
             max_zoom: 0,
             bounds: TileBounds::empty(),
             layer_name: "layer".to_string(),
+            fields: HashMap::new(),
         }
     }
 
     /// Set the layer name for vector_layers metadata
     pub fn set_layer_name(&mut self, name: &str) {
         self.layer_name = name.to_string();
+    }
+
+    /// Set field metadata for vector_layers.fields
+    ///
+    /// Field types should be MVT-style: "String", "Number", or "Boolean"
+    pub fn set_fields(&mut self, fields: HashMap<String, String>) {
+        self.fields = fields;
+    }
+
+    /// Build the fields JSON object string
+    fn build_fields_json(&self) -> String {
+        if self.fields.is_empty() {
+            return "{}".to_string();
+        }
+
+        // Sort field names for deterministic output
+        let mut field_pairs: Vec<_> = self.fields.iter().collect();
+        field_pairs.sort_by_key(|(k, _)| *k);
+
+        let field_strings: Vec<String> = field_pairs
+            .iter()
+            .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
+            .collect();
+
+        format!("{{{}}}", field_strings.join(","))
     }
 
     /// Add a tile (will be gzip compressed)
@@ -450,9 +478,10 @@ impl PmtilesWriter {
         } else {
             self.max_zoom
         };
+        let fields_json = self.build_fields_json();
         let metadata = format!(
-            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{{}}}}],"format":"pbf","generator":"gpq-tiles"}}"#,
-            self.layer_name, min_z, max_z
+            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],"format":"pbf","generator":"gpq-tiles"}}"#,
+            self.layer_name, min_z, max_z, fields_json
         );
         let compressed_metadata = gzip_compress(metadata.as_bytes())
             .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
@@ -958,6 +987,70 @@ mod tests {
         assert!((min_lat - bounds.lat_min).abs() < 0.0001);
         assert!((max_lon - bounds.lng_max).abs() < 0.0001);
         assert!((max_lat - bounds.lat_max).abs() < 0.0001);
+
+        let _ = fs::remove_file(path);
+    }
+
+    // -------------------------------------------------------------------------
+    // Field Metadata Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_build_fields_json_empty() {
+        let writer = PmtilesWriter::new();
+        assert_eq!(writer.build_fields_json(), "{}");
+    }
+
+    #[test]
+    fn test_build_fields_json_with_fields() {
+        let mut writer = PmtilesWriter::new();
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), "String".to_string());
+        fields.insert("area".to_string(), "Number".to_string());
+        writer.set_fields(fields);
+
+        let json = writer.build_fields_json();
+        // Fields are sorted alphabetically
+        assert_eq!(json, r#"{"area":"Number","name":"String"}"#);
+    }
+
+    #[test]
+    fn test_writer_field_metadata_in_output() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let mut writer = PmtilesWriter::new();
+        writer.add_tile(0, 0, 0, &[1, 2, 3]).unwrap();
+        writer.set_layer_name("buildings");
+
+        let mut fields = HashMap::new();
+        fields.insert("name".to_string(), "String".to_string());
+        fields.insert("height".to_string(), "Number".to_string());
+        writer.set_fields(fields);
+
+        let path = Path::new("/tmp/test-pmtiles-fields.pmtiles");
+        let _ = fs::remove_file(path);
+
+        writer.write_to_file(path).expect("Should write file");
+
+        let data = fs::read(path).unwrap();
+
+        // Extract metadata offset and length from header
+        let metadata_offset = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
+        let metadata_length = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
+
+        // Decompress the metadata
+        let compressed_metadata = &data[metadata_offset..metadata_offset + metadata_length];
+        let mut decoder = GzDecoder::new(compressed_metadata);
+        let mut metadata_json = String::new();
+        decoder
+            .read_to_string(&mut metadata_json)
+            .expect("Should decompress metadata");
+
+        // Verify fields are present
+        assert!(metadata_json.contains(r#""height":"Number""#));
+        assert!(metadata_json.contains(r#""name":"String""#));
+        assert!(metadata_json.contains(r#""id":"buildings""#));
 
         let _ = fs::remove_file(path);
     }
