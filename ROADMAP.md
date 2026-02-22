@@ -55,7 +55,7 @@ Produce functional vector tiles:
 
 **Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
-**Current**: 258 tests (249 unit + 9 doc tests) after Phase 4 spatial indexing integration.
+**Current**: 262 tests (252 unit + 10 doc tests) after Phase 4 completion.
 
 #### Golden Comparison Results
 
@@ -117,9 +117,9 @@ let config = TilerConfig::new()
 
 **Note**: Our grid-based approach differs from tippecanoe's Hilbert curve ordering. See `docs/ARCHITECTURE.md` for details.
 
-### Phase 4: Parallelism 🚧 IN PROGRESS
+### Phase 4: Parallelism ✅ COMPLETE
 
-Leverage Rust's concurrency for performance.
+Leveraged Rust's concurrency for performance.
 
 #### Step 1: Spatial Indexing ✅ COMPLETE
 
@@ -162,12 +162,37 @@ Tippecanoe uses this approach because:
 let config = TilerConfig::new(0, 14).with_hilbert(false);
 ```
 
-#### Step 2: Rayon Parallelization 🔲 TODO
+#### Step 2: Rayon Parallelization ✅ COMPLETE
 
-- Parallelize tile generation within each zoom level using `rayon`
-- Partition sorted features by spatial region for parallel processing
+- Tiles within each zoom level processed in parallel using `rayon::par_iter()`
+- Sorted features partitioned by spatial region for cache-friendly parallel processing
+- Results sorted by `(z, x, y)` for deterministic output ordering
 
 **Zoom levels remain sequential** to preserve feature dropping semantics.
+
+```rust
+// Enable/disable parallelism (default: enabled)
+let config = TilerConfig::new(0, 14).with_parallel(true);
+```
+
+#### Step 3: Benchmark Suite ✅ COMPLETE
+
+Comprehensive Criterion benchmarks for performance tracking (`crates/core/benches/tiling.rs`):
+
+| Benchmark | Description |
+|-----------|-------------|
+| `single_tile` | Z8 and Z10 tile generation |
+| `full_pipeline` | Z0-8 and Z0-10 zoom ranges |
+| `parallel_vs_sequential` | Compare Rayon vs single-threaded |
+| `density_dropping` | With/without density drop |
+| `hilbert_vs_zorder` | Compare spatial indexing approaches |
+
+Run with: `cargo bench --package gpq-tiles-core`
+
+**Performance results** (1000 features, Z0-10):
+- gpq-tiles: ~134ms
+- tippecanoe: ~194ms
+- **1.4x faster than tippecanoe**
 
 ### Phase 5: Python Integration
 
