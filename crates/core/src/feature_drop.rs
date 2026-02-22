@@ -432,6 +432,212 @@ pub fn filter_multiline(
     }
 }
 
+// =============================================================================
+// DENSITY-BASED DROPPING
+// =============================================================================
+
+/// Configuration for density-based feature dropping.
+///
+/// This implements a tippecanoe-compatible algorithm for reducing feature density
+/// at lower zoom levels. Features are assigned to grid cells, and when a cell
+/// contains too many features, excess features are dropped deterministically.
+#[derive(Debug, Clone)]
+pub struct DensityDropConfig {
+    /// Grid cell size in pixels (features within same cell compete)
+    /// Default: 16 pixels (256 cells per tile at 4096 extent)
+    pub cell_size: u32,
+
+    /// Maximum features allowed per grid cell before dropping starts
+    /// Default: 1 (tippecanoe's strict approach - one feature per cell)
+    pub max_features_per_cell: usize,
+
+    /// Minimum zoom level at which density dropping is applied
+    /// Below this zoom, all features are subject to density dropping
+    /// Default: 0 (apply at all zoom levels)
+    pub min_zoom: u8,
+
+    /// Maximum zoom level (base_zoom) at which all features are kept
+    /// At this zoom and above, no density dropping occurs
+    /// Default: 14
+    pub max_zoom: u8,
+}
+
+impl Default for DensityDropConfig {
+    fn default() -> Self {
+        Self {
+            cell_size: 16,
+            max_features_per_cell: 1,
+            min_zoom: 0,
+            max_zoom: 14,
+        }
+    }
+}
+
+impl DensityDropConfig {
+    /// Create a new config with default settings.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Set the grid cell size in pixels.
+    pub fn with_cell_size(mut self, cell_size: u32) -> Self {
+        self.cell_size = cell_size;
+        self
+    }
+
+    /// Set the maximum features per cell.
+    pub fn with_max_features_per_cell(mut self, max: usize) -> Self {
+        self.max_features_per_cell = max;
+        self
+    }
+
+    /// Set the zoom range.
+    pub fn with_zoom_range(mut self, min_zoom: u8, max_zoom: u8) -> Self {
+        self.min_zoom = min_zoom;
+        self.max_zoom = max_zoom;
+        self
+    }
+}
+
+/// Density-based feature dropper that tracks feature counts per grid cell.
+///
+/// This struct is used during tile generation to determine which features
+/// should be dropped based on spatial density.
+///
+/// # Algorithm
+///
+/// 1. The tile is divided into a grid of cells (extent / cell_size)
+/// 2. Each feature is assigned to a cell based on its centroid
+/// 3. Features are processed in order; the first N features per cell are kept
+/// 4. Additional features in the same cell are dropped
+///
+/// # Tippecanoe Compatibility
+///
+/// This is a simplified version of tippecanoe's gap-based algorithm.
+/// Tippecanoe sorts features by Hilbert curve and computes gaps (distances)
+/// between consecutive features. We approximate this with a grid-based approach
+/// that achieves similar results without requiring Hilbert curve sorting.
+///
+/// DIVERGENCE FROM TIPPECANOE: Tippecanoe uses Hilbert curve ordering and
+/// gap-based selection. We use grid cells instead. This produces similar
+/// but not identical results. Tippecanoe's approach is more sophisticated
+/// for preserving spatial distribution, while ours is simpler and faster.
+#[derive(Debug)]
+pub struct DensityDropper {
+    config: DensityDropConfig,
+    cell_counts: std::collections::HashMap<(u32, u32), usize>,
+    grid_size: u32,
+}
+
+impl DensityDropper {
+    /// Create a new density dropper with the given configuration.
+    pub fn new(config: DensityDropConfig, extent: u32) -> Self {
+        let grid_size = extent / config.cell_size;
+        Self {
+            config,
+            cell_counts: std::collections::HashMap::new(),
+            grid_size,
+        }
+    }
+
+    /// Create a new density dropper with default configuration.
+    pub fn with_defaults(extent: u32) -> Self {
+        Self::new(DensityDropConfig::default(), extent)
+    }
+
+    /// Reset the dropper for a new tile.
+    pub fn reset(&mut self) {
+        self.cell_counts.clear();
+    }
+
+    /// Check if a feature at the given tile-local coordinates should be dropped.
+    ///
+    /// Returns `true` if the feature should be dropped due to density constraints.
+    ///
+    /// # Arguments
+    ///
+    /// * `x` - X coordinate in tile-local pixels (0 to extent)
+    /// * `y` - Y coordinate in tile-local pixels (0 to extent)
+    /// * `zoom` - Current zoom level
+    ///
+    /// # Returns
+    ///
+    /// `true` if the feature should be dropped, `false` if it should be kept.
+    pub fn should_drop(&mut self, x: f64, y: f64, zoom: u8) -> bool {
+        // At max_zoom or above, never drop due to density
+        if zoom >= self.config.max_zoom {
+            return false;
+        }
+
+        // Calculate grid cell
+        let cell_x = ((x.max(0.0) as u32) / self.config.cell_size).min(self.grid_size - 1);
+        let cell_y = ((y.max(0.0) as u32) / self.config.cell_size).min(self.grid_size - 1);
+        let cell_key = (cell_x, cell_y);
+
+        // Get current count for this cell
+        let count = self.cell_counts.entry(cell_key).or_insert(0);
+
+        // Check if we're over the limit
+        if *count >= self.config.max_features_per_cell {
+            return true; // Drop this feature
+        }
+
+        // Keep this feature, increment count
+        *count += 1;
+        false
+    }
+
+    /// Check if a feature should be dropped based on geometry centroid.
+    ///
+    /// This is a convenience method that calculates the centroid of a geometry
+    /// and checks density at that location.
+    pub fn should_drop_geometry(
+        &mut self,
+        geom: &geo::Geometry<f64>,
+        tile_bounds: &TileBounds,
+        extent: u32,
+        zoom: u8,
+    ) -> bool {
+        use geo::Centroid;
+
+        // Get centroid of geometry
+        let centroid = match geom.centroid() {
+            Some(c) => c,
+            None => return false, // Can't compute centroid, don't drop
+        };
+
+        // Convert to tile-local coordinates
+        let (x, y) = geo_to_tile_coords(centroid.x(), centroid.y(), tile_bounds, extent);
+
+        self.should_drop(x, y, zoom)
+    }
+}
+
+/// Calculate the effective drop rate for a given zoom level.
+///
+/// This is useful for statistics and logging. The drop rate increases
+/// as zoom decreases (more aggressive dropping at lower zooms).
+///
+/// The formula is based on tippecanoe's behavior where feature density
+/// roughly scales with 4^(max_zoom - zoom) but is constrained by the
+/// grid-based limiting.
+pub fn density_drop_rate(zoom: u8, max_zoom: u8, features_per_cell: usize) -> f64 {
+    if zoom >= max_zoom {
+        return 0.0; // No dropping at max_zoom
+    }
+
+    // At each zoom level below max_zoom, tile area quadruples
+    // If we limit to N features per cell, expected drop rate is:
+    // 1 - (N / expected_features_per_cell)
+    //
+    // This is a rough estimate; actual drop rate depends on feature distribution
+    let zoom_diff = (max_zoom - zoom) as f64;
+    let density_factor = 4.0_f64.powf(zoom_diff);
+    let expected_per_cell = density_factor * (features_per_cell as f64);
+    let keep_rate = (features_per_cell as f64) / expected_per_cell;
+    1.0 - keep_rate
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1311,5 +1517,283 @@ mod tests {
                 "Point location should not affect drop decision (for now)"
             );
         }
+    }
+
+    // =========================================================================
+    // DENSITY-BASED DROPPING TESTS
+    // =========================================================================
+
+    #[test]
+    fn test_density_dropper_at_max_zoom_keeps_all() {
+        let config = DensityDropConfig::default().with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // At max_zoom (14), all features should be kept even in same cell
+        for i in 0..100 {
+            assert!(
+                !dropper.should_drop(100.0, 100.0, 14),
+                "Feature {} should be kept at max_zoom",
+                i
+            );
+        }
+    }
+
+    #[test]
+    fn test_density_dropper_first_feature_per_cell_kept() {
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(1)
+            .with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // First feature in a cell should be kept at lower zoom
+        assert!(
+            !dropper.should_drop(100.0, 100.0, 8),
+            "First feature in cell should be kept"
+        );
+    }
+
+    #[test]
+    fn test_density_dropper_second_feature_in_same_cell_dropped() {
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(1)
+            .with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // First feature kept
+        let first = dropper.should_drop(100.0, 100.0, 8);
+        assert!(!first, "First feature should be kept");
+
+        // Second feature in same cell dropped
+        let second = dropper.should_drop(105.0, 105.0, 8); // Same cell (cell_size=16)
+        assert!(second, "Second feature in same cell should be dropped");
+    }
+
+    #[test]
+    fn test_density_dropper_different_cells_both_kept() {
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(1)
+            .with_cell_size(16)
+            .with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // Feature in cell (0, 0)
+        assert!(
+            !dropper.should_drop(8.0, 8.0, 8),
+            "First feature in cell (0,0) should be kept"
+        );
+
+        // Feature in cell (1, 0) - different cell
+        assert!(
+            !dropper.should_drop(24.0, 8.0, 8),
+            "First feature in cell (1,0) should be kept"
+        );
+
+        // Feature in cell (0, 1) - different cell
+        assert!(
+            !dropper.should_drop(8.0, 24.0, 8),
+            "First feature in cell (0,1) should be kept"
+        );
+    }
+
+    #[test]
+    fn test_density_dropper_multiple_features_per_cell() {
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(3)
+            .with_cell_size(16)
+            .with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // First 3 features should be kept
+        assert!(
+            !dropper.should_drop(8.0, 8.0, 8),
+            "Feature 1 should be kept"
+        );
+        assert!(
+            !dropper.should_drop(8.0, 8.0, 8),
+            "Feature 2 should be kept"
+        );
+        assert!(
+            !dropper.should_drop(8.0, 8.0, 8),
+            "Feature 3 should be kept"
+        );
+
+        // 4th feature should be dropped
+        assert!(
+            dropper.should_drop(8.0, 8.0, 8),
+            "Feature 4 should be dropped"
+        );
+    }
+
+    #[test]
+    fn test_density_dropper_reset_clears_state() {
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(1)
+            .with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // Fill a cell
+        dropper.should_drop(100.0, 100.0, 8);
+        assert!(
+            dropper.should_drop(100.0, 100.0, 8),
+            "Should drop after first"
+        );
+
+        // Reset
+        dropper.reset();
+
+        // Now should keep again
+        assert!(
+            !dropper.should_drop(100.0, 100.0, 8),
+            "Should keep after reset"
+        );
+    }
+
+    #[test]
+    fn test_density_dropper_high_density_scenario() {
+        // Simulate 1000 features clustered in a small area
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(1)
+            .with_cell_size(16)
+            .with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        let mut kept = 0;
+        let mut dropped = 0;
+
+        // All features in same 64x64 pixel area (4x4 = 16 cells with cell_size=16)
+        for i in 0..1000 {
+            let x = (i % 64) as f64;
+            let y = (i / 64 % 64) as f64;
+            if dropper.should_drop(x, y, 8) {
+                dropped += 1;
+            } else {
+                kept += 1;
+            }
+        }
+
+        // With 16 cells (4x4) and 1 feature per cell, we should keep ~16 features
+        assert!(
+            kept <= 16,
+            "Should keep at most 16 features (one per cell), got {}",
+            kept
+        );
+        assert!(
+            dropped > 900,
+            "Should drop most features when density is high, got {} dropped",
+            dropped
+        );
+
+        println!(
+            "High density test: kept {}, dropped {} (drop rate: {:.1}%)",
+            kept,
+            dropped,
+            (dropped as f64 / 1000.0) * 100.0
+        );
+    }
+
+    #[test]
+    fn test_density_dropper_reduces_feature_count_significantly() {
+        // This test simulates a realistic scenario at z8 with ~1000 features
+        // We expect density dropping to reduce this significantly
+        let config = DensityDropConfig::default()
+            .with_max_features_per_cell(1)
+            .with_cell_size(32) // Larger cells = more aggressive dropping
+            .with_zoom_range(0, 10);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        let mut kept = 0;
+
+        // Distribute 1000 features across a quarter of the tile (2048x2048 area)
+        // This simulates a dense area within a tile
+        for i in 0..1000 {
+            // Spread features across a 512x512 pixel area (roughly 16x16 cells at cell_size=32)
+            let x = (i as f64 % 512.0) + 1000.0;
+            let y = (i as f64 / 512.0 % 512.0) + 1000.0;
+
+            if !dropper.should_drop(x, y, 8) {
+                kept += 1;
+            }
+        }
+
+        // With 16x16=256 cells max in the 512x512 area (cell_size=32), we expect ~256 kept
+        // But features might cluster more, so expect fewer
+        println!(
+            "Realistic test at z8: {} of 1000 features kept ({:.1}%)",
+            kept,
+            (kept as f64 / 1000.0) * 100.0
+        );
+
+        // Key assertion: significantly fewer than 1000 features
+        assert!(
+            kept < 500,
+            "Density dropping should reduce 1000 features to <500, got {}",
+            kept
+        );
+    }
+
+    #[test]
+    fn test_density_drop_config_builder() {
+        let config = DensityDropConfig::new()
+            .with_cell_size(32)
+            .with_max_features_per_cell(2)
+            .with_zoom_range(5, 12);
+
+        assert_eq!(config.cell_size, 32);
+        assert_eq!(config.max_features_per_cell, 2);
+        assert_eq!(config.min_zoom, 5);
+        assert_eq!(config.max_zoom, 12);
+    }
+
+    #[test]
+    fn test_density_drop_rate_calculation() {
+        // At max_zoom, no dropping
+        assert_eq!(density_drop_rate(14, 14, 1), 0.0);
+
+        // At lower zooms, increasing drop rate
+        let rate_z13 = density_drop_rate(13, 14, 1);
+        let rate_z12 = density_drop_rate(12, 14, 1);
+        let rate_z10 = density_drop_rate(10, 14, 1);
+
+        assert!(rate_z13 > 0.0, "z13 should have some dropping");
+        assert!(
+            rate_z12 > rate_z13,
+            "z12 should have more dropping than z13"
+        );
+        assert!(
+            rate_z10 > rate_z12,
+            "z10 should have more dropping than z12"
+        );
+
+        // At z10 (4 levels below z14), expect significant dropping
+        // Density factor = 4^4 = 256, so expect ~99.6% drop rate
+        assert!(
+            rate_z10 > 0.99,
+            "z10 should have >99% theoretical drop rate, got {}",
+            rate_z10
+        );
+    }
+
+    #[test]
+    fn test_density_dropper_edge_coordinates() {
+        let config = DensityDropConfig::default().with_zoom_range(0, 14);
+        let mut dropper = DensityDropper::new(config, 4096);
+
+        // Test boundary coordinates
+        assert!(!dropper.should_drop(0.0, 0.0, 8), "Origin should work");
+        dropper.reset();
+        assert!(
+            !dropper.should_drop(4095.0, 4095.0, 8),
+            "Max coords should work"
+        );
+        dropper.reset();
+        assert!(
+            !dropper.should_drop(-1.0, -1.0, 8),
+            "Negative coords should be clamped"
+        );
+        dropper.reset();
+        assert!(
+            !dropper.should_drop(5000.0, 5000.0, 8),
+            "Over-max coords should be clamped"
+        );
     }
 }

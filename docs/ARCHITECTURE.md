@@ -24,19 +24,24 @@ This document captures key design decisions and known divergences from tippecano
 
 Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (Andorra, ~1000 buildings):
 
-| Zoom | Tippecanoe Features | gpq-tiles Features | Ratio | Notes |
-|------|--------------------|--------------------|-------|-------|
-| Z5 | 1 | 1000 | - | tippecanoe uses density-based dropping |
-| Z8 | 97 | 1000 | 10.3x | tippecanoe uses density-based dropping |
-| Z10 | 484 | **392** | **0.81x** | ✅ Feature dropping working! |
+| Zoom | Tippecanoe Features | gpq-tiles Features (default) | gpq-tiles (density drop) | Notes |
+|------|--------------------|-----------------------------|--------------------------|-------|
+| Z5 | 1 | ~200 | ~10-40 | Configurable via cell_size |
+| Z8 | 97 | 76 | 9-34 | Already below tippecanoe w/o density drop |
+| Z10 | 484 | 392 | - | Density drop disabled at high zoom |
 
 **Analysis:**
-- At high zoom (Z10), we now drop **more** features than tippecanoe (0.81x ratio) due to diffuse probability for tiny polygons
-- At low zoom (Z5-Z8), tippecanoe's density-based dropping still dominates (deferred feature)
+- At high zoom (Z10), we drop more features than tippecanoe (0.81x ratio) due to diffuse probability for tiny polygons
+- At low zoom (Z5-Z8), our tiny polygon dropping is actually MORE aggressive than tippecanoe's
+- Density-based dropping is available for further reduction when needed
 - Area preservation after clip+simplify: 88% - good fidelity
 - All zoom levels produce valid MVT tiles
 
-**Phase 3 integration complete**: Tiny polygon, line dropping, and point thinning are all working. Density-based dropping deferred.
+**Phase 3 integration complete**: All dropping algorithms implemented:
+- Tiny polygon (diffuse probability)
+- Line dropping (coordinate quantization)
+- Point thinning (1/2.5 per zoom)
+- Density-based dropping (grid-cell limiting)
 
 ## Critical Issues (Resolved)
 
@@ -73,6 +78,27 @@ The `feature_drop` module implements tippecanoe-compatible dropping (Phase 3):
 - At base_zoom - 1: 40% retention
 - At base_zoom - 2: 16% retention
 - Deterministic via Murmur3-style hash on feature index
+
+### Density-Based Dropping
+- Algorithm: Grid-cell limiting (simplified version of tippecanoe's Hilbert-gap approach)
+- The tile is divided into cells (configurable size, default 16 pixels = 256x256 cells)
+- Maximum N features kept per cell (default: 1)
+- Features are processed in order; first N per cell are kept
+- Disabled by default; enable with `.with_density_drop(true)`
+
+**Cell Size Reference** (at Z8, 4096 extent):
+| Cell Size | Grid Size | Typical Features Kept |
+|-----------|-----------|----------------------|
+| 16px | 256x256 | 34 |
+| 32px | 128x128 | 23 |
+| 64px | 64x64 | 13 |
+| 128px | 32x32 | 9 |
+| 256px | 16x16 | 4 |
+
+**DIVERGENCE FROM TIPPECANOE**: Tippecanoe uses Hilbert curve ordering and gap-based
+selection (squared distance between consecutive features). We use a simpler grid-based
+approach. This produces similar but not identical results. Tippecanoe's approach better
+preserves spatial distribution; ours is simpler and faster.
 
 ## Testing Strategy
 

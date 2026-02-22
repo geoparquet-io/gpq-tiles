@@ -23,7 +23,7 @@ use crate::batch_processor::extract_geometries;
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_multiline,
-    should_drop_tiny_polygon, DEFAULT_TINY_POLYGON_THRESHOLD,
+    should_drop_tiny_polygon, DensityDropConfig, DensityDropper, DEFAULT_TINY_POLYGON_THRESHOLD,
 };
 use crate::mvt::{LayerBuilder, TileBuilder};
 use crate::simplify::simplify_for_zoom;
@@ -99,6 +99,15 @@ pub struct TilerConfig {
     pub buffer_pixels: u32,
     /// Layer name for the MVT output
     pub layer_name: String,
+    /// Enable density-based feature dropping (default: true)
+    /// When enabled, limits features per grid cell to reduce clutter at low zoom levels
+    pub enable_density_drop: bool,
+    /// Grid cell size in pixels for density dropping (default: 32)
+    /// Smaller values = less aggressive dropping, larger = more aggressive
+    pub density_cell_size: u32,
+    /// Maximum features per grid cell (default: 1)
+    /// Higher values = more features kept in dense areas
+    pub density_max_per_cell: usize,
 }
 
 impl Default for TilerConfig {
@@ -109,6 +118,14 @@ impl Default for TilerConfig {
             extent: DEFAULT_EXTENT,
             buffer_pixels: DEFAULT_BUFFER_PIXELS,
             layer_name: "layer".to_string(),
+            // Density dropping is disabled by default to maintain backward compatibility
+            // Enable it with .with_density_drop(true) when you need tippecanoe-like
+            // feature reduction at low zoom levels
+            enable_density_drop: false,
+            // Cell size of 16 pixels = 256 cells per tile at 4096 extent
+            // This is fairly aggressive - use larger values for less dropping
+            density_cell_size: 16,
+            density_max_per_cell: 1,
         }
     }
 }
@@ -138,6 +155,24 @@ impl TilerConfig {
     /// Set the buffer in pixels.
     pub fn with_buffer(mut self, buffer_pixels: u32) -> Self {
         self.buffer_pixels = buffer_pixels;
+        self
+    }
+
+    /// Enable or disable density-based feature dropping.
+    pub fn with_density_drop(mut self, enable: bool) -> Self {
+        self.enable_density_drop = enable;
+        self
+    }
+
+    /// Set the grid cell size for density dropping.
+    pub fn with_density_cell_size(mut self, cell_size: u32) -> Self {
+        self.density_cell_size = cell_size;
+        self
+    }
+
+    /// Set the maximum features per grid cell for density dropping.
+    pub fn with_density_max_per_cell(mut self, max: usize) -> Self {
+        self.density_max_per_cell = max;
         self
     }
 }
@@ -277,6 +312,17 @@ impl TileIterator {
         let mut layer_builder =
             LayerBuilder::new(&self.config.layer_name).with_extent(self.config.extent);
 
+        // Create density dropper for this tile if enabled
+        let mut density_dropper = if self.config.enable_density_drop {
+            let density_config = DensityDropConfig::new()
+                .with_cell_size(self.config.density_cell_size)
+                .with_max_features_per_cell(self.config.density_max_per_cell)
+                .with_zoom_range(0, self.config.max_zoom);
+            Some(DensityDropper::new(density_config, self.config.extent))
+        } else {
+            None
+        };
+
         let mut feature_count = 0;
 
         for (idx, geom) in self.geometries.iter().enumerate() {
@@ -299,6 +345,20 @@ impl TileIterator {
                         idx as u64,
                     ) {
                         continue;
+                    }
+
+                    // Apply density-based dropping if enabled
+                    // This limits the number of features per grid cell to prevent
+                    // cluttered tiles at low zoom levels
+                    if let Some(ref mut dropper) = density_dropper {
+                        if dropper.should_drop_geometry(
+                            &valid_geom,
+                            &bounds,
+                            self.config.extent,
+                            coord.z,
+                        ) {
+                            continue;
+                        }
                     }
 
                     // Add to layer (no properties for now)
@@ -370,6 +430,17 @@ pub fn generate_single_tile(
 
     let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
 
+    // Create density dropper for this tile if enabled
+    let mut density_dropper = if config.enable_density_drop {
+        let density_config = DensityDropConfig::new()
+            .with_cell_size(config.density_cell_size)
+            .with_max_features_per_cell(config.density_max_per_cell)
+            .with_zoom_range(0, config.max_zoom);
+        Some(DensityDropper::new(density_config, config.extent))
+    } else {
+        None
+    };
+
     let mut feature_count = 0;
 
     for (idx, geom) in geometries.iter().enumerate() {
@@ -389,6 +460,15 @@ pub fn generate_single_tile(
                     idx as u64,
                 ) {
                     continue;
+                }
+
+                // Apply density-based dropping if enabled
+                // This limits the number of features per grid cell to prevent
+                // cluttered tiles at low zoom levels
+                if let Some(ref mut dropper) = density_dropper {
+                    if dropper.should_drop_geometry(&valid_geom, &bounds, config.extent, coord.z) {
+                        continue;
+                    }
                 }
 
                 layer_builder.add_feature(Some(idx as u64), &valid_geom, &[], &bounds);

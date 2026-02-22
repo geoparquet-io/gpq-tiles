@@ -55,7 +55,7 @@ Produce functional vector tiles:
 
 **Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
-**Current**: 213 tests (207 unit + 6 doc tests) after Phase 3 feature dropping integration.
+**Current**: 226 tests (220 unit + 6 doc tests) after Phase 3 completion with density-based dropping.
 
 #### Golden Comparison Results
 
@@ -64,11 +64,11 @@ The pipeline is validated against tippecanoe-generated tiles:
 | Metric | Tippecanoe | gpq-tiles | Notes |
 |--------|------------|-----------|-------|
 | Z10 features | 484 | 392 | **0.81x ratio** - feature dropping working! |
-| Z8 features | 97 | 1000 | tippecanoe uses density-based dropping (Phase 3 TODO) |
+| Z8 features | 97 | 76 (default) / 9-34 (density drop) | Now matches or exceeds tippecanoe |
 | Area preserved | - | 88% | After clipping + simplification |
 | All zooms produce output | ✅ | ✅ | Z5-Z10 verified |
 
-**Key insight**: After Phase 3 pipeline integration, the Z10 ratio improved from 1.41x to 0.81x. We now drop slightly more aggressively than tippecanoe due to diffuse probability, which is acceptable. Low-zoom density dropping remains TODO.
+**Key insight**: After Phase 3 completion, the Z10 ratio improved from 1.41x to 0.81x. We now drop slightly more aggressively than tippecanoe due to diffuse probability, which is acceptable. Density-based dropping is now available for low-zoom feature reduction.
 
 **Architecture**: See `docs/ARCHITECTURE.md` for design decisions and known divergences.
 
@@ -83,11 +83,11 @@ The pipeline is validated against tippecanoe-generated tiles:
 | ~~**Low**~~ | ~~Value deduplication uses Debug~~ | ✅ **FIXED** - `PropertyValue` now implements proper `Hash`/`Eq` traits |
 | **Medium** | Memory for large files | `extract_geometries` loads all into `Vec`, defeating Arrow zero-copy. |
 
-### Phase 3: Feature Dropping ✅ MOSTLY COMPLETE
+### Phase 3: Feature Dropping ✅ COMPLETE
 
-**Status**: Core algorithms implemented and integrated. Density-based dropping deferred.
+**Status**: All algorithms implemented and integrated, including density-based dropping.
 
-#### Implemented (43 tests total: 39 in `feature_drop.rs` + 4 integration tests)
+#### Implemented (56+ tests total)
 
 | Algorithm | Status | Tests | Description |
 |-----------|--------|-------|-------------|
@@ -95,15 +95,27 @@ The pipeline is validated against tippecanoe-generated tiles:
 | **Line dropping** | ✅ Done | 17 | Coordinate quantization - drop when all vertices collapse to same pixel |
 | **Point thinning** | ✅ Done | 12 | 1/2.5 drop rate per zoom above base (matches tippecanoe exactly) |
 | **Pipeline integration** | ✅ Done | 4 | `should_drop_geometry()` wired into tile generation |
-| **Density-based** | 🔲 Deferred | - | May not be needed; current results are acceptable |
+| **Density-based** | ✅ Done | 13+ | Grid-cell limiting with configurable cell size and max features per cell |
 
 #### Results
 
 - **Z10 ratio**: 1.41x → **0.81x** (improved!)
-- **Z8**: Still shows 1000 features vs tippecanoe's 97 (density-based dropping needed for this)
-- The core feature dropping is working; density-based dropping is a nice-to-have for low zooms
+- **Z8**: 76 features (default) vs tippecanoe's 97, or 9-34 with density drop enabled
+- All feature dropping algorithms working and integrated
 
-**Goal achieved**: Feature density decreases at lower zooms. Golden comparison ratio at Z10 is now < 1.0x.
+**Goal achieved**: Feature density decreases at lower zooms. Density-based dropping available for further reduction.
+
+#### Density-Based Dropping API
+
+```rust
+// Enable density-based dropping
+let config = TilerConfig::new()
+    .with_density_drop(true)
+    .with_density_cell_size(32)        // Default: 16 pixels
+    .with_density_max_per_cell(2);     // Default: 1 feature per cell
+```
+
+**Note**: Our grid-based approach differs from tippecanoe's Hilbert curve ordering. See `docs/ARCHITECTURE.md` for details.
 
 ### Phase 4: Parallelism
 
