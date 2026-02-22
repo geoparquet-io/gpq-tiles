@@ -154,10 +154,11 @@ impl Converter {
         let tile_gen = generate_tiles_with_bounds(input_path, &tiler_config)
             .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
 
-        // Write tiles to PMTiles with proper bounds and layer name
+        // Write tiles to PMTiles with proper bounds, layer name, and field metadata
         let mut writer = PmtilesWriter::new();
         writer.set_bounds(&tile_gen.bounds);
         writer.set_layer_name(&tile_gen.layer_name);
+        writer.set_fields(tile_gen.fields);
 
         let mut tile_count = 0;
         for tile_result in tile_gen.tiles {

@@ -21,7 +21,7 @@ use rayon::prelude::*;
 
 use geo::Geometry;
 
-use crate::batch_processor::extract_geometries;
+use crate::batch_processor::{extract_field_metadata, extract_geometries};
 use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_multiline,
@@ -248,6 +248,8 @@ pub struct TileGeneration<I: Iterator<Item = Result<GeneratedTile>>> {
     pub bounds: TileBounds,
     /// Layer name used in the MVT tiles
     pub layer_name: String,
+    /// Field metadata: field name -> MVT type ("String", "Number", "Boolean")
+    pub fields: std::collections::HashMap<String, String>,
 }
 
 /// Generate vector tiles from a GeoParquet file.
@@ -316,7 +318,10 @@ pub fn generate_tiles_with_bounds(
     input_path: &Path,
     config: &TilerConfig,
 ) -> Result<TileGeneration<impl Iterator<Item = Result<GeneratedTile>>>> {
-    // Step 1: Extract all geometries from the GeoParquet file
+    // Step 1: Extract field metadata from schema
+    let fields = extract_field_metadata(input_path).unwrap_or_default();
+
+    // Step 2: Extract all geometries from the GeoParquet file
     // WARNING: This loads all geometries into memory. For large files,
     // we'll need a streaming approach in Phase 4.
     let geometries = extract_geometries(input_path)?;
@@ -326,17 +331,19 @@ pub fn generate_tiles_with_bounds(
             tiles: TileIterator::empty(),
             bounds: TileBounds::empty(),
             layer_name: config.layer_name.clone(),
+            fields,
         });
     }
 
-    // Step 2: Calculate bounding box from geometries
+    // Step 3: Calculate bounding box from geometries
     let bbox = calculate_bbox_from_geometries(&geometries);
 
-    // Step 3: Create tile iterator
+    // Step 4: Create tile iterator
     Ok(TileGeneration {
         tiles: TileIterator::new(geometries, bbox, config.clone()),
         bounds: bbox,
         layer_name: config.layer_name.clone(),
+        fields,
     })
 }
 

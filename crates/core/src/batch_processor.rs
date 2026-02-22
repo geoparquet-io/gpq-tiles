@@ -16,6 +16,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 
 use crate::tile::TileBounds;
 use crate::{Error, Result};
+use std::collections::HashMap;
 
 /// Process geometries in a GeoParquet file batch-by-batch.
 ///
@@ -220,6 +221,59 @@ pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
     }
 
     Ok(bounds)
+}
+
+/// Extract field metadata from a GeoParquet file's schema.
+///
+/// Returns a mapping of field names to MVT-style types:
+/// - "String" for string/utf8 fields
+/// - "Number" for numeric fields (int, float, etc.)
+/// - "Boolean" for boolean fields
+///
+/// Geometry columns are excluded from the result.
+pub fn extract_field_metadata(path: &Path) -> Result<HashMap<String, String>> {
+    use arrow_schema::DataType;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+    let schema = builder.schema();
+    let mut fields = HashMap::new();
+
+    for field in schema.fields() {
+        let name = field.name();
+
+        // Skip geometry columns
+        if name == "geometry" || name.contains("geom") {
+            continue;
+        }
+
+        // Map Arrow types to MVT-style types
+        let mvt_type = match field.data_type() {
+            DataType::Utf8 | DataType::LargeUtf8 => "String",
+            DataType::Boolean => "Boolean",
+            DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64 => "Number",
+            // Skip complex types (lists, structs, binary, etc.)
+            _ => continue,
+        };
+
+        fields.insert(name.clone(), mvt_type.to_string());
+    }
+
+    Ok(fields)
 }
 
 #[cfg(test)]
