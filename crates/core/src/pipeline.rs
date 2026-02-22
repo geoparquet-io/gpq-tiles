@@ -288,6 +288,53 @@ pub fn generate_tiles(
     Ok(TileIterator::new(geometries, bbox, config.clone()))
 }
 
+/// Generate vector tiles from pre-loaded geometries.
+///
+/// This is a lower-level function useful for benchmarking and library consumers
+/// who have already loaded geometries. It bypasses file I/O, which makes it ideal
+/// for performance testing.
+///
+/// # Arguments
+///
+/// * `geometries` - Pre-loaded geometries (will be sorted by spatial index)
+/// * `config` - Tiling configuration
+///
+/// # Returns
+///
+/// An iterator of `Result<GeneratedTile>`, yielding each generated tile.
+/// Empty tiles (no features after clipping) are skipped.
+///
+/// # Example
+///
+/// ```no_run
+/// use gpq_tiles_core::pipeline::{generate_tiles_from_geometries, TilerConfig};
+/// use gpq_tiles_core::batch_processor::extract_geometries;
+/// use std::path::Path;
+///
+/// // Pre-load geometries (e.g., in benchmark setup)
+/// let geometries = extract_geometries(Path::new("input.parquet")).unwrap();
+///
+/// // Then benchmark just the tiling
+/// let config = TilerConfig::new(0, 10);
+/// let tiles: Vec<_> = generate_tiles_from_geometries(geometries, &config)
+///     .unwrap()
+///     .collect();
+/// ```
+pub fn generate_tiles_from_geometries(
+    geometries: Vec<geo::Geometry<f64>>,
+    config: &TilerConfig,
+) -> Result<impl Iterator<Item = Result<GeneratedTile>>> {
+    if geometries.is_empty() {
+        return Ok(TileIterator::empty());
+    }
+
+    // Calculate bounding box from geometries
+    let bbox = calculate_bbox_from_geometries(&geometries);
+
+    // Create tile iterator (sorting happens inside)
+    Ok(TileIterator::new(geometries, bbox, config.clone()))
+}
+
 /// Calculate bounding box from a collection of geometries.
 fn calculate_bbox_from_geometries(geometries: &[geo::Geometry<f64>]) -> TileBounds {
     use geo::BoundingRect;
