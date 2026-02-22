@@ -44,6 +44,7 @@ pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod simplify;
+pub mod spatial_index;
 pub mod tile;
 pub mod validate;
 

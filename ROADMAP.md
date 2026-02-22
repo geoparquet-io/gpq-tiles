@@ -55,7 +55,7 @@ Produce functional vector tiles:
 
 **Final Status**: 122 tests passing. Full pipeline complete: GeoParquet → clip → simplify → MVT → PMTiles.
 
-**Current**: 226 tests (220 unit + 6 doc tests) after Phase 3 completion with density-based dropping.
+**Current**: 250 tests (242 unit + 8 doc tests) after Phase 4 spatial indexing.
 
 #### Golden Comparison Results
 
@@ -117,11 +117,44 @@ let config = TilerConfig::new()
 
 **Note**: Our grid-based approach differs from tippecanoe's Hilbert curve ordering. See `docs/ARCHITECTURE.md` for details.
 
-### Phase 4: Parallelism
+### Phase 4: Parallelism 🚧 IN PROGRESS
 
-Leverage Rust's concurrency for performance:
+Leverage Rust's concurrency for performance.
+
+#### Step 1: Spatial Indexing ✅ COMPLETE
+
+Instead of R-tree, we implemented **space-filling curve sorting** following tippecanoe's approach:
+
+```rust
+use gpq_tiles_core::spatial_index::{sort_by_spatial_index, encode_hilbert};
+
+// Sort features by Hilbert curve index before tile generation
+sort_by_spatial_index(&mut features, true);  // true = use Hilbert curve
+```
+
+**Why space-filling curves instead of R-tree?**
+
+| Approach | Memory | Cache Locality | Streaming | Complexity |
+|----------|--------|----------------|-----------|------------|
+| R-tree | +30-50% overhead | Random access | Hard | Tree balancing |
+| Space-filling sort | No overhead | Sequential access | Natural | Simple sort |
+
+Tippecanoe uses this approach because:
+1. **Sort once, scan sequentially** — no random spatial queries needed
+2. **Cache-friendly** — features for the same tile are adjacent in memory
+3. **Streaming-ready** — can sort externally and process in passes
+4. **Parallel-friendly** — sorted stream partitions cleanly by spatial region
+
+**Implemented in `spatial_index.rs` (22 tests):**
+- `encode_zorder()` / `decode_zorder()` — Morton curve (matches tippecanoe's `encode_quadkey`)
+- `encode_hilbert()` / `decode_hilbert()` — Hilbert curve (better locality, tippecanoe's `-ah` flag)
+- `sort_by_spatial_index()` — Sort features for efficient tile generation
+- `lng_lat_to_world_coords()` — Geographic to 32-bit world coordinates
+
+#### Step 2: Rayon Parallelization 🔲 TODO
+
 - Parallelize tile generation within each zoom level using `rayon`
-- Implement spatial indexing (R-tree via `rstar`) for efficient feature lookup
+- Partition sorted features by spatial region for parallel processing
 
 **Zoom levels remain sequential** to preserve feature dropping semantics.
 

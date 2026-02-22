@@ -184,6 +184,7 @@ gpq-tiles/
 | Output format | PMTiles | PMTiles, MBTiles |
 | Language | Rust | C++ |
 | Feature dropping | Density-based (MVP) | Multiple strategies |
+| Spatial indexing | Hilbert/Z-order curves | Hilbert/Z-order curves |
 | Parallelism | Per-tile (Rayon) | Per-zoom |
 | Python bindings | Native (pyo3) | CLI wrapper |
 
@@ -206,8 +207,16 @@ gpq-tiles/
   - [x] Golden comparison tests against tippecanoe (6 tests)
   - [x] CI/CD with coverage, benchmarks, mutation testing
 
-- [ ] **Phase 3: Feature Dropping** - Density-based optimization 🚧
-- [ ] **Phase 4: Parallelism** - Rayon + spatial indexing
+- [x] **Phase 3: Feature Dropping** - Density-based optimization ✅
+  - [x] Tiny polygon dropping (diffuse probability)
+  - [x] Line dropping (coordinate quantization)
+  - [x] Point thinning (1/2.5 per zoom)
+  - [x] Density-based dropping (grid-cell limiting)
+
+- [ ] **Phase 4: Parallelism** - Space-filling curves + Rayon 🚧
+  - [x] Spatial indexing via Hilbert/Z-order curves (22 tests)
+  - [ ] Rayon parallel tile generation
+
 - [ ] **Phase 5: Python Integration** - Production-ready bindings
 
 See the full [development roadmap](ROADMAP.md) for details.
@@ -230,7 +239,7 @@ Contributions are welcome! Please:
 This project follows a layered testing approach:
 
 1. **Unit tests**: Fast, focused tests for algorithmic correctness
-   - **Current**: 203 tests passing across all modules
+   - **Current**: 250 tests passing (242 unit + 8 doc tests)
 2. **Property-based tests**: `proptest` for edge cases (geometry round-trips, tile coordinate invariants)
 3. **Integration tests**: GeoParquet → PMTiles pipelines with golden file comparison
    - Semantic comparison against tippecanoe output (not byte-exact)

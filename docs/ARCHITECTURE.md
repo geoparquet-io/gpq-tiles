@@ -114,6 +114,45 @@ preserves spatial distribution; ours is simpler and faster.
 - `test_document_low_zoom_feature_dropping_difference` - documents expected differences
 - `test_golden_polygon_area_preserved_z10` - verifies area preservation
 
+## Spatial Indexing Strategy
+
+**We use space-filling curve sorting, not R-tree.**
+
+This matches tippecanoe's approach: sort features by Hilbert/Z-order index, then scan sequentially.
+
+### Why Not R-tree?
+
+| Consideration | R-tree | Space-filling Sort |
+|---------------|--------|-------------------|
+| Memory overhead | +30-50% for tree structure | None |
+| Access pattern | Random (cache-unfriendly) | Sequential (cache-friendly) |
+| Streaming support | Difficult | Natural |
+| Implementation | Tree balancing, complex | Standard sort |
+| Parallelization | Concurrent access issues | Clean partitioning |
+
+### How It Works
+
+1. **Compute spatial index** for each feature's centroid using Hilbert curve encoding
+2. **Sort features** by their index — spatially adjacent features become sequentially adjacent
+3. **Process tiles** — features for each tile are now clustered together in the sequence
+
+```rust
+use gpq_tiles_core::spatial_index::sort_by_spatial_index;
+
+// Before tile generation, sort by Hilbert curve
+sort_by_spatial_index(&mut features, true);
+
+// Now iterate through features — they're spatially clustered
+// All features for tile (z=10, x=512, y=384) will be adjacent
+```
+
+### Hilbert vs Z-Order
+
+- **Z-order (Morton)**: Bit interleaving, simple, but has "jumps" at quadrant boundaries
+- **Hilbert curve**: More complex rotation algorithm, but spatially adjacent points are *always* close in the 1D index
+
+We support both, defaulting to Hilbert (matches tippecanoe's `-ah` flag recommendation).
+
 ## Module Structure
 
 ```
@@ -126,6 +165,7 @@ crates/core/src/
 ├── mvt.rs              # MVT protobuf encoding (with auto winding correction)
 ├── pmtiles_writer.rs   # Custom PMTiles v3 writer
 ├── feature_drop.rs     # Tippecanoe-compatible dropping algorithms
+├── spatial_index.rs    # Space-filling curve sorting (Hilbert/Z-order)
 ├── pipeline.rs         # Tile generation orchestration
 ├── batch_processor.rs  # GeoArrow batch iteration
 └── golden.rs           # Golden comparison tests
