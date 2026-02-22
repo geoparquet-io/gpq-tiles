@@ -27,6 +27,8 @@ rstar = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 flate2 = "1"
+brotli = "7"
+zstd = "0.13"
 
 [build-dependencies]
 prost-build = { workspace = true }

@@ -4,7 +4,7 @@
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use gpq_tiles_core::{Config, Converter, DropDensity, PropertyFilter};
+use gpq_tiles_core::{Compression, Config, Converter, DropDensity, PropertyFilter};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
@@ -55,6 +55,10 @@ struct Args {
     #[arg(short = 'X', long = "exclude-all")]
     exclude_all: bool,
 
+    /// Compression algorithm for tiles (gzip, brotli, zstd, none)
+    #[arg(long, default_value = "gzip")]
+    compression: String,
+
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
@@ -93,6 +97,15 @@ impl Args {
             Ok(PropertyFilter::None)
         }
     }
+
+    fn parse_compression(&self) -> Result<Compression> {
+        Compression::from_str(&self.compression).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Invalid compression: '{}'. Valid options: none, gzip, brotli, zstd",
+                self.compression
+            )
+        })
+    }
 }
 
 fn main() -> Result<()> {
@@ -102,21 +115,26 @@ fn main() -> Result<()> {
     let log_level = if args.verbose { "debug" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    // Parse property filter first (before moving args fields)
+    // Parse options before building config (avoid borrow-after-move)
+    let drop_density = args
+        .parse_drop_density()
+        .context("Failed to parse drop density")?;
     let property_filter = args
         .parse_property_filter()
         .context("Failed to parse property filter")?;
+    let compression = args
+        .parse_compression()
+        .context("Failed to parse compression")?;
 
     // Build configuration
     let config = Config {
         min_zoom: args.min_zoom,
         max_zoom: args.max_zoom,
         extent: 4096,
-        drop_density: args
-            .parse_drop_density()
-            .context("Failed to parse drop density")?,
+        drop_density,
         layer_name: args.layer_name,
         property_filter,
+        compression,
     };
 
     // Create converter and run

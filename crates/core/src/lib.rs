@@ -29,6 +29,7 @@ pub mod vector_tile {
 
 pub mod batch_processor;
 pub mod clip;
+pub mod compression;
 pub mod feature_drop;
 #[cfg(test)]
 mod golden;
@@ -45,6 +46,8 @@ pub mod validate;
 
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
+// Re-export Compression from compression module for public API
+pub use compression::Compression;
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]
@@ -83,6 +86,8 @@ pub struct Config {
     /// Property filter for controlling which attributes are included in output tiles.
     /// Matches tippecanoe's -x (exclude), -y (include), and -X (exclude-all) flags.
     pub property_filter: property_filter::PropertyFilter,
+    /// Compression algorithm for tile data (default: Gzip)
+    pub compression: Compression,
 }
 
 impl Default for Config {
@@ -94,6 +99,7 @@ impl Default for Config {
             drop_density: DropDensity::Medium,
             layer_name: None,
             property_filter: property_filter::PropertyFilter::None,
+            compression: Compression::default(),
         }
     }
 }
@@ -163,8 +169,8 @@ impl Converter {
         let tile_gen = generate_tiles_with_bounds(input_path, &tiler_config)
             .map_err(|e| Error::GeoParquetRead(e.to_string()))?;
 
-        // Write tiles to PMTiles with proper bounds, layer name, and field metadata
-        let mut writer = PmtilesWriter::new();
+        // Write tiles to PMTiles with proper bounds, layer name, field metadata, and compression
+        let mut writer = PmtilesWriter::with_compression(self.config.compression);
         writer.set_bounds(&tile_gen.bounds);
         writer.set_layer_name(&tile_gen.layer_name);
         writer.set_fields(tile_gen.fields);
