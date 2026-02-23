@@ -55,6 +55,8 @@ pub use property_filter::PropertyFilter;
 pub use compression::Compression;
 // Re-export StreamingPmtilesWriter and related types
 pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
+// Re-export progress types for CLI usage
+pub use pipeline::{ProgressCallback, ProgressEvent};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]

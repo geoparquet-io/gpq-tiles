@@ -188,62 +188,170 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
 /// (e.g., a U-shaped polygon clipped across its opening).
 fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
-    if let Some(rect) = poly.bounding_rect() {
-        if !intersects_bounds(&rect, bounds) {
-            return None;
+    let poly_rect = poly.bounding_rect()?;
+    if !intersects_bounds(&poly_rect, bounds) {
+        return None;
+    }
+
+    // FAST PATH: If polygon is fully inside bounds, return as-is (no clipping needed)
+    if poly_rect.min().x >= bounds.lng_min
+        && poly_rect.max().x <= bounds.lng_max
+        && poly_rect.min().y >= bounds.lat_min
+        && poly_rect.max().y <= bounds.lat_max
+    {
+        return Some(Geometry::Polygon(poly.clone()));
+    }
+
+    // Use Sutherland-Hodgman for axis-aligned rect clipping (O(n) vs O(n²))
+    let clipped_exterior = sutherland_hodgman_clip(poly.exterior(), bounds);
+    if clipped_exterior.0.len() < 3 {
+        return None;
+    }
+
+    // Clip interior rings (holes)
+    let mut clipped_interiors = Vec::new();
+    for interior in poly.interiors() {
+        let clipped_interior = sutherland_hodgman_clip(interior, bounds);
+        if clipped_interior.0.len() >= 3 {
+            clipped_interiors.push(clipped_interior);
         }
     }
 
-    let clip_rect = Rect::new(
-        Coord {
-            x: bounds.lng_min,
-            y: bounds.lat_min,
-        },
-        Coord {
-            x: bounds.lng_max,
-            y: bounds.lat_max,
+    Some(Geometry::Polygon(Polygon::new(
+        clipped_exterior,
+        clipped_interiors,
+    )))
+}
+
+/// Sutherland-Hodgman polygon clipping algorithm for axis-aligned rectangles.
+/// O(n) complexity vs O(n²) for general polygon intersection.
+fn sutherland_hodgman_clip(ring: &LineString<f64>, bounds: &TileBounds) -> LineString<f64> {
+    let mut output: Vec<Coord<f64>> = ring.0.clone();
+
+    // Clip against each edge of the rectangle
+    // Left edge
+    output = clip_against_edge(
+        &output,
+        |c| c.x >= bounds.lng_min,
+        |c1, c2| {
+            let t = (bounds.lng_min - c1.x) / (c2.x - c1.x);
+            Coord {
+                x: bounds.lng_min,
+                y: c1.y + t * (c2.y - c1.y),
+            }
         },
     );
-    let clip_poly = clip_rect.to_polygon();
 
-    // Use intersection for polygon-polygon clipping
-    let clipped = poly.intersection(&clip_poly);
+    // Right edge
+    output = clip_against_edge(
+        &output,
+        |c| c.x <= bounds.lng_max,
+        |c1, c2| {
+            let t = (bounds.lng_max - c1.x) / (c2.x - c1.x);
+            Coord {
+                x: bounds.lng_max,
+                y: c1.y + t * (c2.y - c1.y),
+            }
+        },
+    );
 
-    match clipped.0.len() {
-        0 => None,
-        1 => Some(Geometry::Polygon(clipped.0.into_iter().next().unwrap())),
-        _ => Some(Geometry::MultiPolygon(clipped)),
+    // Bottom edge
+    output = clip_against_edge(
+        &output,
+        |c| c.y >= bounds.lat_min,
+        |c1, c2| {
+            let t = (bounds.lat_min - c1.y) / (c2.y - c1.y);
+            Coord {
+                x: c1.x + t * (c2.x - c1.x),
+                y: bounds.lat_min,
+            }
+        },
+    );
+
+    // Top edge
+    output = clip_against_edge(
+        &output,
+        |c| c.y <= bounds.lat_max,
+        |c1, c2| {
+            let t = (bounds.lat_max - c1.y) / (c2.y - c1.y);
+            Coord {
+                x: c1.x + t * (c2.x - c1.x),
+                y: bounds.lat_max,
+            }
+        },
+    );
+
+    // Close the ring if needed
+    if !output.is_empty() && output.first() != output.last() {
+        output.push(output[0]);
     }
+
+    LineString::new(output)
+}
+
+/// Clip polygon vertices against a single edge
+fn clip_against_edge<F, I>(vertices: &[Coord<f64>], inside: F, intersect: I) -> Vec<Coord<f64>>
+where
+    F: Fn(&Coord<f64>) -> bool,
+    I: Fn(&Coord<f64>, &Coord<f64>) -> Coord<f64>,
+{
+    if vertices.is_empty() {
+        return Vec::new();
+    }
+
+    let mut output = Vec::with_capacity(vertices.len());
+
+    for i in 0..vertices.len() {
+        let current = &vertices[i];
+        let next = &vertices[(i + 1) % vertices.len()];
+
+        let current_inside = inside(current);
+        let next_inside = inside(next);
+
+        if current_inside {
+            output.push(*current);
+            if !next_inside {
+                // Exiting: add intersection
+                output.push(intersect(current, next));
+            }
+        } else if next_inside {
+            // Entering: add intersection
+            output.push(intersect(current, next));
+        }
+    }
+
+    output
 }
 
 /// Clip a multipolygon to bounds
 fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<MultiPolygon<f64>> {
     // Quick rejection test
-    if let Some(rect) = mp.bounding_rect() {
-        if !intersects_bounds(&rect, bounds) {
-            return None;
+    let mp_rect = mp.bounding_rect()?;
+    if !intersects_bounds(&mp_rect, bounds) {
+        return None;
+    }
+
+    // FAST PATH: If multipolygon is fully inside bounds, return as-is
+    if mp_rect.min().x >= bounds.lng_min
+        && mp_rect.max().x <= bounds.lng_max
+        && mp_rect.min().y >= bounds.lat_min
+        && mp_rect.max().y <= bounds.lat_max
+    {
+        return Some(mp.clone());
+    }
+
+    // Clip each polygon individually using fast Sutherland-Hodgman
+    let mut clipped_polys = Vec::new();
+    for poly in &mp.0 {
+        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
+            clipped_polys.push(clipped);
         }
     }
 
-    let clip_rect = Rect::new(
-        Coord {
-            x: bounds.lng_min,
-            y: bounds.lat_min,
-        },
-        Coord {
-            x: bounds.lng_max,
-            y: bounds.lat_max,
-        },
-    );
-    let clip_poly = clip_rect.to_polygon();
-
-    // Use intersection for polygon-polygon clipping
-    let clipped = mp.intersection(&clip_poly);
-
-    if clipped.0.is_empty() {
+    if clipped_polys.is_empty() {
         None
     } else {
-        Some(clipped)
+        Some(MultiPolygon::new(clipped_polys))
     }
 }
 
