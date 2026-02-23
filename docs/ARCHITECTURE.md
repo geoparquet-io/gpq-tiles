@@ -69,6 +69,52 @@ Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (~1000 build
 - Area preservation after clip+simplify: 88%
 - All zoom levels produce valid MVT tiles
 
+## Streaming Processing
+
+**Design:** Row-group-based streaming where memory is bounded by the largest row group, not file size.
+
+```
+peak_memory ≈ row_group_decoded + active_tile_buffers
+           ≈ 100MB            + 50MB (typical)
+           ≈ 150MB per row group being processed
+```
+
+### Row Group Iterator
+
+```rust
+// Process one row group at a time
+for row_group in row_group_iterator(path)? {
+    let features = decode_row_group(&row_group)?;
+    for feature in features {
+        // Bucket by tile across all zoom levels
+        for tile_coord in tiles_intersecting(&feature.geom, config) {
+            let clipped = clip_to_tile(&feature.geom, &tile_coord)?;
+            tile_buckets.entry(tile_coord).or_default().push(clipped);
+        }
+    }
+    // Encode and yield tiles for this row group
+}
+```
+
+### File Quality Detection
+
+Before streaming, `assess_quality()` checks input files and warns about suboptimal formats:
+
+| Check | Cost | Action |
+|-------|------|--------|
+| Missing `geo` metadata | O(1) | Warn: "File missing GeoParquet metadata" |
+| No row group bboxes | O(1) | Warn: "Cannot skip spatially" |
+| Few row groups for size | O(1) | Warn: "Large file limits streaming efficiency" |
+| Not Hilbert-sorted | O(1000) | Warn: "File not spatially sorted" (sampled) |
+
+Warnings recommend optimizing with [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io):
+
+```
+gpq optimize input.parquet -o optimized.parquet --hilbert
+```
+
+Use `--quiet` to suppress warnings. See `quality.rs` for implementation.
+
 ## Module Structure
 
 ```
@@ -82,7 +128,8 @@ crates/core/src/
 ├── pmtiles_writer.rs   # PMTiles v3 writer
 ├── feature_drop.rs     # Dropping algorithms
 ├── spatial_index.rs    # Hilbert/Z-order curves
-├── pipeline.rs         # Tile generation
-├── batch_processor.rs  # GeoArrow iteration
+├── pipeline.rs         # Tile generation (streaming + non-streaming)
+├── batch_processor.rs  # GeoArrow iteration (row group support)
+├── quality.rs          # File quality assessment
 └── golden.rs           # Golden tests
 ```

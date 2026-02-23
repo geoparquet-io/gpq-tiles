@@ -6,7 +6,7 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
-**Status:** Phase 5 complete (272 tests). See `ROADMAP.md` for details.
+**Status:** Phase 5 complete (329 tests). See `ROADMAP.md` for details.
 
 ## Documentation Philosophy
 
@@ -39,31 +39,40 @@ cargo test --package gpq-tiles-core <module> -- --nocapture  # Verify green
 git commit -m "feat: implement X (TDD green)"
 ```
 
-### 2. Arrow/GeoArrow is the Data Layer
+### 2. Arrow/GeoArrow: Columnar I/O, Not Zero-Copy Geometry Processing
 
-**The entire point of this library is zero-copy Arrow integration.**
+**Arrow gives us efficient columnar I/O and streaming, but geometry operations require `geo::Geometry` conversion.**
+
+What we GET from Arrow/GeoArrow:
+- Columnar decoding (only geometry column parsed, properties lazy-loaded)
+- Row-group streaming (memory = O(row_group), not O(file))
+- No double-copy (Arrow → geo directly, not Arrow → WKB → geo)
+
+What we DON'T get (yet):
+- Zero-copy clipping (geo::BooleanOps requires owned `geo::Polygon`)
+- Zero-copy simplification (geo::Simplify requires owned `geo::LineString`)
 
 DO:
 ```rust
-// Process geometries within Arrow batch lifetime
+// Iterate geometries within Arrow batch, convert only what's needed
 for batch in reader {
     let geom_col = batch.column(geom_idx);
-    let polygon_array = PolygonArray::try_from(geom_col)?;
-    for i in 0..polygon_array.len() {
-        let poly_ref = polygon_array.value(i);  // Borrows from batch
-        // Process immediately, write to tile
+    let geom_array = geoarrow::array::from_arrow_array(geom_col, geom_field)?;
+    for geom in geom_array.iter() {
+        let geo_geom: geo::Geometry = geom.try_to_geometry()?;  // Conversion needed for clipping
+        let clipped = clip_geometry(&geo_geom, &tile_bounds)?;
+        // Process immediately, don't accumulate all features
     }
 }
 ```
 
 DO NOT:
 ```rust
-// WRONG: Deserializing every geometry defeats Arrow's purpose
+// WRONG: Deserializing to WKB first defeats Arrow's columnar benefits
 let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
-geometries.push((geom, row_offset + i));  // Heap allocation per feature!
 ```
 
-**Exception:** Complex operations (boolean clipping) may require temporary `geo::Geometry` conversion.
+**See also:** `docs/plans/2026-02-23-streaming-design.md` for streaming architecture details.
 
 ### 3. Reference Implementations (CRITICAL)
 
@@ -117,6 +126,8 @@ cargo run --package gpq-tiles -- input.parquet output.pmtiles
 3. **PMTiles crate**: Read-only — we implement our own v3 writer
 4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
 5. **rstar**: Listed in deps but we use space-filling curves for spatial indexing instead
+6. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
+7. **Streaming vs non-streaming**: `generate_tiles_streaming()` exists but `generate_tiles()` is the default. Streaming is for files larger than memory
 
 ## Setup
 
