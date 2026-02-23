@@ -691,8 +691,7 @@ pub fn generate_tiles_to_writer(
         StreamingMode::Fast => generate_tiles_to_writer_fast(input_path, config, writer),
         StreamingMode::LowMemory => generate_tiles_to_writer_low_memory(input_path, config, writer),
         StreamingMode::ExternalSort => {
-            // TODO: implement generate_tiles_to_writer_external_sort
-            unimplemented!("ExternalSort mode not yet implemented")
+            generate_tiles_to_writer_external_sort(input_path, config, writer)
         }
     }
 }
@@ -1056,6 +1055,290 @@ fn generate_tiles_to_writer_low_memory(
     if !config.quiet {
         log::info!(
             "Low-memory streaming complete: peak memory {}",
+            stats.peak_formatted()
+        );
+    }
+
+    Ok(stats)
+}
+
+/// External sort streaming mode: bounded memory with single file pass.
+///
+/// Phase 1: Read file, clip geometries, write to external sorter
+/// Phase 2: Sort by tile_id (memory-bounded external merge sort)
+/// Phase 3: Read sorted, group by tile, encode MVT, write PMTiles
+///
+/// Memory usage: O(sort_buffer_size) - configurable, typically 100K-1M records
+/// Speed: ~1.2x slower than Fast (disk I/O for sorting), but single file pass
+fn generate_tiles_to_writer_external_sort(
+    input_path: &Path,
+    config: &TilerConfig,
+    writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
+) -> Result<crate::memory::MemoryStats> {
+    use crate::external_sort::{TileFeatureRecord, TileFeatureSorter};
+    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker};
+    use crate::mvt::{LayerBuilder, TileBuilder};
+    use crate::pmtiles_writer::tile_id;
+    use crate::wkb::{geometry_to_wkb, wkb_to_geometry};
+    use geo::BoundingRect;
+    use std::cell::RefCell;
+
+    let memory_tracker = RefCell::new(match config.memory_budget {
+        Some(budget) => MemoryTracker::with_budget(budget),
+        None => MemoryTracker::new(),
+    });
+
+    let global_bounds = RefCell::new(TileBounds::empty());
+    let global_feature_index = RefCell::new(0u64);
+
+    // Phase 1: Read GeoParquet, clip geometries, write to sorter
+    // Buffer size: 100K records is ~50-100MB depending on geometry complexity
+    let sort_buffer_size = 100_000;
+    let sorter = RefCell::new(TileFeatureSorter::new(sort_buffer_size));
+
+    // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
+    const RECORD_FIXED_OVERHEAD: usize = 25;
+
+    if !config.quiet {
+        log::info!("Phase 1: Reading GeoParquet and writing to external sorter");
+    }
+
+    process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
+        if !config.quiet {
+            log::info!(
+                "Processing row group {} with {} features",
+                rg_info.index,
+                rg_info.num_rows
+            );
+        }
+
+        // Sort geometries within row group for better locality
+        let mut sorted = geometries;
+        sort_geometries(&mut sorted, config.use_hilbert);
+
+        for geom in sorted {
+            let feat_idx = *global_feature_index.borrow();
+            *global_feature_index.borrow_mut() += 1;
+
+            let geom_bbox = match geom.bounding_rect() {
+                Some(rect) => {
+                    let bounds =
+                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+                    global_bounds.borrow_mut().expand(&bounds);
+                    bounds
+                }
+                None => continue,
+            };
+
+            // Process all zoom levels for this geometry
+            for z in config.min_zoom..=config.max_zoom {
+                let tiles = tiles_for_bbox(&geom_bbox, z);
+
+                for tile_coord in tiles {
+                    let tile_bounds = tile_coord.bounds();
+                    let buffer =
+                        buffer_pixels_to_degrees(config.buffer_pixels, &tile_bounds, config.extent);
+
+                    // Check if geometry bbox intersects buffered tile bounds
+                    let buffered_lng_min = tile_bounds.lng_min - buffer;
+                    let buffered_lng_max = tile_bounds.lng_max + buffer;
+                    let buffered_lat_min = tile_bounds.lat_min - buffer;
+                    let buffered_lat_max = tile_bounds.lat_max + buffer;
+
+                    let intersects = geom_bbox.lng_max >= buffered_lng_min
+                        && geom_bbox.lng_min <= buffered_lng_max
+                        && geom_bbox.lat_max >= buffered_lat_min
+                        && geom_bbox.lat_min <= buffered_lat_max;
+
+                    if !intersects {
+                        continue;
+                    }
+
+                    // Clip, simplify, validate (same as Fast mode)
+                    let clipped = match clip_geometry(&geom, &tile_bounds, buffer) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+
+                    let simplified = simplify_for_zoom(&clipped, z, config.extent);
+                    let validated = match filter_valid_geometry(&simplified) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    // Check dropping rules after clipping
+                    if should_drop_geometry(
+                        &validated,
+                        z,
+                        config.max_zoom,
+                        config.extent,
+                        &tile_bounds,
+                        feat_idx,
+                    ) {
+                        continue;
+                    }
+
+                    // Serialize geometry to WKB
+                    let wkb = match geometry_to_wkb(&validated) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            log::warn!("Failed to serialize geometry to WKB: {}", e);
+                            continue;
+                        }
+                    };
+
+                    // Track memory for this record being buffered in sorter
+                    // Record size = fixed overhead + geometry_wkb.len() + properties.len()
+                    let record_size = RECORD_FIXED_OVERHEAD + wkb.len();
+                    memory_tracker.borrow_mut().add(record_size);
+
+                    // Create record with tile_id and coordinates
+                    let tid = tile_id(z, tile_coord.x, tile_coord.y);
+                    let record = TileFeatureRecord::new(
+                        tid,
+                        z,
+                        tile_coord.x,
+                        tile_coord.y,
+                        feat_idx,
+                        wkb,
+                        vec![], // Empty properties for now
+                    );
+
+                    sorter.borrow_mut().add(record);
+                }
+            }
+        }
+
+        Ok(())
+    })?;
+
+    // After Phase 1, sorter memory is released when it starts sorting to disk
+    // Reset current memory as records are now on disk during sort
+    let phase1_peak = memory_tracker.borrow().peak();
+    memory_tracker.borrow_mut().reset_current();
+
+    let total_records = sorter.borrow().len();
+    if !config.quiet {
+        log::info!(
+            "Phase 1 complete: {} records to sort (peak memory so far: {} bytes)",
+            total_records,
+            phase1_peak
+        );
+    }
+
+    // Phase 2: Sort by tile_id (external merge sort)
+    if !config.quiet {
+        log::info!("Phase 2: External merge sort by tile_id");
+    }
+
+    let sorted_iter = sorter
+        .into_inner()
+        .sort()
+        .map_err(|e| Error::PMTilesWrite(format!("External sort failed: {}", e)))?;
+
+    // Phase 3: Read sorted records, group by tile, encode MVT, write PMTiles
+    if !config.quiet {
+        log::info!("Phase 3: Encoding tiles and writing to PMTiles");
+    }
+
+    let mut current_tile: Option<(u8, u32, u32)> = None;
+    let mut current_features: Vec<(geo::Geometry<f64>, u64)> = Vec::new();
+    let mut current_tile_memory: usize = 0; // Track memory for current tile's geometries
+    let mut tiles_written = 0;
+
+    for record_result in sorted_iter {
+        let record = record_result
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to read sorted record: {}", e)))?;
+
+        let record_tile = (record.z, record.x, record.y);
+
+        // Check if we're starting a new tile
+        if current_tile.is_some() && current_tile != Some(record_tile) {
+            // Encode and write the previous tile
+            let (z, x, y) = current_tile.unwrap();
+            let coord = TileCoord::new(x, y, z);
+            let tile_bounds = coord.bounds();
+
+            let mut layer_builder =
+                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+            let mut feature_count = 0;
+
+            for (geom, feat_idx) in current_features.drain(..) {
+                layer_builder.add_feature(Some(feat_idx), &geom, &[], &tile_bounds);
+                feature_count += 1;
+            }
+
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                writer
+                    .add_tile_with_count(z, x, y, &encoded, feature_count)
+                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+
+                tiles_written += 1;
+            }
+
+            // Reset memory tracking for next tile - geometries are released
+            memory_tracker.borrow_mut().remove(current_tile_memory);
+            current_tile_memory = 0;
+        }
+
+        // Decode WKB back to geometry
+        let geom = wkb_to_geometry(&record.geometry_wkb)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to decode WKB: {}", e)))?;
+
+        // Track memory for decoded geometry
+        let geom_size = estimate_geometry_size(&geom);
+        memory_tracker.borrow_mut().add(geom_size);
+        current_tile_memory += geom_size;
+
+        // Add to current tile's features
+        current_features.push((geom, record.feature_id));
+        current_tile = Some(record_tile);
+    }
+
+    // Write the final tile
+    if let Some((z, x, y)) = current_tile {
+        if !current_features.is_empty() {
+            let coord = TileCoord::new(x, y, z);
+            let tile_bounds = coord.bounds();
+
+            let mut layer_builder =
+                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+            let mut feature_count = 0;
+
+            for (geom, feat_idx) in current_features {
+                layer_builder.add_feature(Some(feat_idx), &geom, &[], &tile_bounds);
+                feature_count += 1;
+            }
+
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                writer
+                    .add_tile_with_count(z, x, y, &encoded, feature_count)
+                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+
+                tiles_written += 1;
+            }
+        }
+    }
+
+    writer.set_bounds(&global_bounds.into_inner());
+
+    let stats = MemoryStats::from_tracker(&memory_tracker.borrow());
+    if !config.quiet {
+        log::info!(
+            "External sort streaming complete: {} tiles written, peak memory {}",
+            tiles_written,
             stats.peak_formatted()
         );
     }

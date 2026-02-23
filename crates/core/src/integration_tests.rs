@@ -75,6 +75,7 @@ mod tests {
 
     /// Simplified PMTiles header for testing
     #[derive(Debug)]
+    #[allow(dead_code)] // Fields parsed for completeness but only some are used in tests
     struct PmtilesHeader {
         root_dir_offset: u64,
         root_dir_length: u64,

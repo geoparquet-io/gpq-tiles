@@ -43,6 +43,7 @@ use std::io::{Read, Write};
 ///
 /// This struct holds all data needed to include a feature in a vector tile:
 /// - `tile_id`: PMTiles Hilbert-curve ID (determines sort order)
+/// - `z`, `x`, `y`: Tile coordinates (stored to avoid reversing Hilbert curve)
 /// - `feature_id`: Original feature index for debugging/provenance
 /// - `geometry_wkb`: WKB-encoded geometry (clipped to tile if needed)
 /// - `properties`: MessagePack-serialized feature properties
@@ -50,6 +51,12 @@ use std::io::{Read, Write};
 pub struct TileFeatureRecord {
     /// PMTiles tile ID (Hilbert curve order) - primary sort key
     pub tile_id: u64,
+    /// Zoom level
+    pub z: u8,
+    /// Tile X coordinate
+    pub x: u32,
+    /// Tile Y coordinate
+    pub y: u32,
     /// Original feature ID from source data
     pub feature_id: u64,
     /// WKB-encoded geometry
@@ -60,9 +67,20 @@ pub struct TileFeatureRecord {
 
 impl TileFeatureRecord {
     /// Create a new tile feature record.
-    pub fn new(tile_id: u64, feature_id: u64, geometry_wkb: Vec<u8>, properties: Vec<u8>) -> Self {
+    pub fn new(
+        tile_id: u64,
+        z: u8,
+        x: u32,
+        y: u32,
+        feature_id: u64,
+        geometry_wkb: Vec<u8>,
+        properties: Vec<u8>,
+    ) -> Self {
         Self {
             tile_id,
+            z,
+            x,
+            y,
             feature_id,
             geometry_wkb,
             properties,
@@ -177,8 +195,11 @@ mod tests {
 
     #[test]
     fn test_tile_feature_record_creation() {
-        let record = TileFeatureRecord::new(42, 1, vec![1, 2, 3], vec![4, 5, 6]);
+        let record = TileFeatureRecord::new(42, 5, 10, 20, 1, vec![1, 2, 3], vec![4, 5, 6]);
         assert_eq!(record.tile_id, 42);
+        assert_eq!(record.z, 5);
+        assert_eq!(record.x, 10);
+        assert_eq!(record.y, 20);
         assert_eq!(record.feature_id, 1);
         assert_eq!(record.geometry_wkb, vec![1, 2, 3]);
         assert_eq!(record.properties, vec![4, 5, 6]);
@@ -186,9 +207,9 @@ mod tests {
 
     #[test]
     fn test_tile_feature_record_ordering() {
-        let r1 = TileFeatureRecord::new(1, 1, vec![], vec![]);
-        let r2 = TileFeatureRecord::new(2, 1, vec![], vec![]);
-        let r3 = TileFeatureRecord::new(1, 2, vec![], vec![]);
+        let r1 = TileFeatureRecord::new(1, 0, 0, 0, 1, vec![], vec![]);
+        let r2 = TileFeatureRecord::new(2, 0, 0, 0, 1, vec![], vec![]);
+        let r3 = TileFeatureRecord::new(1, 0, 0, 0, 2, vec![], vec![]);
 
         // tile_id is primary sort key
         assert!(r1 < r2);
@@ -200,6 +221,9 @@ mod tests {
     fn test_sortable_encode_decode_roundtrip() {
         let original = TileFeatureRecord::new(
             123456,
+            10,
+            100,
+            200,
             789,
             vec![0x01, 0x02, 0x03, 0x04],
             vec![0x82, 0xa4, b't', b'e', b's', b't'], // MessagePack map
@@ -218,7 +242,7 @@ mod tests {
         assert!(sorter.is_empty());
         assert_eq!(sorter.len(), 0);
 
-        sorter.add(TileFeatureRecord::new(1, 1, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, vec![], vec![]));
         assert!(!sorter.is_empty());
         assert_eq!(sorter.len(), 1);
     }
@@ -228,9 +252,9 @@ mod tests {
         let mut sorter = TileFeatureSorter::new(1000);
 
         // Add records out of order
-        sorter.add(TileFeatureRecord::new(3, 1, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(1, 1, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(2, 1, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(3, 0, 0, 0, 1, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(1, 0, 0, 0, 1, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(2, 0, 0, 0, 1, vec![], vec![]));
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
@@ -245,9 +269,9 @@ mod tests {
         let mut sorter = TileFeatureSorter::new(1000);
 
         // Multiple features in same tile
-        sorter.add(TileFeatureRecord::new(5, 3, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(5, 1, vec![], vec![]));
-        sorter.add(TileFeatureRecord::new(5, 2, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 3, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 1, vec![], vec![]));
+        sorter.add(TileFeatureRecord::new(5, 1, 0, 0, 2, vec![], vec![]));
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
@@ -268,8 +292,24 @@ mod tests {
         let geom2 = vec![0x01, 0x02, 0x00, 0x00, 0x00]; // LineString WKB header
         let props2 = rmp_serde::to_vec(&serde_json::json!({"name": "feature2"})).unwrap();
 
-        sorter.add(TileFeatureRecord::new(2, 1, geom2.clone(), props2.clone()));
-        sorter.add(TileFeatureRecord::new(1, 1, geom1.clone(), props1.clone()));
+        sorter.add(TileFeatureRecord::new(
+            2,
+            0,
+            0,
+            0,
+            1,
+            geom2.clone(),
+            props2.clone(),
+        ));
+        sorter.add(TileFeatureRecord::new(
+            1,
+            0,
+            0,
+            0,
+            1,
+            geom1.clone(),
+            props1.clone(),
+        ));
 
         let sorted: Vec<_> = sorter.sort().unwrap().map(|r| r.unwrap()).collect();
 
@@ -291,6 +331,9 @@ mod tests {
         for i in (0..1000).rev() {
             sorter.add(TileFeatureRecord::new(
                 i,
+                0,
+                0,
+                0,
                 i,
                 vec![i as u8],
                 vec![(i % 256) as u8],
