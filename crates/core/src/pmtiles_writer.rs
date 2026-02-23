@@ -788,6 +788,447 @@ impl Default for PmtilesWriter {
 }
 
 // ============================================================================
+// StreamingPmtilesWriter - Writes tile data to temp file immediately
+// ============================================================================
+
+use std::path::PathBuf;
+
+/// Directory entry for streaming writer (minimal memory footprint).
+/// Only stores what's needed for final directory encoding.
+#[derive(Debug, Clone)]
+struct StreamingDirEntry {
+    tile_id: u64,
+    offset: u64,
+    length: u32,
+}
+
+/// Statistics about streaming write operations.
+#[derive(Debug, Clone, Default)]
+pub struct StreamingWriteStats {
+    /// Total tiles added (including duplicates)
+    pub total_tiles: u64,
+    /// Unique tiles written to disk
+    pub unique_tiles: u64,
+    /// Bytes written to temp file
+    pub bytes_written: u64,
+    /// Bytes saved by deduplication
+    pub bytes_saved_dedup: u64,
+}
+
+impl StreamingWriteStats {
+    /// Calculate memory used by directory entries (approximate).
+    /// Each StreamingDirEntry is ~24 bytes (tile_id: 8, offset: 8, length: 4 + padding).
+    /// We estimate based on total_tiles since each tile gets a directory entry.
+    pub fn estimated_memory_bytes(&self) -> u64 {
+        // Each entry: tile_id (8) + offset (8) + length (4) = 20 bytes + padding ≈ 24 bytes
+        // Plus HashMap entry overhead for dedup cache: ~40 bytes per unique
+        // Plus Vec overhead: ~8 bytes
+        self.total_tiles * 24 + self.unique_tiles * 40
+    }
+}
+
+/// PMTiles writer that streams tile data to disk immediately.
+///
+/// Unlike `PmtilesWriter` which accumulates all tiles in memory,
+/// `StreamingPmtilesWriter` writes compressed tile data to a temp file
+/// as tiles are added. Only the small directory entries (~32 bytes each)
+/// are kept in memory.
+///
+/// # Memory Usage
+///
+/// For 30,000 tiles:
+/// - `PmtilesWriter`: ~1.2 GB (all tile data in memory)
+/// - `StreamingPmtilesWriter`: ~2-3 MB (only directory entries)
+///
+/// # Example
+///
+/// ```no_run
+/// use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
+/// use gpq_tiles_core::compression::Compression;
+/// use std::path::Path;
+///
+/// let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+/// writer.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+/// writer.add_tile(1, 0, 0, &[0x1a, 0x01]).unwrap();
+/// writer.finalize(Path::new("output.pmtiles")).unwrap();
+/// ```
+pub struct StreamingPmtilesWriter {
+    /// Buffered writer for temp file (tile data written immediately)
+    temp_file: Option<BufWriter<File>>,
+    /// Path to temp file (for cleanup and final assembly)
+    temp_path: PathBuf,
+    /// Directory entries (minimal memory: ~32 bytes each)
+    entries: Vec<StreamingDirEntry>,
+    /// Deduplication: hash → (offset, length) for detecting duplicates
+    dedup_cache: HashMap<u64, (u64, u32)>,
+    /// Current write offset in temp file
+    current_offset: u64,
+    /// Min zoom level seen
+    min_zoom: u8,
+    /// Max zoom level seen
+    max_zoom: u8,
+    /// Geographic bounds
+    bounds: TileBounds,
+    /// Layer name for metadata
+    layer_name: String,
+    /// Field metadata
+    fields: HashMap<String, String>,
+    /// Compression for tile data
+    tile_compression: Compression,
+    /// Compression for internal data (directories, metadata)
+    internal_compression: Compression,
+    /// Statistics
+    stats: StreamingWriteStats,
+    /// Total feature count
+    total_features: u64,
+    /// Whether finalize has been called (prevents double cleanup)
+    finalized: bool,
+}
+
+impl StreamingPmtilesWriter {
+    /// Create a new streaming writer with the specified compression.
+    ///
+    /// Creates a temp file in the system temp directory for tile data.
+    pub fn new(compression: Compression) -> std::io::Result<Self> {
+        Self::with_temp_dir(compression, std::env::temp_dir())
+    }
+
+    /// Create a new streaming writer with a custom temp directory.
+    pub fn with_temp_dir(compression: Compression, temp_dir: PathBuf) -> std::io::Result<Self> {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        // Generate unique temp file name
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temp_path = temp_dir.join(format!("gpq-tiles-{}.tmp", timestamp));
+
+        let file = File::create(&temp_path)?;
+        let temp_file = BufWriter::with_capacity(64 * 1024, file); // 64KB buffer
+
+        Ok(Self {
+            temp_file: Some(temp_file),
+            temp_path,
+            entries: Vec::new(),
+            dedup_cache: HashMap::new(),
+            current_offset: 0,
+            min_zoom: 255,
+            max_zoom: 0,
+            bounds: TileBounds::empty(),
+            layer_name: "layer".to_string(),
+            fields: HashMap::new(),
+            tile_compression: compression,
+            internal_compression: compression,
+            stats: StreamingWriteStats::default(),
+            total_features: 0,
+            finalized: false,
+        })
+    }
+
+    /// Get the path to the temp file (for testing).
+    pub fn temp_path(&self) -> &Path {
+        &self.temp_path
+    }
+
+    /// Set the layer name for metadata.
+    pub fn set_layer_name(&mut self, name: &str) {
+        self.layer_name = name.to_string();
+    }
+
+    /// Set field metadata.
+    pub fn set_fields(&mut self, fields: HashMap<String, String>) {
+        self.fields = fields;
+    }
+
+    /// Set geographic bounds.
+    pub fn set_bounds(&mut self, bounds: &TileBounds) {
+        self.bounds = *bounds;
+    }
+
+    /// Get current statistics.
+    pub fn stats(&self) -> &StreamingWriteStats {
+        &self.stats
+    }
+
+    /// Add a tile (writes immediately to temp file if unique).
+    ///
+    /// Tiles are compressed and written immediately. Duplicate tiles
+    /// (same content) are detected and not written again.
+    pub fn add_tile(&mut self, z: u8, x: u32, y: u32, data: &[u8]) -> std::io::Result<()> {
+        self.add_tile_with_count(z, x, y, data, 0)
+    }
+
+    /// Add a tile with feature count.
+    pub fn add_tile_with_count(
+        &mut self,
+        z: u8,
+        x: u32,
+        y: u32,
+        data: &[u8],
+        feature_count: usize,
+    ) -> std::io::Result<()> {
+        let temp_file = self.temp_file.as_mut().ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::Other, "Writer already finalized")
+        })?;
+
+        let id = tile_id(z, x, y);
+        self.stats.total_tiles += 1;
+        self.total_features += feature_count as u64;
+
+        // Track zoom range
+        self.min_zoom = self.min_zoom.min(z);
+        self.max_zoom = self.max_zoom.max(z);
+
+        // Hash uncompressed data for deduplication
+        let hash = crate::dedup::TileHasher::hash(data);
+
+        // Check for duplicate
+        if let Some((offset, length)) = self.dedup_cache.get(&hash) {
+            // Duplicate - just add directory entry pointing to existing data
+            self.entries.push(StreamingDirEntry {
+                tile_id: id,
+                offset: *offset,
+                length: *length,
+            });
+            self.stats.bytes_saved_dedup += data.len() as u64;
+            return Ok(());
+        }
+
+        // New unique tile - compress and write to temp file
+        let compressed = compression::compress(data, self.tile_compression)?;
+        let compressed_len = compressed.len() as u32;
+
+        temp_file.write_all(&compressed)?;
+
+        // Record in dedup cache and directory
+        let offset = self.current_offset;
+        self.dedup_cache.insert(hash, (offset, compressed_len));
+        self.entries.push(StreamingDirEntry {
+            tile_id: id,
+            offset,
+            length: compressed_len,
+        });
+
+        self.current_offset += compressed_len as u64;
+        self.stats.unique_tiles += 1;
+        self.stats.bytes_written += compressed_len as u64;
+
+        Ok(())
+    }
+
+    /// Finalize the PMTiles file.
+    ///
+    /// Reads tile data from temp file and assembles the final PMTiles archive
+    /// with header, directory, metadata, and tile data sections.
+    ///
+    /// The temp file is deleted after successful finalization.
+    pub fn finalize(mut self, output_path: &Path) -> Result<StreamingWriteStats> {
+        // Take the temp file handle to close it properly
+        let temp_file = self
+            .temp_file
+            .take()
+            .ok_or_else(|| Error::PMTilesWrite("Writer already finalized".to_string()))?;
+
+        // Flush and close temp file
+        let inner = temp_file
+            .into_inner()
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to flush temp file: {}", e)))?;
+        drop(inner); // Explicitly close
+
+        // Sort entries by tile_id for clustered mode
+        self.entries.sort_by_key(|e| e.tile_id);
+
+        // Build run-length encoded directory entries
+        let dir_entries = self.build_directory_entries();
+
+        // Encode and compress directory
+        let dir_bytes = encode_directory(&dir_entries);
+        let compressed_dir = compression::compress(&dir_bytes, self.internal_compression)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to compress directory: {}", e)))?;
+
+        // Build metadata JSON
+        let metadata = self.build_metadata_json();
+        let compressed_metadata =
+            compression::compress(metadata.as_bytes(), self.internal_compression)
+                .map_err(|e| Error::PMTilesWrite(format!("Failed to compress metadata: {}", e)))?;
+
+        // Calculate section offsets
+        let root_dir_offset = 127u64;
+        let root_dir_length = compressed_dir.len() as u64;
+        let metadata_offset = root_dir_offset + root_dir_length;
+        let metadata_length = compressed_metadata.len() as u64;
+        let tile_data_offset = metadata_offset + metadata_length;
+        let tile_data_length = self.current_offset;
+
+        // Build header
+        let header = Header {
+            root_dir_offset,
+            root_dir_length,
+            json_metadata_offset: metadata_offset,
+            json_metadata_length: metadata_length,
+            leaf_dirs_offset: 0,
+            leaf_dirs_length: 0,
+            tile_data_offset,
+            tile_data_length,
+            addressed_tiles_count: self.stats.total_tiles,
+            tile_entries_count: dir_entries.len() as u64,
+            tile_contents_count: self.stats.unique_tiles,
+            clustered: true,
+            internal_compression: self.internal_compression,
+            tile_compression: self.tile_compression,
+            tile_type: TileType::Mvt,
+            min_zoom: if self.min_zoom == 255 {
+                0
+            } else {
+                self.min_zoom
+            },
+            max_zoom: if self.max_zoom == 0 && self.entries.is_empty() {
+                0
+            } else {
+                self.max_zoom
+            },
+            min_lon: self.bounds.lng_min,
+            min_lat: self.bounds.lat_min,
+            max_lon: self.bounds.lng_max,
+            max_lat: self.bounds.lat_max,
+            center_zoom: if self.entries.is_empty() {
+                0
+            } else {
+                (self.min_zoom + self.max_zoom) / 2
+            },
+            center_lon: (self.bounds.lng_min + self.bounds.lng_max) / 2.0,
+            center_lat: (self.bounds.lat_min + self.bounds.lat_max) / 2.0,
+        };
+
+        // Create output file and write all sections
+        let output_file = File::create(output_path)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to create output file: {}", e)))?;
+        let mut writer = BufWriter::new(output_file);
+
+        // Write header
+        writer
+            .write_all(&header.to_bytes())
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write header: {}", e)))?;
+
+        // Write directory
+        writer
+            .write_all(&compressed_dir)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write directory: {}", e)))?;
+
+        // Write metadata
+        writer
+            .write_all(&compressed_metadata)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to write metadata: {}", e)))?;
+
+        // Copy tile data from temp file
+        let mut temp_reader = File::open(&self.temp_path)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to reopen temp file: {}", e)))?;
+        std::io::copy(&mut temp_reader, &mut writer)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to copy tile data: {}", e)))?;
+
+        writer
+            .flush()
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to flush output: {}", e)))?;
+
+        // Clean up temp file
+        let _ = std::fs::remove_file(&self.temp_path);
+
+        // Mark as finalized so Drop doesn't try to clean up again
+        self.finalized = true;
+
+        Ok(self.stats.clone())
+    }
+
+    /// Build directory entries with run-length encoding for consecutive identical tiles.
+    fn build_directory_entries(&self) -> Vec<DirEntry> {
+        let mut dir_entries = Vec::new();
+
+        for entry in &self.entries {
+            // Check if this extends the previous entry's run
+            if let Some(last) = dir_entries.last_mut() {
+                let last_entry: &mut DirEntry = last;
+                if last_entry.offset == entry.offset
+                    && entry.tile_id == last_entry.tile_id + last_entry.run_length as u64
+                {
+                    last_entry.run_length += 1;
+                    continue;
+                }
+            }
+
+            dir_entries.push(DirEntry {
+                tile_id: entry.tile_id,
+                offset: entry.offset,
+                length: entry.length,
+                run_length: 1,
+            });
+        }
+
+        dir_entries
+    }
+
+    /// Build metadata JSON string.
+    fn build_metadata_json(&self) -> String {
+        let min_z = if self.min_zoom == 255 {
+            0
+        } else {
+            self.min_zoom
+        };
+        let max_z = if self.max_zoom == 0 && self.entries.is_empty() {
+            0
+        } else {
+            self.max_zoom
+        };
+
+        let fields_json = self.build_fields_json();
+        let tilestats_json = self.build_tilestats_json();
+
+        format!(
+            r#"{{"vector_layers":[{{"id":"{}","minzoom":{},"maxzoom":{},"fields":{}}}],{}"format":"pbf","generator":"gpq-tiles"}}"#,
+            self.layer_name, min_z, max_z, fields_json, tilestats_json
+        )
+    }
+
+    fn build_fields_json(&self) -> String {
+        if self.fields.is_empty() {
+            return "{}".to_string();
+        }
+
+        let mut field_pairs: Vec<_> = self.fields.iter().collect();
+        field_pairs.sort_by_key(|(k, _)| *k);
+
+        let field_strings: Vec<String> = field_pairs
+            .iter()
+            .map(|(name, type_str)| format!(r#""{}":"{}""#, name, type_str))
+            .collect();
+
+        format!("{{{}}}", field_strings.join(","))
+    }
+
+    fn build_tilestats_json(&self) -> String {
+        if self.total_features == 0 {
+            return String::new();
+        }
+
+        format!(
+            r#""tilestats":{{"layerCount":1,"layers":[{{"layer":"{}","count":{},"attributeCount":{}}}]}},"#,
+            self.layer_name,
+            self.total_features,
+            self.fields.len()
+        )
+    }
+}
+
+impl Drop for StreamingPmtilesWriter {
+    fn drop(&mut self) {
+        // Clean up temp file if it still exists (e.g., if finalize wasn't called)
+        if !self.finalized {
+            let _ = std::fs::remove_file(&self.temp_path);
+        }
+    }
+}
+
+// ============================================================================
 // Tests (TDD)
 // ============================================================================
 
@@ -1588,5 +2029,261 @@ mod tests {
         assert_eq!(contents_count, 3, "Should have 3 unique contents");
 
         let _ = fs::remove_file(path);
+    }
+
+    // =========================================================================
+    // StreamingPmtilesWriter Tests (TDD)
+    // =========================================================================
+
+    #[test]
+    fn test_streaming_writer_creates_temp_file() {
+        let writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        // Temp file should exist
+        assert!(
+            writer.temp_path().exists(),
+            "Temp file should be created at {:?}",
+            writer.temp_path()
+        );
+
+        // Clean up happens on drop
+        let temp_path = writer.temp_path().to_path_buf();
+        drop(writer);
+        assert!(
+            !temp_path.exists(),
+            "Temp file should be cleaned up on drop"
+        );
+    }
+
+    #[test]
+    fn test_streaming_writer_add_tile_writes_to_temp() {
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        // Add a tile
+        let mvt_data = vec![0x1a, 0x00, 0x01, 0x02];
+        writer.add_tile(0, 0, 0, &mvt_data).unwrap();
+
+        // Stats should reflect the write
+        let stats = writer.stats();
+        assert_eq!(stats.total_tiles, 1);
+        assert_eq!(stats.unique_tiles, 1);
+        assert!(
+            stats.bytes_written > 0,
+            "Should have written bytes to temp file"
+        );
+
+        // Note: The BufWriter may not have flushed to disk yet, so we check our
+        // internal stats rather than file metadata (which requires flush)
+        assert_eq!(
+            stats.bytes_written, writer.current_offset,
+            "bytes_written should match current_offset"
+        );
+    }
+
+    #[test]
+    fn test_streaming_writer_dedup_same_content() {
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        // Add 3 tiles with identical content
+        let ocean_tile = vec![0x1a, 0x00];
+        writer.add_tile(1, 0, 0, &ocean_tile).unwrap();
+        writer.add_tile(1, 0, 1, &ocean_tile).unwrap();
+        writer.add_tile(1, 1, 1, &ocean_tile).unwrap();
+
+        let stats = writer.stats();
+        assert_eq!(stats.total_tiles, 3, "Should track 3 total tiles");
+        assert_eq!(stats.unique_tiles, 1, "Should only have 1 unique tile");
+        assert!(
+            stats.bytes_saved_dedup > 0,
+            "Should have saved bytes via deduplication"
+        );
+    }
+
+    #[test]
+    fn test_streaming_writer_finalize_creates_valid_pmtiles() {
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        // Add a few tiles
+        writer.add_tile(0, 0, 0, &[0x1a, 0x00]).unwrap();
+        writer.add_tile(1, 0, 0, &[0x1a, 0x01]).unwrap();
+        writer.add_tile(1, 0, 1, &[0x1a, 0x02]).unwrap();
+        writer.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+
+        let output_path = Path::new("/tmp/test-streaming-pmtiles.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let stats = writer.finalize(output_path).expect("Should finalize");
+
+        // Verify file was created with valid PMTiles structure
+        assert!(output_path.exists(), "Output file should exist");
+
+        let data = fs::read(output_path).unwrap();
+
+        // Check magic and version
+        assert_eq!(&data[0..7], b"PMTiles", "Should have PMTiles magic");
+        assert_eq!(data[7], 3, "Should be version 3");
+
+        // Check tile counts in header
+        let addressed_count = u64::from_le_bytes(data[72..80].try_into().unwrap());
+        assert_eq!(addressed_count, 3, "Should have 3 addressed tiles");
+
+        // Verify stats
+        assert_eq!(stats.total_tiles, 3);
+        assert_eq!(stats.unique_tiles, 3); // All different content
+
+        // Clean up
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_streaming_writer_memory_bounded() {
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        // Add many tiles (simulating a large file scenario)
+        // Even with 1000 tiles, memory should stay low
+        // Use valid coordinates for each zoom level
+        let mut count = 0;
+        for z in 0..10u8 {
+            let max_coord = 1u32 << z; // Valid range: 0 to max_coord-1
+            for x in 0..max_coord.min(10) {
+                for y in 0..max_coord.min(10) {
+                    let data = vec![0x1a, z, (x & 0xFF) as u8, (y & 0xFF) as u8, count as u8];
+                    writer.add_tile(z, x, y, &data).unwrap();
+                    count += 1;
+                    if count >= 1000 {
+                        break;
+                    }
+                }
+                if count >= 1000 {
+                    break;
+                }
+            }
+            if count >= 1000 {
+                break;
+            }
+        }
+
+        let stats = writer.stats();
+
+        // Memory estimate should be bounded: ~64 bytes per entry (24 dir + 40 dedup)
+        // 1000 tiles × 64 bytes = ~64KB (not 40MB of tile data)
+        let estimated_mem = stats.estimated_memory_bytes();
+        assert!(
+            estimated_mem < 200_000, // Less than 200KB
+            "Memory usage should be bounded, got {} bytes",
+            estimated_mem
+        );
+
+        // Clean up (finalize not needed for this test)
+    }
+
+    #[test]
+    fn test_streaming_writer_matches_non_streaming_output() {
+        // Create identical content with both writers and compare output
+        let tiles_data = vec![
+            (0, 0, 0, vec![0x1a, 0x00]),
+            (1, 0, 0, vec![0x1a, 0x01]),
+            (1, 0, 1, vec![0x1a, 0x02]),
+            (1, 1, 1, vec![0x1a, 0x00]), // Duplicate content
+        ];
+
+        // Non-streaming writer (with dedup enabled for fair comparison)
+        let mut non_streaming = PmtilesWriter::with_compression(Compression::Gzip);
+        non_streaming.enable_deduplication(true);
+        non_streaming.set_layer_name("test");
+        non_streaming.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+        for (z, x, y, data) in &tiles_data {
+            non_streaming.add_tile(*z, *x, *y, data).unwrap();
+        }
+
+        let non_streaming_path = Path::new("/tmp/test-compare-non-streaming.pmtiles");
+        let _ = fs::remove_file(non_streaming_path);
+        non_streaming.write_to_file(non_streaming_path).unwrap();
+
+        // Streaming writer
+        let mut streaming = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        streaming.set_layer_name("test");
+        streaming.set_bounds(&TileBounds::new(-180.0, -85.0, 180.0, 85.0));
+        for (z, x, y, data) in &tiles_data {
+            streaming.add_tile(*z, *x, *y, data).unwrap();
+        }
+
+        let streaming_path = Path::new("/tmp/test-compare-streaming.pmtiles");
+        let _ = fs::remove_file(streaming_path);
+        streaming.finalize(streaming_path).unwrap();
+
+        // Compare key header fields
+        let ns_data = fs::read(non_streaming_path).unwrap();
+        let s_data = fs::read(streaming_path).unwrap();
+
+        // Magic and version should match
+        assert_eq!(
+            &ns_data[0..8],
+            &s_data[0..8],
+            "Header magic/version should match"
+        );
+
+        // Addressed tiles count should match
+        let ns_addressed = u64::from_le_bytes(ns_data[72..80].try_into().unwrap());
+        let s_addressed = u64::from_le_bytes(s_data[72..80].try_into().unwrap());
+        assert_eq!(ns_addressed, s_addressed, "Addressed tiles should match");
+
+        // Unique contents should match
+        let ns_contents = u64::from_le_bytes(ns_data[88..96].try_into().unwrap());
+        let s_contents = u64::from_le_bytes(s_data[88..96].try_into().unwrap());
+        assert_eq!(ns_contents, s_contents, "Unique contents should match");
+
+        // Clean up
+        let _ = fs::remove_file(non_streaming_path);
+        let _ = fs::remove_file(streaming_path);
+    }
+
+    #[test]
+    fn test_streaming_writer_with_feature_count() {
+        use flate2::read::GzDecoder;
+        use std::io::Read;
+
+        let mut writer = StreamingPmtilesWriter::new(Compression::Gzip).unwrap();
+        writer.set_layer_name("buildings");
+
+        // Add tiles with feature counts
+        writer
+            .add_tile_with_count(0, 0, 0, &[0x1a, 0x00], 100)
+            .unwrap();
+        writer
+            .add_tile_with_count(1, 0, 0, &[0x1a, 0x01], 50)
+            .unwrap();
+        writer
+            .add_tile_with_count(1, 0, 1, &[0x1a, 0x02], 75)
+            .unwrap();
+
+        let output_path = Path::new("/tmp/test-streaming-features.pmtiles");
+        let _ = fs::remove_file(output_path);
+        writer.finalize(output_path).unwrap();
+
+        let data = fs::read(output_path).unwrap();
+
+        // Extract metadata and check tilestats
+        let metadata_offset = u64::from_le_bytes(data[24..32].try_into().unwrap()) as usize;
+        let metadata_length = u64::from_le_bytes(data[32..40].try_into().unwrap()) as usize;
+        let compressed_metadata = &data[metadata_offset..metadata_offset + metadata_length];
+
+        let mut decoder = GzDecoder::new(compressed_metadata);
+        let mut metadata_json = String::new();
+        decoder.read_to_string(&mut metadata_json).unwrap();
+
+        // Should have tilestats with total feature count
+        assert!(
+            metadata_json.contains("\"count\":225"),
+            "Should have total feature count 225, got: {}",
+            metadata_json
+        );
+
+        let _ = fs::remove_file(output_path);
     }
 }

@@ -51,6 +51,8 @@ pub mod validate;
 pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API
 pub use compression::Compression;
+// Re-export StreamingPmtilesWriter and related types
+pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]

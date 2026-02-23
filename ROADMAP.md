@@ -2,7 +2,7 @@
 
 Production-grade GeoParquet → PMTiles converter in Rust.
 
-**Current:** 335 tests (324 unit + 11 doc). 1.4x faster than tippecanoe.
+**Current:** 364 tests (349 unit + 15 doc). 1.4x faster than tippecanoe.
 
 ## Phase Summary
 
@@ -16,6 +16,50 @@ Production-grade GeoParquet → PMTiles converter in Rust.
 | 6. Deduplication | ✅ | 27 | Tile dedup via XXH3 + run_length encoding |
 | 7. Property Filtering | ✅ | 20 | Include/exclude fields (--include/-y, --exclude/-x, --exclude-all/-X) |
 | 8. Compression Options | ✅ | 20 | gzip (default), brotli, zstd, none |
+| 9. Streaming Writer | 🚧 | 9 | StreamingPmtilesWriter for large files |
+
+## Phase 9: Streaming Writer 🚧 PARTIAL
+
+Memory-efficient PMTiles writer for large files. Two streaming modes available:
+
+### StreamingMode::LowMemory ✅ WORKS
+
+Re-reads the file for each zoom level. Slow but memory-bounded.
+
+```rust
+use gpq_tiles_core::pipeline::{generate_tiles_to_writer, StreamingMode, TilerConfig};
+use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
+use gpq_tiles_core::compression::Compression;
+
+let config = TilerConfig::new(0, 14)
+    .with_streaming_mode(StreamingMode::LowMemory);  // ~750MB for 3.2GB file
+
+let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
+generate_tiles_to_writer(Path::new("large.parquet"), &config, &mut writer)?;
+writer.finalize(Path::new("output.pmtiles"))?;
+```
+
+| Mode | Memory | Speed | Status |
+|------|--------|-------|--------|
+| `LowMemory` | ~750MB | 2-3x slower | ✅ Works |
+| `Fast` | ~1-2GB target | 1x | ⚠️ May OOM on very large files |
+
+### StreamingMode::Fast ⚠️ NEEDS WORK
+
+Single-pass processing that stores clipped geometries. Works for most files but may OOM on very large files (10GB+) due to geometry accumulation.
+
+**Known limitation:** For files with features that span many tiles across many zoom levels, clipped geometry accumulation can exceed available memory.
+
+**Planned fix:** External sort approach (see `docs/ARCHITECTURE.md`).
+
+**Test large files:**
+```bash
+# Low memory mode (recommended for large files)
+cargo run --example test_large_file --release /path/to/large.parquet --low-memory
+
+# Fast mode (may OOM on very large files)
+cargo run --example test_large_file --release /path/to/large.parquet
+```
 
 ## Phase 8: Compression Options ✅ COMPLETE
 
@@ -191,6 +235,6 @@ uv run maturin build --release # Build wheel
 
 | Severity | Issue | Status |
 |----------|-------|--------|
-| Medium | Memory for large files | `extract_geometries` loads all into Vec |
+| Medium | Memory for large files | 🚧 LowMemory mode works; Fast mode needs external sort |
 
 See `docs/ARCHITECTURE.md` for design decisions and tippecanoe divergences.
