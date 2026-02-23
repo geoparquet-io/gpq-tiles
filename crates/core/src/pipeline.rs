@@ -118,6 +118,16 @@ pub enum StreamingMode {
     /// The file is re-read for each zoom level, but OS page cache makes
     /// subsequent reads fast.
     LowMemory,
+
+    /// External sort for bounded-memory fast processing.
+    ///
+    /// - **Memory**: ~200-500MB (sort buffer + one row group)
+    /// - **Speed**: ~1x (single file pass + sort + single encode pass)
+    /// - **Best for**: Very large files (10GB+) where Fast OOMs
+    ///
+    /// Writes clipped geometries to temp file, sorts by tile_id using
+    /// external merge sort, then encodes tiles sequentially.
+    ExternalSort,
 }
 
 /// Configuration for the tiling pipeline.
@@ -680,6 +690,10 @@ pub fn generate_tiles_to_writer(
     match config.streaming_mode {
         StreamingMode::Fast => generate_tiles_to_writer_fast(input_path, config, writer),
         StreamingMode::LowMemory => generate_tiles_to_writer_low_memory(input_path, config, writer),
+        StreamingMode::ExternalSort => {
+            // TODO: implement generate_tiles_to_writer_external_sort
+            unimplemented!("ExternalSort mode not yet implemented")
+        }
     }
 }
 
