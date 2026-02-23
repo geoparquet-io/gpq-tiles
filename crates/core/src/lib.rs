@@ -36,6 +36,7 @@ pub mod feature_drop;
 mod golden;
 #[cfg(test)]
 mod integration_tests;
+pub mod memory;
 pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
