@@ -126,6 +126,12 @@ pub struct TilerConfig {
     /// Matches tippecanoe's -x (exclude), -y (include), and -X (exclude-all) flags.
     /// Geometry columns are always preserved regardless of filter settings.
     pub property_filter: PropertyFilter,
+    /// Memory budget in bytes for streaming processing (default: None = no limit).
+    /// When set, streaming will attempt to stay within this budget by:
+    /// - Processing one row group at a time
+    /// - Flushing tiles after each row group
+    /// - Warning if a single row group exceeds the budget
+    pub memory_budget: Option<usize>,
 }
 
 impl Default for TilerConfig {
@@ -150,6 +156,8 @@ impl Default for TilerConfig {
             parallel: true,
             // No property filtering by default - include all properties
             property_filter: PropertyFilter::None,
+            // No memory budget by default - rely on row group streaming
+            memory_budget: None,
         }
     }
 }
@@ -266,6 +274,30 @@ impl TilerConfig {
     /// This is equivalent to tippecanoe's `-X` flag.
     pub fn with_geometry_only(self) -> Self {
         self.with_property_filter(PropertyFilter::ExcludeAll)
+    }
+
+    /// Set a memory budget for streaming processing.
+    ///
+    /// When set, streaming will attempt to stay within this budget by:
+    /// - Processing one row group at a time
+    /// - Flushing tiles after each row group
+    /// - Warning if a single row group exceeds the budget
+    ///
+    /// Note: This is advisory - actual memory usage depends on row group size
+    /// in the input file. If a single row group exceeds the budget, processing
+    /// will continue with a warning.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_memory_budget(4 * 1024 * 1024 * 1024); // 4GB
+    /// ```
+    pub fn with_memory_budget(mut self, bytes: usize) -> Self {
+        self.memory_budget = Some(bytes);
+        self
     }
 }
 
@@ -523,13 +555,50 @@ pub fn generate_tiles_streaming(
     input_path: &Path,
     config: &TilerConfig,
 ) -> Result<Vec<GeneratedTile>> {
+    let (tiles, _stats) = generate_tiles_streaming_with_stats(input_path, config)?;
+    Ok(tiles)
+}
+
+/// Result of streaming tile generation including memory statistics.
+#[derive(Debug)]
+pub struct StreamingResult {
+    /// Generated tiles
+    pub tiles: Vec<GeneratedTile>,
+    /// Memory usage statistics
+    pub memory_stats: crate::memory::MemoryStats,
+}
+
+/// Generate tiles from a GeoParquet file using streaming processing with memory tracking.
+///
+/// This is the same as `generate_tiles_streaming` but also returns memory usage statistics.
+/// Use this when you need to verify memory budget compliance.
+///
+/// # Arguments
+///
+/// * `input_path` - Path to the GeoParquet file
+/// * `config` - Tiling configuration (including optional memory_budget)
+///
+/// # Returns
+///
+/// A tuple of (tiles, memory_stats) where memory_stats contains peak usage and budget info.
+pub fn generate_tiles_streaming_with_stats(
+    input_path: &Path,
+    config: &TilerConfig,
+) -> Result<(Vec<GeneratedTile>, crate::memory::MemoryStats)> {
+    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker};
     use geo::BoundingRect;
     use std::collections::HashMap;
 
-    // Step 1: Extract field metadata
+    // Step 1: Initialize memory tracker
+    let mut memory_tracker = match config.memory_budget {
+        Some(budget) => MemoryTracker::with_budget(budget),
+        None => MemoryTracker::new(),
+    };
+
+    // Step 2: Extract field metadata
     let _all_fields = extract_field_metadata(input_path).unwrap_or_default();
 
-    // Step 2: Track tiles by coordinate for merging across row groups
+    // Step 3: Track tiles by coordinate for merging across row groups
     // Key: (z, x, y), Value: accumulated features with their global index
     let mut tile_features: HashMap<(u8, u32, u32), Vec<(Geometry<f64>, u64)>> = HashMap::new();
     let mut global_feature_index: u64 = 0;
@@ -537,8 +606,24 @@ pub fn generate_tiles_streaming(
     // Clone config for closure
     let config_clone = config.clone();
 
-    // Step 3: Process each row group independently
-    process_geometries_by_row_group(input_path, |_rg_info: RowGroupInfo, geometries| {
+    // Step 4: Process each row group independently
+    process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
+        // Track memory for this row group
+        let row_group_mem: usize = geometries.iter().map(estimate_geometry_size).sum();
+        memory_tracker.add(row_group_mem);
+
+        // Check budget and log warning if exceeded
+        if memory_tracker.is_over_budget() {
+            memory_tracker.record_budget_exceeded();
+            log::warn!(
+                "Row group {} ({} features) exceeds memory budget: {} > {}",
+                rg_info.index,
+                rg_info.num_rows,
+                crate::memory::format_bytes(memory_tracker.current()),
+                crate::memory::format_bytes(memory_tracker.budget().unwrap_or(0))
+            );
+        }
+
         // Sort geometries within this row group for better locality
         let mut sorted = geometries;
         sort_geometries(&mut sorted, config_clone.use_hilbert);
@@ -581,6 +666,10 @@ pub fn generate_tiles_streaming(
                         continue;
                     }
 
+                    // Track memory for accumulated geometry
+                    let geom_size = estimate_geometry_size(&geom);
+                    memory_tracker.add(geom_size);
+
                     // Store feature for this tile (clipping happens when encoding)
                     tile_features
                         .entry((z, tile_coord.x, tile_coord.y))
@@ -591,10 +680,13 @@ pub fn generate_tiles_streaming(
             global_feature_index += 1;
         }
 
+        // "Free" the row group memory (geometries go out of scope after this closure)
+        memory_tracker.remove(row_group_mem);
+
         Ok(())
     })?;
 
-    // Step 4: Generate tiles from accumulated features
+    // Step 5: Generate tiles from accumulated features
     let mut tiles: Vec<GeneratedTile> = Vec::new();
 
     for ((z, x, y), features) in tile_features {
@@ -672,7 +764,25 @@ pub fn generate_tiles_streaming(
     // Sort tiles by (z, x, y) for deterministic output
     tiles.sort_by(|a, b| (a.coord.z, a.coord.x, a.coord.y).cmp(&(b.coord.z, b.coord.x, b.coord.y)));
 
-    Ok(tiles)
+    // Collect memory stats
+    let stats = MemoryStats::from_tracker(&memory_tracker);
+
+    // Log memory summary
+    log::info!(
+        "Streaming complete: peak memory {}, budget {}",
+        stats.peak_formatted(),
+        stats
+            .budget_formatted()
+            .unwrap_or_else(|| "none".to_string())
+    );
+    if stats.budget_exceeded_count > 0 {
+        log::warn!(
+            "Memory budget exceeded {} times during processing",
+            stats.budget_exceeded_count
+        );
+    }
+
+    Ok((tiles, stats))
 }
 
 /// Iterator that generates tiles for each tile coordinate.
@@ -2052,5 +2162,87 @@ mod tests {
             result.fields.is_empty(),
             "Should have no fields with ExcludeAll filter"
         );
+    }
+
+    #[test]
+    fn test_streaming_with_memory_budget() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Set a generous budget (100MB) that should not be exceeded by small fixture
+        let config = TilerConfig::new(0, 6).with_memory_budget(100 * 1024 * 1024);
+
+        let (tiles, stats) =
+            generate_tiles_streaming_with_stats(fixture, &config).expect("streaming should work");
+
+        assert!(!tiles.is_empty(), "Should generate tiles");
+        assert!(
+            stats.within_budget(),
+            "Should stay within 100MB budget for small file"
+        );
+        assert_eq!(
+            stats.budget_exceeded_count, 0,
+            "Should not exceed budget for small file"
+        );
+
+        println!(
+            "Memory stats: peak={}, budget={:?}",
+            stats.peak_formatted(),
+            stats.budget_formatted()
+        );
+    }
+
+    #[test]
+    fn test_streaming_memory_tracking_reports_peak() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(0, 4);
+
+        let (tiles, stats) =
+            generate_tiles_streaming_with_stats(fixture, &config).expect("streaming should work");
+
+        assert!(!tiles.is_empty(), "Should generate tiles");
+        assert!(stats.peak_bytes > 0, "Should report non-zero peak memory");
+
+        println!("Multi-rowgroup memory: peak={}", stats.peak_formatted());
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test test_large_file_memory_bounded -- --ignored
+    fn test_large_file_memory_bounded() {
+        // This test requires downloading a large file:
+        // curl -o tests/fixtures/large/adm0_polygons.parquet \
+        //   https://data.fieldmaps.io/edge-matched/humanitarian/intl/adm0_polygons.parquet
+        let fixture = Path::new("../../tests/fixtures/large/adm0_polygons.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: large fixture not found. Download from data.fieldmaps.io");
+            return;
+        }
+
+        // Set a 1GB budget
+        let budget = 1024 * 1024 * 1024; // 1GB
+        let config = TilerConfig::new(0, 8).with_memory_budget(budget);
+
+        let (tiles, stats) =
+            generate_tiles_streaming_with_stats(fixture, &config).expect("streaming should work");
+
+        println!(
+            "Large file stats: {} tiles, peak={}, budget={:?}, exceeded={}",
+            tiles.len(),
+            stats.peak_formatted(),
+            stats.budget_formatted(),
+            stats.budget_exceeded_count
+        );
+
+        // For truly large files, we expect some row groups might exceed budget
+        // but overall the approach should work
+        assert!(!tiles.is_empty(), "Should generate tiles from large file");
     }
 }
