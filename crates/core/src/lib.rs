@@ -31,6 +31,7 @@ pub mod batch_processor;
 pub mod clip;
 pub mod compression;
 pub mod dedup;
+pub mod external_sort;
 pub mod feature_drop;
 #[cfg(test)]
 mod golden;
@@ -46,6 +47,7 @@ pub mod simplify;
 pub mod spatial_index;
 pub mod tile;
 pub mod validate;
+pub mod wkb;
 
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
