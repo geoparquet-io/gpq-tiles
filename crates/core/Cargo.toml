@@ -44,3 +44,7 @@ serde_json = "1"
 [[bench]]
 name = "tiling"
 harness = false
+
+[[bench]]
+name = "streaming"
+harness = false
