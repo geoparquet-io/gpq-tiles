@@ -30,6 +30,9 @@ flate2 = "1"
 brotli = "7"
 zstd = "0.13"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
+extsort = { workspace = true }
+rmp-serde = { workspace = true }
+serde = { workspace = true }
 
 [build-dependencies]
 prost-build = { workspace = true }

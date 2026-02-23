@@ -27,7 +27,7 @@ parquet = "55"
 arrow-schema = "55"
 geo = "0.29"
 pmtiles = "0.12"
-geozero = "0.14"
+geozero = { version = "0.14", features = ["with-wkb", "with-geo"] }
 
 # Protobuf for MVT encoding
 prost = "0.13"
@@ -50,6 +50,12 @@ thiserror = "1.0"
 # Utilities
 log = "0.4"
 env_logger = "0.11"
+indicatif = "0.17"
+
+# External sorting
+extsort = "0.5"
+rmp-serde = "1.3"
+serde = { version = "1.0", features = ["derive"] }
 
 # Note: Install these separately with cargo install:
 # - cargo-tarpaulin (coverage)

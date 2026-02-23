@@ -3,9 +3,18 @@
 //! This is a thin wrapper around the gpq-tiles-core library.
 
 use anyhow::{Context, Result};
-use clap::Parser;
-use gpq_tiles_core::{Compression, Config, Converter, DropDensity, PropertyFilter};
+use clap::{Parser, ValueEnum};
+use gpq_tiles_core::compression::Compression;
+use gpq_tiles_core::pipeline::{
+    generate_tiles_to_writer, generate_tiles_to_writer_with_progress, ProgressEvent, StreamingMode,
+    TilerConfig,
+};
+use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
+use gpq_tiles_core::PropertyFilter;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,21 +68,26 @@ struct Args {
     #[arg(long, default_value = "gzip")]
     compression: String,
 
-    /// Enable verbose logging
+    /// Enable verbose logging with progress bars
     #[arg(short, long)]
     verbose: bool,
+
+    /// Streaming mode for processing large files
+    #[arg(long, value_enum, default_value = "fast")]
+    streaming_mode: CliStreamingMode,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliStreamingMode {
+    /// Fast mode: single pass, ~1-2GB memory for large files
+    Fast,
+    /// Low memory mode: re-reads file per zoom level, ~100MB memory
+    LowMemory,
+    /// External sort: tippecanoe-style disk-based sort, bounded memory
+    ExternalSort,
 }
 
 impl Args {
-    fn parse_drop_density(&self) -> Result<DropDensity> {
-        match self.drop_density.to_lowercase().as_str() {
-            "low" => Ok(DropDensity::Low),
-            "medium" => Ok(DropDensity::Medium),
-            "high" => Ok(DropDensity::High),
-            _ => anyhow::bail!("Invalid drop density: {}", self.drop_density),
-        }
-    }
-
     fn parse_property_filter(&self) -> Result<PropertyFilter> {
         // Check for conflicting options
         let has_include = !self.include.is_empty();
@@ -111,14 +125,11 @@ impl Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Initialize logging
-    let log_level = if args.verbose { "debug" } else { "info" };
+    // Initialize logging - suppress when verbose (we use progress bars instead)
+    let log_level = if args.verbose { "warn" } else { "info" };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(log_level)).init();
 
-    // Parse options before building config (avoid borrow-after-move)
-    let drop_density = args
-        .parse_drop_density()
-        .context("Failed to parse drop density")?;
+    // Parse options
     let property_filter = args
         .parse_property_filter()
         .context("Failed to parse property filter")?;
@@ -126,29 +137,241 @@ fn main() -> Result<()> {
         .parse_compression()
         .context("Failed to parse compression")?;
 
-    // Build configuration
-    let config = Config {
-        min_zoom: args.min_zoom,
-        max_zoom: args.max_zoom,
-        extent: 4096,
-        drop_density,
-        layer_name: args.layer_name,
-        property_filter,
-        compression,
+    // Derive layer name from input filename if not specified
+    let layer_name = args.layer_name.clone().unwrap_or_else(|| {
+        args.input
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("layer")
+            .to_string()
+    });
+
+    // Map CLI streaming mode to core streaming mode
+    let streaming_mode = match args.streaming_mode {
+        CliStreamingMode::Fast => StreamingMode::Fast,
+        CliStreamingMode::LowMemory => StreamingMode::LowMemory,
+        CliStreamingMode::ExternalSort => StreamingMode::ExternalSort,
     };
 
-    // Create converter and run
-    let converter = Converter::new(config);
+    // Build TilerConfig - quiet when using progress bars
+    let tiler_config = TilerConfig::new(args.min_zoom, args.max_zoom)
+        .with_extent(4096)
+        .with_layer_name(&layer_name)
+        .with_property_filter(property_filter)
+        .with_streaming_mode(streaming_mode)
+        .with_quiet(args.verbose); // Suppress log output when we have progress bars
 
-    converter
-        .convert(&args.input, &args.output)
-        .context("Failed to convert GeoParquet to PMTiles")?;
+    // Print configuration in verbose mode
+    if args.verbose {
+        eprintln!("Configuration:");
+        eprintln!("  Input: {}", args.input.display());
+        eprintln!("  Output: {}", args.output.display());
+        eprintln!("  Zoom: {}-{}", args.min_zoom, args.max_zoom);
+        eprintln!("  Streaming mode: {:?}", args.streaming_mode);
+        eprintln!("  Compression: {}", args.compression);
+        eprintln!();
+    }
+
+    let total_start = Instant::now();
+
+    // Create streaming writer
+    let mut writer =
+        StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
+
+    // Run the pipeline with or without progress bars
+    let stats = if args.verbose && matches!(args.streaming_mode, CliStreamingMode::ExternalSort) {
+        // Use progress callback for ExternalSort with verbose mode
+        run_with_progress(&args.input, &tiler_config, &mut writer)?
+    } else {
+        // Standard execution
+        if args.verbose {
+            eprintln!("Starting tile generation...");
+        }
+        generate_tiles_to_writer(&args.input, &tiler_config, &mut writer)
+            .context("Failed to generate tiles")?
+    };
+
+    if args.verbose {
+        eprintln!();
+        eprintln!("Tile generation complete:");
+        eprintln!(
+            "  Peak memory tracked: {} MB",
+            stats.peak_bytes / (1024 * 1024)
+        );
+        eprintln!();
+        eprintln!("Finalizing PMTiles file...");
+    }
+
+    let finalize_start = Instant::now();
+    let write_stats = writer
+        .finalize(&args.output)
+        .context("Failed to write PMTiles file")?;
+    let finalize_duration = finalize_start.elapsed();
+
+    let total_duration = total_start.elapsed();
+
+    // Print results
+    if args.verbose {
+        eprintln!();
+        eprintln!("Results:");
+        eprintln!("  Total tiles: {}", write_stats.total_tiles);
+        eprintln!("  Unique tiles: {}", write_stats.unique_tiles);
+        eprintln!(
+            "  Bytes written: {} MB",
+            write_stats.bytes_written / (1024 * 1024)
+        );
+        eprintln!(
+            "  Bytes saved (dedup): {} MB",
+            write_stats.bytes_saved_dedup / (1024 * 1024)
+        );
+        eprintln!();
+        eprintln!("Timing:");
+        eprintln!("  Finalize: {:.2}s", finalize_duration.as_secs_f64());
+        eprintln!("  Total: {:.2}s", total_duration.as_secs_f64());
+    }
 
     println!(
-        "✓ Converted {} to {}",
+        "✓ Converted {} to {} ({} tiles in {:.1}s)",
         args.input.display(),
-        args.output.display()
+        args.output.display(),
+        write_stats.total_tiles,
+        total_duration.as_secs_f64()
     );
 
     Ok(())
+}
+
+/// Run tile generation with progress bars for ExternalSort mode
+fn run_with_progress(
+    input: &PathBuf,
+    config: &TilerConfig,
+    writer: &mut StreamingPmtilesWriter,
+) -> Result<gpq_tiles_core::memory::MemoryStats> {
+    // Shared state for progress bar
+    let progress_bar: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+    let pb_clone = Arc::clone(&progress_bar);
+
+    // Track totals for Phase 3
+    let total_records: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
+    let total_records_clone = Arc::clone(&total_records);
+
+    let progress_callback = Box::new(move |event: ProgressEvent| {
+        let mut pb_guard = pb_clone.lock().unwrap();
+
+        match event {
+            ProgressEvent::PhaseStart { phase, name } => {
+                // Finish previous progress bar if any
+                if let Some(ref pb) = *pb_guard {
+                    pb.finish_and_clear();
+                }
+
+                if phase == 1 {
+                    // Phase 1: Reading row groups - indeterminate at first
+                    let pb = ProgressBar::new_spinner();
+                    pb.set_style(
+                        ProgressStyle::default_spinner()
+                            .template("{spinner:.green} Phase 1: {msg}")
+                            .unwrap(),
+                    );
+                    pb.set_message(format!("{} - starting...", name));
+                    *pb_guard = Some(pb);
+                } else if phase == 3 {
+                    // Phase 3: Encoding - we know total from Phase 1
+                    let total = *total_records_clone.lock().unwrap();
+                    let pb = ProgressBar::new(total);
+                    pb.set_style(
+                        ProgressStyle::default_bar()
+                            .template("{spinner:.green} Phase 3: [{bar:40.cyan/blue}] {pos}/{len} records ({percent}%) | {msg}")
+                            .unwrap()
+                            .progress_chars("█▉▊▋▌▍▎▏  "),
+                    );
+                    pb.set_message("Encoding tiles");
+                    *pb_guard = Some(pb);
+                }
+            }
+
+            ProgressEvent::Phase1Progress {
+                row_group,
+                total_row_groups,
+                features_in_group,
+                records_written,
+            } => {
+                if let Some(ref pb) = *pb_guard {
+                    pb.set_message(format!(
+                        "Row group {}/{} ({} features) | {} records written",
+                        row_group + 1,
+                        total_row_groups,
+                        features_in_group,
+                        records_written
+                    ));
+                }
+            }
+
+            ProgressEvent::Phase1Complete {
+                total_records: total,
+                peak_memory_bytes,
+            } => {
+                // Store total for Phase 3
+                *total_records.lock().unwrap() = total;
+
+                if let Some(ref pb) = *pb_guard {
+                    pb.finish_with_message(format!(
+                        "Complete: {} records, peak mem {} MB",
+                        total,
+                        peak_memory_bytes / (1024 * 1024)
+                    ));
+                }
+                *pb_guard = None;
+            }
+
+            ProgressEvent::Phase2Start => {
+                let pb = ProgressBar::new_spinner();
+                pb.set_style(
+                    ProgressStyle::default_spinner()
+                        .template("{spinner:.green} Phase 2: {msg}")
+                        .unwrap(),
+                );
+                pb.set_message("External merge sort by tile_id...");
+                pb.enable_steady_tick(std::time::Duration::from_millis(100));
+                *pb_guard = Some(pb);
+            }
+
+            ProgressEvent::Phase2Complete => {
+                if let Some(ref pb) = *pb_guard {
+                    pb.finish_with_message("Sort complete");
+                }
+                *pb_guard = None;
+            }
+
+            ProgressEvent::Phase3Progress {
+                tiles_written,
+                records_processed,
+                total_records: _,
+            } => {
+                if let Some(ref pb) = *pb_guard {
+                    pb.set_position(records_processed);
+                    pb.set_message(format!("{} tiles written", tiles_written));
+                }
+            }
+
+            ProgressEvent::Complete {
+                total_tiles,
+                peak_memory_bytes,
+                duration_secs,
+            } => {
+                if let Some(ref pb) = *pb_guard {
+                    pb.finish_and_clear();
+                }
+                eprintln!(
+                    "✓ Generated {} tiles in {:.1}s (peak memory: {} MB)",
+                    total_tiles,
+                    duration_secs,
+                    peak_memory_bytes / (1024 * 1024)
+                );
+            }
+        }
+    });
+
+    generate_tiles_to_writer_with_progress(input, config, writer, progress_callback)
+        .context("Failed to generate tiles")
 }

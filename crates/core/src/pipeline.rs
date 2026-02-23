@@ -38,6 +38,44 @@ use crate::validate::filter_valid_geometry;
 use crate::vector_tile::Tile;
 use crate::{Error, Result};
 
+/// Progress event emitted during tile generation.
+#[derive(Debug, Clone)]
+pub enum ProgressEvent {
+    /// Starting a phase of processing
+    PhaseStart { phase: u8, name: &'static str },
+    /// Progress within Phase 1 (reading row groups)
+    Phase1Progress {
+        row_group: usize,
+        total_row_groups: usize,
+        features_in_group: usize,
+        records_written: u64,
+    },
+    /// Phase 1 complete
+    Phase1Complete {
+        total_records: u64,
+        peak_memory_bytes: usize,
+    },
+    /// Phase 2 (sorting) started - no granular progress available
+    Phase2Start,
+    /// Phase 2 complete
+    Phase2Complete,
+    /// Progress within Phase 3 (encoding tiles)
+    Phase3Progress {
+        tiles_written: u64,
+        records_processed: u64,
+        total_records: u64,
+    },
+    /// Processing complete
+    Complete {
+        total_tiles: u64,
+        peak_memory_bytes: usize,
+        duration_secs: f64,
+    },
+}
+
+/// Callback type for progress reporting.
+pub type ProgressCallback = Box<dyn Fn(ProgressEvent) + Send + Sync>;
+
 /// Default buffer in pixels (matches tippecanoe common usage)
 pub const DEFAULT_BUFFER_PIXELS: u32 = 8;
 
@@ -118,6 +156,16 @@ pub enum StreamingMode {
     /// The file is re-read for each zoom level, but OS page cache makes
     /// subsequent reads fast.
     LowMemory,
+
+    /// External sort for bounded-memory fast processing.
+    ///
+    /// - **Memory**: ~200-500MB (sort buffer + one row group)
+    /// - **Speed**: ~1x (single file pass + sort + single encode pass)
+    /// - **Best for**: Very large files (10GB+) where Fast OOMs
+    ///
+    /// Writes clipped geometries to temp file, sorts by tile_id using
+    /// external merge sort, then encodes tiles sequentially.
+    ExternalSort,
 }
 
 /// Configuration for the tiling pipeline.
@@ -680,6 +728,49 @@ pub fn generate_tiles_to_writer(
     match config.streaming_mode {
         StreamingMode::Fast => generate_tiles_to_writer_fast(input_path, config, writer),
         StreamingMode::LowMemory => generate_tiles_to_writer_low_memory(input_path, config, writer),
+        StreamingMode::ExternalSort => {
+            generate_tiles_to_writer_external_sort(input_path, config, writer, None)
+        }
+    }
+}
+
+/// Generate tiles directly to a streaming PMTiles writer with progress reporting.
+///
+/// Same as `generate_tiles_to_writer` but accepts a progress callback for monitoring.
+/// Currently only `StreamingMode::ExternalSort` supports detailed progress reporting.
+pub fn generate_tiles_to_writer_with_progress(
+    input_path: &Path,
+    config: &TilerConfig,
+    writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
+    progress: ProgressCallback,
+) -> Result<crate::memory::MemoryStats> {
+    use crate::quality::{assess_quality, emit_quality_warnings};
+
+    // Quality assessment with warnings
+    if let Ok(quality) = assess_quality(input_path) {
+        emit_quality_warnings(&quality, config.quiet);
+    }
+
+    // Extract field metadata and set on writer
+    let all_fields = extract_field_metadata(input_path).unwrap_or_default();
+    let fields = if config.property_filter.is_active() {
+        all_fields
+            .into_iter()
+            .filter(|(name, _)| config.property_filter.should_include(name))
+            .collect()
+    } else {
+        all_fields
+    };
+    writer.set_fields(fields);
+    writer.set_layer_name(&config.layer_name);
+
+    // Dispatch based on streaming mode
+    match config.streaming_mode {
+        StreamingMode::Fast => generate_tiles_to_writer_fast(input_path, config, writer),
+        StreamingMode::LowMemory => generate_tiles_to_writer_low_memory(input_path, config, writer),
+        StreamingMode::ExternalSort => {
+            generate_tiles_to_writer_external_sort(input_path, config, writer, Some(progress))
+        }
     }
 }
 
@@ -739,6 +830,10 @@ fn generate_tiles_to_writer_fast(
 
             // Process all zoom levels for this geometry
             for z in config.min_zoom..=config.max_zoom {
+                // PERFORMANCE: Pre-simplify geometry BEFORE tile iteration
+                // This reduces 688K coord polygons to ~5K coords, making clipping fast
+                let simplified_geom = simplify_for_zoom(&geom, z, config.extent);
+
                 let tiles = tiles_for_bbox(&geom_bbox, z);
 
                 for tile_coord in tiles {
@@ -761,15 +856,13 @@ fn generate_tiles_to_writer_fast(
                         continue;
                     }
 
-                    // CLIP NOW - store the clipped result, NOT the original geometry
-                    // This is the key optimization: clipped geometries are ~90% smaller
-                    let clipped = match clip_geometry(&geom, &tile_bounds, buffer) {
+                    // Clip the pre-simplified geometry to tile bounds
+                    let clipped = match clip_geometry(&simplified_geom, &tile_bounds, buffer) {
                         Some(c) => c,
                         None => continue,
                     };
 
-                    let simplified = simplify_for_zoom(&clipped, z, config.extent);
-                    let validated = match filter_valid_geometry(&simplified) {
+                    let validated = match filter_valid_geometry(&clipped) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -917,6 +1010,9 @@ fn generate_tiles_to_writer_low_memory(
                     None => continue,
                 };
 
+                // PERFORMANCE: Pre-simplify geometry BEFORE tile iteration
+                let simplified_geom = simplify_for_zoom(&geom, z, config.extent);
+
                 // Process ONLY this zoom level
                 let tiles = tiles_for_bbox(&geom_bbox, z);
 
@@ -940,14 +1036,13 @@ fn generate_tiles_to_writer_low_memory(
                         continue;
                     }
 
-                    // Clip and simplify
-                    let clipped = match clip_geometry(&geom, &tile_bounds, buffer) {
+                    // Clip the pre-simplified geometry
+                    let clipped = match clip_geometry(&simplified_geom, &tile_bounds, buffer) {
                         Some(c) => c,
                         None => continue,
                     };
 
-                    let simplified = simplify_for_zoom(&clipped, z, config.extent);
-                    let validated = match filter_valid_geometry(&simplified) {
+                    let validated = match filter_valid_geometry(&clipped) {
                         Some(v) => v,
                         None => continue,
                     };
@@ -1042,6 +1137,457 @@ fn generate_tiles_to_writer_low_memory(
     if !config.quiet {
         log::info!(
             "Low-memory streaming complete: peak memory {}",
+            stats.peak_formatted()
+        );
+    }
+
+    Ok(stats)
+}
+
+/// External sort streaming mode: bounded memory with single file pass.
+///
+/// Phase 1: Read file, clip geometries, write to external sorter
+/// Phase 2: Sort by tile_id (memory-bounded external merge sort)
+/// Phase 3: Read sorted, group by tile, encode MVT, write PMTiles
+///
+/// Memory usage: O(sort_buffer_size) - configurable, typically 100K-1M records
+/// Speed: ~1.2x slower than Fast (disk I/O for sorting), but single file pass
+fn generate_tiles_to_writer_external_sort(
+    input_path: &Path,
+    config: &TilerConfig,
+    writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
+    progress: Option<ProgressCallback>,
+) -> Result<crate::memory::MemoryStats> {
+    use crate::batch_processor::get_row_group_count;
+    use crate::external_sort::{TileFeatureRecord, TileFeatureSorter};
+    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker};
+    use crate::mvt::{LayerBuilder, TileBuilder};
+    use crate::pmtiles_writer::tile_id;
+    use crate::wkb::{geometry_to_wkb, wkb_to_geometry};
+    use geo::BoundingRect;
+    use std::cell::RefCell;
+    use std::time::Instant;
+
+    let start_time = Instant::now();
+
+    let memory_tracker = RefCell::new(match config.memory_budget {
+        Some(budget) => MemoryTracker::with_budget(budget),
+        None => MemoryTracker::new(),
+    });
+
+    let global_bounds = RefCell::new(TileBounds::empty());
+    let global_feature_index = RefCell::new(0u64);
+
+    // Get total row group count for progress tracking
+    let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
+
+    // Phase 1: Read GeoParquet, clip geometries, write to sorter
+    // Buffer size: 100K records is ~50-100MB depending on geometry complexity
+    let sort_buffer_size = 100_000;
+    let sorter = RefCell::new(TileFeatureSorter::new(sort_buffer_size));
+
+    // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
+    const RECORD_FIXED_OVERHEAD: usize = 25;
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::PhaseStart {
+            phase: 1,
+            name: "Reading GeoParquet",
+        });
+    }
+    if !config.quiet {
+        log::info!("Phase 1: Reading GeoParquet and writing to external sorter");
+    }
+
+    let records_written = RefCell::new(0u64);
+
+    process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
+        let features_in_group = geometries.len();
+
+        if let Some(ref cb) = progress {
+            cb(ProgressEvent::Phase1Progress {
+                row_group: rg_info.index,
+                total_row_groups,
+                features_in_group,
+                records_written: *records_written.borrow(),
+            });
+        }
+        if !config.quiet {
+            log::info!(
+                "Processing row group {}/{} with {} features",
+                rg_info.index + 1,
+                total_row_groups,
+                rg_info.num_rows
+            );
+        }
+
+        // PROFILING: Track time spent in each phase
+        let rg_start = std::time::Instant::now();
+        let mut time_sort = std::time::Duration::ZERO;
+        let mut time_clip = std::time::Duration::ZERO;
+        let mut time_simplify = std::time::Duration::ZERO;
+        let mut time_wkb = std::time::Duration::ZERO;
+        let mut time_sorter_add = std::time::Duration::ZERO;
+        let mut clip_count = 0u64;
+        let mut tiles_touched = 0u64;
+
+        // Sort geometries within row group for better locality
+        let sort_start = std::time::Instant::now();
+        let mut sorted = geometries;
+        sort_geometries(&mut sorted, config.use_hilbert);
+        time_sort = sort_start.elapsed();
+
+        let num_geoms = sorted.len();
+        for (geom_idx, geom) in sorted.into_iter().enumerate() {
+            let feat_idx = *global_feature_index.borrow();
+            *global_feature_index.borrow_mut() += 1;
+
+            // Progress within row group every 100 geometries
+            if geom_idx % 100 == 0 && geom_idx > 0 {
+                eprintln!(
+                    "    geom {}/{} | tiles_touched so far: {}",
+                    geom_idx, num_geoms, tiles_touched
+                );
+            }
+
+            let geom_start = std::time::Instant::now();
+            let tiles_before = tiles_touched;
+
+            let geom_bbox = match geom.bounding_rect() {
+                Some(rect) => {
+                    let bounds =
+                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
+                    global_bounds.borrow_mut().expand(&bounds);
+                    bounds
+                }
+                None => continue,
+            };
+
+            // Pre-simplify geometry ONCE at the MAX zoom level tolerance
+            let simplify_start = std::time::Instant::now();
+            let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
+            time_simplify += simplify_start.elapsed();
+
+            // Count total tiles for this geometry across all zoom levels (for progress)
+            let total_tiles_for_geom: usize = (config.min_zoom..=config.max_zoom)
+                .map(|z| tiles_for_bbox(&geom_bbox, z).count())
+                .sum();
+
+            // Warn if this geometry will touch a lot of tiles
+            if total_tiles_for_geom > 10000 {
+                eprintln!(
+                    "    LARGE GEOM {}: {} total tiles across all zooms (bbox: lng=[{:.2},{:.2}] lat=[{:.2},{:.2}])",
+                    geom_idx, total_tiles_for_geom,
+                    geom_bbox.lng_min, geom_bbox.lng_max, geom_bbox.lat_min, geom_bbox.lat_max
+                );
+            }
+
+            let mut tiles_processed_for_geom = 0usize;
+            let geom_tile_start = std::time::Instant::now();
+
+            // Process all zoom levels using the pre-simplified geometry
+            for z in config.min_zoom..=config.max_zoom {
+                let tiles: Vec<_> = tiles_for_bbox(&geom_bbox, z).collect();
+
+                for tile_coord in tiles.into_iter() {
+                    tiles_processed_for_geom += 1;
+
+                    // Progress every 5000 tiles or 10% for large geometries
+                    if total_tiles_for_geom > 10000 && tiles_processed_for_geom % 5000 == 0 {
+                        let pct =
+                            100.0 * tiles_processed_for_geom as f64 / total_tiles_for_geom as f64;
+                        let elapsed = geom_tile_start.elapsed().as_secs_f64();
+                        let rate = tiles_processed_for_geom as f64 / elapsed.max(0.001);
+                        eprintln!(
+                            "      geom {} progress: {:.1}% ({}/{} tiles, {:.0} tiles/sec)",
+                            geom_idx, pct, tiles_processed_for_geom, total_tiles_for_geom, rate
+                        );
+                    }
+
+                    tiles_touched += 1;
+                    let tile_bounds = tile_coord.bounds();
+                    let buffer =
+                        buffer_pixels_to_degrees(config.buffer_pixels, &tile_bounds, config.extent);
+
+                    // Check if geometry bbox intersects buffered tile bounds
+                    let buffered_lng_min = tile_bounds.lng_min - buffer;
+                    let buffered_lng_max = tile_bounds.lng_max + buffer;
+                    let buffered_lat_min = tile_bounds.lat_min - buffer;
+                    let buffered_lat_max = tile_bounds.lat_max + buffer;
+
+                    let intersects = geom_bbox.lng_max >= buffered_lng_min
+                        && geom_bbox.lng_min <= buffered_lng_max
+                        && geom_bbox.lat_max >= buffered_lat_min
+                        && geom_bbox.lat_min <= buffered_lat_max;
+
+                    if !intersects {
+                        continue;
+                    }
+
+                    // Clip the pre-simplified geometry to tile bounds
+                    let clip_start = std::time::Instant::now();
+                    let clipped = match clip_geometry(&base_simplified, &tile_bounds, buffer) {
+                        Some(c) => c,
+                        None => continue,
+                    };
+                    time_clip += clip_start.elapsed();
+                    clip_count += 1;
+
+                    // Validate (simplification already done above)
+                    let validated = match filter_valid_geometry(&clipped) {
+                        Some(v) => v,
+                        None => continue,
+                    };
+
+                    // Check dropping rules after clipping
+                    if should_drop_geometry(
+                        &validated,
+                        z,
+                        config.max_zoom,
+                        config.extent,
+                        &tile_bounds,
+                        feat_idx,
+                    ) {
+                        continue;
+                    }
+
+                    // Serialize geometry to WKB
+                    let wkb_start = std::time::Instant::now();
+                    let wkb = match geometry_to_wkb(&validated) {
+                        Ok(bytes) => bytes,
+                        Err(e) => {
+                            log::warn!("Failed to serialize geometry to WKB: {}", e);
+                            continue;
+                        }
+                    };
+                    time_wkb += wkb_start.elapsed();
+
+                    // Track memory for this record being buffered in sorter
+                    // Record size = fixed overhead + geometry_wkb.len() + properties.len()
+                    let record_size = RECORD_FIXED_OVERHEAD + wkb.len();
+                    memory_tracker.borrow_mut().add(record_size);
+
+                    // Create record with tile_id and coordinates
+                    let sorter_start = std::time::Instant::now();
+                    let tid = tile_id(z, tile_coord.x, tile_coord.y);
+                    let record = TileFeatureRecord::new(
+                        tid,
+                        z,
+                        tile_coord.x,
+                        tile_coord.y,
+                        feat_idx,
+                        wkb,
+                        vec![], // Empty properties for now
+                    );
+
+                    sorter.borrow_mut().add(record);
+                    time_sorter_add += sorter_start.elapsed();
+                    *records_written.borrow_mut() += 1;
+                }
+            }
+
+            // Per-geometry profiling for geometries touching many tiles
+            let geom_tiles = tiles_touched - tiles_before;
+            let geom_elapsed = geom_start.elapsed();
+            if geom_tiles > 1000 || geom_elapsed.as_secs_f64() > 1.0 {
+                eprintln!(
+                    "    SLOW GEOM {}: {} tiles in {:.2}s ({:.0} tiles/sec)",
+                    geom_idx,
+                    geom_tiles,
+                    geom_elapsed.as_secs_f64(),
+                    geom_tiles as f64 / geom_elapsed.as_secs_f64().max(0.001)
+                );
+            }
+        }
+
+        // PROFILING: Log timing breakdown
+        let rg_total = rg_start.elapsed();
+        eprintln!(
+            "  PROFILE RG {}: total={:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles_touched={}",
+            rg_info.index,
+            rg_total.as_secs_f64(),
+            time_sort.as_secs_f64(),
+            time_clip.as_secs_f64(),
+            clip_count,
+            time_simplify.as_secs_f64(),
+            time_wkb.as_secs_f64(),
+            time_sorter_add.as_secs_f64(),
+            tiles_touched
+        );
+
+        Ok(())
+    })?;
+
+    // After Phase 1, sorter memory is released when it starts sorting to disk
+    // Reset current memory as records are now on disk during sort
+    let phase1_peak = memory_tracker.borrow().peak();
+    memory_tracker.borrow_mut().reset_current();
+
+    let total_records = sorter.borrow().len() as u64;
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase1Complete {
+            total_records,
+            peak_memory_bytes: phase1_peak,
+        });
+    }
+    if !config.quiet {
+        log::info!(
+            "Phase 1 complete: {} records to sort (peak memory so far: {} bytes)",
+            total_records,
+            phase1_peak
+        );
+    }
+
+    // Phase 2: Sort by tile_id (external merge sort)
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase2Start);
+    }
+    if !config.quiet {
+        log::info!("Phase 2: External merge sort by tile_id");
+    }
+
+    let sorted_iter = sorter
+        .into_inner()
+        .sort()
+        .map_err(|e| Error::PMTilesWrite(format!("External sort failed: {}", e)))?;
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Phase2Complete);
+    }
+
+    // Phase 3: Read sorted records, group by tile, encode MVT, write PMTiles
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::PhaseStart {
+            phase: 3,
+            name: "Encoding tiles",
+        });
+    }
+    if !config.quiet {
+        log::info!("Phase 3: Encoding tiles and writing to PMTiles");
+    }
+
+    let mut current_tile: Option<(u8, u32, u32)> = None;
+    let mut current_features: Vec<(geo::Geometry<f64>, u64)> = Vec::new();
+    let mut current_tile_memory: usize = 0; // Track memory for current tile's geometries
+    let mut tiles_written: u64 = 0;
+    let mut records_processed: u64 = 0;
+    let progress_interval: u64 = std::cmp::max(1, total_records / 100); // Report ~100 times
+
+    for record_result in sorted_iter {
+        records_processed += 1;
+
+        // Report progress periodically
+        if records_processed % progress_interval == 0 {
+            if let Some(ref cb) = progress {
+                cb(ProgressEvent::Phase3Progress {
+                    tiles_written,
+                    records_processed,
+                    total_records,
+                });
+            }
+        }
+        let record = record_result
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to read sorted record: {}", e)))?;
+
+        let record_tile = (record.z, record.x, record.y);
+
+        // Check if we're starting a new tile
+        if current_tile.is_some() && current_tile != Some(record_tile) {
+            // Encode and write the previous tile
+            let (z, x, y) = current_tile.unwrap();
+            let coord = TileCoord::new(x, y, z);
+            let tile_bounds = coord.bounds();
+
+            let mut layer_builder =
+                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+            let mut feature_count = 0;
+
+            for (geom, feat_idx) in current_features.drain(..) {
+                layer_builder.add_feature(Some(feat_idx), &geom, &[], &tile_bounds);
+                feature_count += 1;
+            }
+
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                writer
+                    .add_tile_with_count(z, x, y, &encoded, feature_count)
+                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+
+                tiles_written += 1;
+            }
+
+            // Reset memory tracking for next tile - geometries are released
+            memory_tracker.borrow_mut().remove(current_tile_memory);
+            current_tile_memory = 0;
+        }
+
+        // Decode WKB back to geometry
+        let geom = wkb_to_geometry(&record.geometry_wkb)
+            .map_err(|e| Error::PMTilesWrite(format!("Failed to decode WKB: {}", e)))?;
+
+        // Track memory for decoded geometry
+        let geom_size = estimate_geometry_size(&geom);
+        memory_tracker.borrow_mut().add(geom_size);
+        current_tile_memory += geom_size;
+
+        // Add to current tile's features
+        current_features.push((geom, record.feature_id));
+        current_tile = Some(record_tile);
+    }
+
+    // Write the final tile
+    if let Some((z, x, y)) = current_tile {
+        if !current_features.is_empty() {
+            let coord = TileCoord::new(x, y, z);
+            let tile_bounds = coord.bounds();
+
+            let mut layer_builder =
+                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+            let mut feature_count = 0;
+
+            for (geom, feat_idx) in current_features {
+                layer_builder.add_feature(Some(feat_idx), &geom, &[], &tile_bounds);
+                feature_count += 1;
+            }
+
+            if feature_count > 0 {
+                let layer = layer_builder.build();
+                let mut tile_builder = TileBuilder::new();
+                tile_builder.add_layer(layer);
+                let tile = tile_builder.build();
+                let encoded = tile.encode_to_vec();
+
+                writer
+                    .add_tile_with_count(z, x, y, &encoded, feature_count)
+                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+
+                tiles_written += 1;
+            }
+        }
+    }
+
+    writer.set_bounds(&global_bounds.into_inner());
+
+    let stats = MemoryStats::from_tracker(&memory_tracker.borrow());
+    let duration = start_time.elapsed();
+
+    if let Some(ref cb) = progress {
+        cb(ProgressEvent::Complete {
+            total_tiles: tiles_written,
+            peak_memory_bytes: stats.peak_bytes,
+            duration_secs: duration.as_secs_f64(),
+        });
+    }
+    if !config.quiet {
+        log::info!(
+            "External sort streaming complete: {} tiles written, peak memory {}",
+            tiles_written,
             stats.peak_formatted()
         );
     }
@@ -1200,14 +1746,14 @@ pub fn generate_tiles_streaming_with_stats(
         };
 
         for (geom, feat_idx) in features {
-            // Clip and simplify first
-            let clipped = match clip_geometry(&geom, &tile_bounds, buffer) {
+            // PERFORMANCE: Simplify first, then clip
+            let simplified_geom = simplify_for_zoom(&geom, z, config.extent);
+            let clipped = match clip_geometry(&simplified_geom, &tile_bounds, buffer) {
                 Some(c) => c,
                 None => continue,
             };
 
-            let simplified = simplify_for_zoom(&clipped, z, config.extent);
-            let validated = match filter_valid_geometry(&simplified) {
+            let validated = match filter_valid_geometry(&clipped) {
                 Some(v) => v,
                 None => continue,
             };
@@ -1354,14 +1900,12 @@ impl TileIterator {
         let mut feature_count = 0;
 
         for (idx, geom) in geometries.iter().enumerate() {
-            // Clip to tile bounds
-            if let Some(clipped) = clip_geometry(geom, &bounds, buffer) {
-                // Simplify for zoom level
-                let simplified = simplify_for_zoom(&clipped, coord.z, config.extent);
-
-                // Validate geometry - filter out degenerate geometries post-simplification
+            // PERFORMANCE: Simplify first to reduce coord count, then clip
+            let simplified = simplify_for_zoom(geom, coord.z, config.extent);
+            if let Some(clipped) = clip_geometry(&simplified, &bounds, buffer) {
+                // Validate geometry - filter out degenerate geometries post-clip
                 // (e.g., polygons with < 4 points, zero-area polygons, linestrings with < 2 points)
-                if let Some(valid_geom) = filter_valid_geometry(&simplified) {
+                if let Some(valid_geom) = filter_valid_geometry(&clipped) {
                     // Apply feature dropping based on zoom level and geometry type
                     // base_zoom is max_zoom: at max_zoom all features are kept
                     if should_drop_geometry(
@@ -2819,6 +3363,251 @@ mod tests {
             write_stats.total_tiles,
             non_streaming.len(),
             ratio
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    // ========== External Sort Streaming Mode Tests ==========
+
+    #[test]
+    fn test_external_sort_produces_tiles() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(0, 6)
+            .with_quiet(true)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should generate tiles with external sort");
+
+        let output_path = Path::new("/tmp/test-external-sort-basic.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        assert!(
+            write_stats.total_tiles > 0,
+            "Should produce tiles with external sort mode"
+        );
+
+        // Memory tracking should be present
+        assert!(
+            stats.peak_bytes > 0,
+            "Should track memory usage: {:?}",
+            stats
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_external_sort_matches_fast_mode() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Use small zoom range for faster test
+        let base_config = TilerConfig::new(0, 6).with_quiet(true);
+
+        // Fast mode (default)
+        let fast_config = base_config.clone().with_streaming_mode(StreamingMode::Fast);
+        let mut fast_writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create fast writer");
+        generate_tiles_to_writer(fixture, &fast_config, &mut fast_writer)
+            .expect("Fast mode should work");
+
+        let fast_output = Path::new("/tmp/test-external-sort-fast.pmtiles");
+        let _ = fs::remove_file(fast_output);
+        let fast_stats = fast_writer
+            .finalize(fast_output)
+            .expect("Should finalize fast");
+
+        // External sort mode
+        let sort_config = base_config
+            .clone()
+            .with_streaming_mode(StreamingMode::ExternalSort);
+        let mut sort_writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create sort writer");
+        generate_tiles_to_writer(fixture, &sort_config, &mut sort_writer)
+            .expect("External sort mode should work");
+
+        let sort_output = Path::new("/tmp/test-external-sort-sorted.pmtiles");
+        let _ = fs::remove_file(sort_output);
+        let sort_stats = sort_writer
+            .finalize(sort_output)
+            .expect("Should finalize sort");
+
+        // Compare tile counts - should be identical or very close
+        // (minor differences can occur due to feature ordering affecting dropping decisions)
+        let ratio = sort_stats.total_tiles as f64 / fast_stats.total_tiles as f64;
+        assert!(
+            ratio > 0.95 && ratio < 1.05,
+            "ExternalSort and Fast should produce similar tile counts: fast={}, sort={}, ratio={}",
+            fast_stats.total_tiles,
+            sort_stats.total_tiles,
+            ratio
+        );
+
+        let _ = fs::remove_file(fast_output);
+        let _ = fs::remove_file(sort_output);
+    }
+
+    #[test]
+    fn test_external_sort_with_multi_row_group() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(0, 6)
+            .with_quiet(true)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let _stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should handle multi-row-group file");
+
+        let output_path = Path::new("/tmp/test-external-sort-multi-rg.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        assert!(
+            write_stats.total_tiles > 0,
+            "Should produce tiles from multi-row-group file"
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_external_sort_memory_stays_bounded() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Set a reasonable memory budget
+        let memory_budget = 500 * 1024 * 1024; // 500MB
+
+        let config = TilerConfig::new(0, 8)
+            .with_quiet(true)
+            .with_streaming_mode(StreamingMode::ExternalSort)
+            .with_memory_budget(memory_budget);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should generate tiles with memory budget");
+
+        let output_path = Path::new("/tmp/test-external-sort-memory.pmtiles");
+        let _ = fs::remove_file(output_path);
+        let _write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        // Peak memory should be tracked and within budget
+        // Note: We track what we can, actual memory may be higher due to
+        // untracked allocations, but the trend should be visible
+        eprintln!(
+            "External sort memory stats: peak={}KB ({}MB), budget={}MB",
+            stats.peak_bytes / 1024,
+            stats.peak_bytes / (1024 * 1024),
+            memory_budget / (1024 * 1024)
+        );
+
+        // For small files, peak should be well under budget
+        // (This is more of a sanity check than a strict bound)
+        assert!(
+            stats.peak_bytes < memory_budget * 2,
+            "Peak memory ({}) should be reasonable relative to budget ({})",
+            stats.peak_bytes,
+            memory_budget
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test test_external_sort_large_file -- --ignored
+    fn test_external_sort_large_file() {
+        // This test uses the 3.3GB adm4_polygons.parquet fixture
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/adm4_polygons.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: large fixture not found at {:?}", fixture);
+            return;
+        }
+
+        // Target: stay under 1GB for this 3.3GB file
+        let memory_budget = 1024 * 1024 * 1024;
+
+        let config = TilerConfig::new(0, 8) // zoom 0-8 for reasonable test time
+            .with_quiet(false) // Show progress for large file
+            .with_streaming_mode(StreamingMode::ExternalSort)
+            .with_memory_budget(memory_budget);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("External sort should handle large file");
+
+        let output_path = Path::new("/tmp/test-external-sort-large.pmtiles");
+        let _ = fs::remove_file(output_path);
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        eprintln!("Large file test results:");
+        eprintln!("  Total tiles: {}", write_stats.total_tiles);
+        eprintln!(
+            "  Peak memory: {}MB (budget: {}MB)",
+            stats.peak_bytes / (1024 * 1024),
+            memory_budget / (1024 * 1024)
+        );
+
+        assert!(
+            write_stats.total_tiles > 0,
+            "Should produce tiles from large file"
+        );
+
+        // The whole point: memory should stay bounded
+        assert!(
+            stats.peak_bytes < memory_budget,
+            "Peak memory ({}) should stay under budget ({})",
+            stats.peak_bytes,
+            memory_budget
         );
 
         let _ = fs::remove_file(output_path);

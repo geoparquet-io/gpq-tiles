@@ -31,6 +31,7 @@ pub mod batch_processor;
 pub mod clip;
 pub mod compression;
 pub mod dedup;
+pub mod external_sort;
 pub mod feature_drop;
 #[cfg(test)]
 mod golden;
@@ -46,6 +47,7 @@ pub mod simplify;
 pub mod spatial_index;
 pub mod tile;
 pub mod validate;
+pub mod wkb;
 
 // Re-export PropertyFilter for convenience
 pub use property_filter::PropertyFilter;
@@ -53,6 +55,8 @@ pub use property_filter::PropertyFilter;
 pub use compression::Compression;
 // Re-export StreamingPmtilesWriter and related types
 pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
+// Re-export progress types for CLI usage
+pub use pipeline::{ProgressCallback, ProgressEvent};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]

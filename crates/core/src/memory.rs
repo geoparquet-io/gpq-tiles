@@ -214,7 +214,7 @@ pub fn format_bytes(bytes: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geo::{coord, LineString, Point, Polygon};
+    use geo::{LineString, Point, Polygon};
 
     #[test]
     fn test_estimate_point_size() {

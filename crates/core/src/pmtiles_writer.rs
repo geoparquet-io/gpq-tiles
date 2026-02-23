@@ -336,6 +336,7 @@ struct TileEntry {
     /// Hash of uncompressed content (for deduplication)
     hash: u64,
     /// Uncompressed size (for stats)
+    #[allow(dead_code)] // Reserved for future deduplication stats reporting
     uncompressed_size: u32,
 }
 
