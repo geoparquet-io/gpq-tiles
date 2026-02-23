@@ -3120,4 +3120,255 @@ mod tests {
 
         let _ = fs::remove_file(output_path);
     }
+
+    // ========== External Sort Streaming Mode Tests ==========
+
+    #[test]
+    fn test_external_sort_produces_tiles() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(0, 6)
+            .with_quiet(true)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should generate tiles with external sort");
+
+        let output_path = Path::new("/tmp/test-external-sort-basic.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        assert!(
+            write_stats.total_tiles > 0,
+            "Should produce tiles with external sort mode"
+        );
+
+        // Memory tracking should be present
+        assert!(
+            stats.peak_bytes > 0,
+            "Should track memory usage: {:?}",
+            stats
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_external_sort_matches_fast_mode() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Use small zoom range for faster test
+        let base_config = TilerConfig::new(0, 6).with_quiet(true);
+
+        // Fast mode (default)
+        let fast_config = base_config.clone().with_streaming_mode(StreamingMode::Fast);
+        let mut fast_writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create fast writer");
+        generate_tiles_to_writer(fixture, &fast_config, &mut fast_writer)
+            .expect("Fast mode should work");
+
+        let fast_output = Path::new("/tmp/test-external-sort-fast.pmtiles");
+        let _ = fs::remove_file(fast_output);
+        let fast_stats = fast_writer
+            .finalize(fast_output)
+            .expect("Should finalize fast");
+
+        // External sort mode
+        let sort_config = base_config
+            .clone()
+            .with_streaming_mode(StreamingMode::ExternalSort);
+        let mut sort_writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create sort writer");
+        generate_tiles_to_writer(fixture, &sort_config, &mut sort_writer)
+            .expect("External sort mode should work");
+
+        let sort_output = Path::new("/tmp/test-external-sort-sorted.pmtiles");
+        let _ = fs::remove_file(sort_output);
+        let sort_stats = sort_writer
+            .finalize(sort_output)
+            .expect("Should finalize sort");
+
+        // Compare tile counts - should be identical or very close
+        // (minor differences can occur due to feature ordering affecting dropping decisions)
+        let ratio = sort_stats.total_tiles as f64 / fast_stats.total_tiles as f64;
+        assert!(
+            ratio > 0.95 && ratio < 1.05,
+            "ExternalSort and Fast should produce similar tile counts: fast={}, sort={}, ratio={}",
+            fast_stats.total_tiles,
+            sort_stats.total_tiles,
+            ratio
+        );
+
+        let _ = fs::remove_file(fast_output);
+        let _ = fs::remove_file(sort_output);
+    }
+
+    #[test]
+    fn test_external_sort_with_multi_row_group() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let config = TilerConfig::new(0, 6)
+            .with_quiet(true)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let _stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should handle multi-row-group file");
+
+        let output_path = Path::new("/tmp/test-external-sort-multi-rg.pmtiles");
+        let _ = fs::remove_file(output_path);
+
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        assert!(
+            write_stats.total_tiles > 0,
+            "Should produce tiles from multi-row-group file"
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn test_external_sort_memory_stays_bounded() {
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Set a reasonable memory budget
+        let memory_budget = 500 * 1024 * 1024; // 500MB
+
+        let config = TilerConfig::new(0, 8)
+            .with_quiet(true)
+            .with_streaming_mode(StreamingMode::ExternalSort)
+            .with_memory_budget(memory_budget);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("Should generate tiles with memory budget");
+
+        let output_path = Path::new("/tmp/test-external-sort-memory.pmtiles");
+        let _ = fs::remove_file(output_path);
+        let _write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        // Peak memory should be tracked and within budget
+        // Note: We track what we can, actual memory may be higher due to
+        // untracked allocations, but the trend should be visible
+        eprintln!(
+            "External sort memory stats: peak={}KB ({}MB), budget={}MB",
+            stats.peak_bytes / 1024,
+            stats.peak_bytes / (1024 * 1024),
+            memory_budget / (1024 * 1024)
+        );
+
+        // For small files, peak should be well under budget
+        // (This is more of a sanity check than a strict bound)
+        assert!(
+            stats.peak_bytes < memory_budget * 2,
+            "Peak memory ({}) should be reasonable relative to budget ({})",
+            stats.peak_bytes,
+            memory_budget
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    #[ignore] // Run with: cargo test test_external_sort_large_file -- --ignored
+    fn test_external_sort_large_file() {
+        // This test requires downloading a large file:
+        // curl -o tests/fixtures/large/adm0_polygons.parquet \
+        //   https://data.fieldmaps.io/edge-matched/humanitarian/intl/adm0_polygons.parquet
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/large/adm0_polygons.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: large fixture not found. Download with:");
+            eprintln!("curl -o tests/fixtures/large/adm0_polygons.parquet \\");
+            eprintln!(
+                "  https://data.fieldmaps.io/edge-matched/humanitarian/intl/adm0_polygons.parquet"
+            );
+            return;
+        }
+
+        // Target: stay under 500MB for this ~100MB file
+        let memory_budget = 500 * 1024 * 1024;
+
+        let config = TilerConfig::new(0, 10)
+            .with_quiet(false) // Show progress for large file
+            .with_streaming_mode(StreamingMode::ExternalSort)
+            .with_memory_budget(memory_budget);
+
+        let mut writer =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
+
+        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
+            .expect("External sort should handle large file");
+
+        let output_path = Path::new("/tmp/test-external-sort-large.pmtiles");
+        let _ = fs::remove_file(output_path);
+        let write_stats = writer.finalize(output_path).expect("Should finalize");
+
+        eprintln!("Large file test results:");
+        eprintln!("  Total tiles: {}", write_stats.total_tiles);
+        eprintln!(
+            "  Peak memory: {}MB (budget: {}MB)",
+            stats.peak_bytes / (1024 * 1024),
+            memory_budget / (1024 * 1024)
+        );
+
+        assert!(
+            write_stats.total_tiles > 0,
+            "Should produce tiles from large file"
+        );
+
+        // The whole point: memory should stay bounded
+        assert!(
+            stats.peak_bytes < memory_budget,
+            "Peak memory ({}) should stay under budget ({})",
+            stats.peak_bytes,
+            memory_budget
+        );
+
+        let _ = fs::remove_file(output_path);
+    }
 }

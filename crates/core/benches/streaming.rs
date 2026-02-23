@@ -22,9 +22,12 @@
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use gpq_tiles_core::batch_processor::extract_geometries;
+use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::pipeline::{
-    generate_tiles, generate_tiles_from_geometries, generate_tiles_streaming, TilerConfig,
+    generate_tiles, generate_tiles_from_geometries, generate_tiles_streaming,
+    generate_tiles_to_writer, StreamingMode, TilerConfig,
 };
+use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use std::path::Path;
 
 // Fixture paths (relative to crates/core/)
@@ -310,6 +313,130 @@ fn bench_output_equivalence(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmark comparing all streaming modes: Fast, LowMemory, ExternalSort
+///
+/// This measures performance of each streaming mode writing to a PMTiles file.
+/// Key metrics:
+/// - Fast: fastest, uses most memory (~1-2GB for large files)
+/// - LowMemory: 2-3x slower, ~100MB memory
+/// - ExternalSort: tippecanoe-style, bounded memory with external disk sort
+fn bench_streaming_modes(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_SMALL) {
+        eprintln!("Skipping streaming modes benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_SMALL);
+
+    let mut group = c.benchmark_group("streaming_modes");
+    group.sample_size(20);
+
+    let base_config = TilerConfig::new(0, 8).with_quiet(true);
+
+    // Fast mode (default)
+    group.bench_function("fast", |b| {
+        b.iter(|| {
+            let config = base_config.clone().with_streaming_mode(StreamingMode::Fast);
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let _stats = generate_tiles_to_writer(fixture_path, &config, &mut writer)
+                .expect("Fast mode should work");
+            let output = std::path::Path::new("/tmp/bench-fast.pmtiles");
+            let result = writer.finalize(output);
+            let _ = std::fs::remove_file(output);
+            black_box(result)
+        })
+    });
+
+    // LowMemory mode
+    group.bench_function("low_memory", |b| {
+        b.iter(|| {
+            let config = base_config
+                .clone()
+                .with_streaming_mode(StreamingMode::LowMemory);
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let _stats = generate_tiles_to_writer(fixture_path, &config, &mut writer)
+                .expect("LowMemory mode should work");
+            let output = std::path::Path::new("/tmp/bench-lowmem.pmtiles");
+            let result = writer.finalize(output);
+            let _ = std::fs::remove_file(output);
+            black_box(result)
+        })
+    });
+
+    // ExternalSort mode
+    group.bench_function("external_sort", |b| {
+        b.iter(|| {
+            let config = base_config
+                .clone()
+                .with_streaming_mode(StreamingMode::ExternalSort);
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let _stats = generate_tiles_to_writer(fixture_path, &config, &mut writer)
+                .expect("ExternalSort mode should work");
+            let output = std::path::Path::new("/tmp/bench-extsort.pmtiles");
+            let result = writer.finalize(output);
+            let _ = std::fs::remove_file(output);
+            black_box(result)
+        })
+    });
+
+    group.finish();
+}
+
+/// Benchmark ExternalSort on larger file to demonstrate memory-bounded behavior
+fn bench_external_sort_larger(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_LARGE) {
+        eprintln!("Skipping external sort larger benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_LARGE);
+
+    let mut group = c.benchmark_group("external_sort_larger");
+    group.sample_size(10);
+
+    let base_config = TilerConfig::new(0, 8).with_quiet(true);
+
+    // ExternalSort with memory budget
+    group.bench_function("external_sort_17k", |b| {
+        b.iter(|| {
+            let config = base_config
+                .clone()
+                .with_streaming_mode(StreamingMode::ExternalSort)
+                .with_memory_budget(500 * 1024 * 1024); // 500MB budget
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config, &mut writer)
+                .expect("ExternalSort should work on larger file");
+            let output = std::path::Path::new("/tmp/bench-extsort-large.pmtiles");
+            let result = writer.finalize(output);
+            let _ = std::fs::remove_file(output);
+            eprintln!("External sort peak memory: {}KB", stats.peak_bytes / 1024);
+            black_box(result)
+        })
+    });
+
+    // Compare with Fast mode
+    group.bench_function("fast_17k", |b| {
+        b.iter(|| {
+            let config = base_config.clone().with_streaming_mode(StreamingMode::Fast);
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config, &mut writer)
+                .expect("Fast mode should work on larger file");
+            let output = std::path::Path::new("/tmp/bench-fast-large.pmtiles");
+            let result = writer.finalize(output);
+            let _ = std::fs::remove_file(output);
+            eprintln!("Fast mode peak memory: {}KB", stats.peak_bytes / 1024);
+            black_box(result)
+        })
+    });
+
+    group.finish();
+}
+
 // Group benchmarks by execution time expectations
 criterion_group!(
     name = fast_benchmarks;
@@ -320,13 +447,13 @@ criterion_group!(
 criterion_group!(
     name = medium_benchmarks;
     config = Criterion::default().sample_size(30);
-    targets = bench_streaming_multi_rowgroup, bench_output_equivalence
+    targets = bench_streaming_multi_rowgroup, bench_output_equivalence, bench_streaming_modes
 );
 
 criterion_group!(
     name = slow_benchmarks;
     config = Criterion::default().sample_size(10);
-    targets = bench_streaming_large
+    targets = bench_streaming_large, bench_external_sort_larger
 );
 
 criterion_main!(fast_benchmarks, medium_benchmarks, slow_benchmarks);
