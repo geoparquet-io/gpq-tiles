@@ -36,10 +36,12 @@ pub mod feature_drop;
 mod golden;
 #[cfg(test)]
 mod integration_tests;
+pub mod memory;
 pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod property_filter;
+pub mod quality;
 pub mod simplify;
 pub mod spatial_index;
 pub mod tile;
@@ -49,6 +51,8 @@ pub mod validate;
 pub use property_filter::PropertyFilter;
 // Re-export Compression from compression module for public API
 pub use compression::Compression;
+// Re-export StreamingPmtilesWriter and related types
+pub use pmtiles_writer::{StreamingPmtilesWriter, StreamingWriteStats};
 
 /// Errors that can occur during GeoParquet to PMTiles conversion
 #[derive(Error, Debug)]

@@ -30,6 +30,11 @@ from gpq_tiles import convert
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14, compression="zstd")
 ```
 
+**Suppress warnings:**
+```bash
+gpq-tiles input.parquet output.pmtiles --quiet  # No optimization warnings
+```
+
 **Rust:**
 ```rust
 use gpq_tiles_core::pipeline::{generate_tiles, TilerConfig};
@@ -44,6 +49,18 @@ let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
 - **Smart** — Density-based feature dropping, tiny polygon removal, point thinning
 - **Flexible** — Property filtering (`--include`/`--exclude`), compression options (gzip/brotli/zstd)
 - **Efficient** — Tile deduplication via XXH3 hashing and run_length encoding
+- **Streaming** — Process files larger than memory via row-group streaming
+
+## Best Practices
+
+For optimal performance with large files, optimize your GeoParquet input:
+
+```bash
+# Hilbert-sort and add row group bboxes with geoparquet-io
+gpq optimize input.parquet -o optimized.parquet --hilbert
+```
+
+gpq-tiles will warn if input files aren't optimized. See [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) for file optimization tools.
 
 ## Project Structure
 
@@ -66,7 +83,7 @@ cargo build && cargo test
 
 **Key commands:**
 ```bash
-cargo test                    # Run all tests (335 total)
+cargo test                    # Run all tests (333 total)
 cargo bench                   # Run benchmarks
 cargo fmt && cargo clippy     # Format and lint
 cargo tarpaulin --out html    # Coverage report
