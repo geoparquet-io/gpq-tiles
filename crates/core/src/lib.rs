@@ -40,6 +40,7 @@ pub mod mvt;
 pub mod pipeline;
 pub mod pmtiles_writer;
 pub mod property_filter;
+pub mod quality;
 pub mod simplify;
 pub mod spatial_index;
 pub mod tile;
