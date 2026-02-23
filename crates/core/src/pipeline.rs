@@ -1282,107 +1282,236 @@ fn generate_tiles_to_writer_external_sort(
                 );
             }
 
-            let mut tiles_processed_for_geom = 0usize;
             let geom_tile_start = std::time::Instant::now();
 
-            // Process all zoom levels using the pre-simplified geometry
-            for z in config.min_zoom..=config.max_zoom {
-                let tiles: Vec<_> = tiles_for_bbox(&geom_bbox, z).collect();
+            // Threshold for parallel processing: overhead not worth it for small geom
+            const PARALLEL_THRESHOLD: usize = 1000;
 
-                for tile_coord in tiles.into_iter() {
-                    tiles_processed_for_geom += 1;
+            // Process tiles - parallel for large geometries, sequential for small
+            if config.parallel && total_tiles_for_geom >= PARALLEL_THRESHOLD {
+                // PARALLEL PATH: Collect all tile coords, process in parallel, batch-add to sorter
 
-                    // Progress every 5000 tiles or 10% for large geometries
-                    if total_tiles_for_geom > 10000 && tiles_processed_for_geom % 5000 == 0 {
-                        let pct =
-                            100.0 * tiles_processed_for_geom as f64 / total_tiles_for_geom as f64;
-                        let elapsed = geom_tile_start.elapsed().as_secs_f64();
-                        let rate = tiles_processed_for_geom as f64 / elapsed.max(0.001);
-                        eprintln!(
-                            "      geom {} progress: {:.1}% ({}/{} tiles, {:.0} tiles/sec)",
-                            geom_idx, pct, tiles_processed_for_geom, total_tiles_for_geom, rate
+                // Collect all (z, tile_coord) pairs across all zoom levels
+                let all_tiles: Vec<(u8, TileCoord)> = (config.min_zoom..=config.max_zoom)
+                    .flat_map(|z| tiles_for_bbox(&geom_bbox, z).map(move |tc| (z, tc)))
+                    .collect();
+
+                if total_tiles_for_geom > 10000 {
+                    eprintln!(
+                        "      geom {} PARALLEL: processing {} tiles across {} threads",
+                        geom_idx,
+                        all_tiles.len(),
+                        rayon::current_num_threads()
+                    );
+                }
+
+                // Process tiles in parallel - each returns Option<(record, clip_time, wkb_time)>
+                let results: Vec<_> = all_tiles
+                    .into_par_iter()
+                    .filter_map(|(z, tile_coord)| {
+                        let tile_bounds = tile_coord.bounds();
+                        let buffer = buffer_pixels_to_degrees(
+                            config.buffer_pixels,
+                            &tile_bounds,
+                            config.extent,
                         );
-                    }
 
-                    tiles_touched += 1;
-                    let tile_bounds = tile_coord.bounds();
-                    let buffer =
-                        buffer_pixels_to_degrees(config.buffer_pixels, &tile_bounds, config.extent);
+                        // Check if geometry bbox intersects buffered tile bounds
+                        let buffered_lng_min = tile_bounds.lng_min - buffer;
+                        let buffered_lng_max = tile_bounds.lng_max + buffer;
+                        let buffered_lat_min = tile_bounds.lat_min - buffer;
+                        let buffered_lat_max = tile_bounds.lat_max + buffer;
 
-                    // Check if geometry bbox intersects buffered tile bounds
-                    let buffered_lng_min = tile_bounds.lng_min - buffer;
-                    let buffered_lng_max = tile_bounds.lng_max + buffer;
-                    let buffered_lat_min = tile_bounds.lat_min - buffer;
-                    let buffered_lat_max = tile_bounds.lat_max + buffer;
+                        let intersects = geom_bbox.lng_max >= buffered_lng_min
+                            && geom_bbox.lng_min <= buffered_lng_max
+                            && geom_bbox.lat_max >= buffered_lat_min
+                            && geom_bbox.lat_min <= buffered_lat_max;
 
-                    let intersects = geom_bbox.lng_max >= buffered_lng_min
-                        && geom_bbox.lng_min <= buffered_lng_max
-                        && geom_bbox.lat_max >= buffered_lat_min
-                        && geom_bbox.lat_min <= buffered_lat_max;
+                        if !intersects {
+                            return None;
+                        }
 
-                    if !intersects {
-                        continue;
-                    }
+                        // Clip the pre-simplified geometry to tile bounds
+                        let clip_start = std::time::Instant::now();
+                        let clipped = clip_geometry(&base_simplified, &tile_bounds, buffer)?;
+                        let clip_elapsed = clip_start.elapsed();
 
-                    // Clip the pre-simplified geometry to tile bounds
-                    let clip_start = std::time::Instant::now();
-                    let clipped = match clip_geometry(&base_simplified, &tile_bounds, buffer) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-                    time_clip += clip_start.elapsed();
+                        // Validate (simplification already done above)
+                        let validated = filter_valid_geometry(&clipped)?;
+
+                        // Check dropping rules after clipping
+                        if should_drop_geometry(
+                            &validated,
+                            z,
+                            config.max_zoom,
+                            config.extent,
+                            &tile_bounds,
+                            feat_idx,
+                        ) {
+                            return None;
+                        }
+
+                        // Serialize geometry to WKB
+                        let wkb_start = std::time::Instant::now();
+                        let wkb = match geometry_to_wkb(&validated) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                log::warn!("Failed to serialize geometry to WKB: {}", e);
+                                return None;
+                            }
+                        };
+                        let wkb_elapsed = wkb_start.elapsed();
+
+                        // Create record with tile_id and coordinates
+                        let tid = tile_id(z, tile_coord.x, tile_coord.y);
+                        let record = TileFeatureRecord::new(
+                            tid,
+                            z,
+                            tile_coord.x,
+                            tile_coord.y,
+                            feat_idx,
+                            wkb,
+                            vec![], // Empty properties for now
+                        );
+
+                        Some((record, clip_elapsed, wkb_elapsed))
+                    })
+                    .collect();
+
+                // Aggregate results (single-threaded) - preserves determinism via sort
+                tiles_touched += total_tiles_for_geom as u64;
+
+                // Sort by tile_id for deterministic insertion order
+                let mut sorted_results = results;
+                sorted_results.sort_by_key(|(r, _, _)| r.tile_id);
+
+                for (record, clip_elapsed, wkb_elapsed) in sorted_results {
+                    time_clip += clip_elapsed;
+                    time_wkb += wkb_elapsed;
                     clip_count += 1;
 
-                    // Validate (simplification already done above)
-                    let validated = match filter_valid_geometry(&clipped) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-
-                    // Check dropping rules after clipping
-                    if should_drop_geometry(
-                        &validated,
-                        z,
-                        config.max_zoom,
-                        config.extent,
-                        &tile_bounds,
-                        feat_idx,
-                    ) {
-                        continue;
-                    }
-
-                    // Serialize geometry to WKB
-                    let wkb_start = std::time::Instant::now();
-                    let wkb = match geometry_to_wkb(&validated) {
-                        Ok(bytes) => bytes,
-                        Err(e) => {
-                            log::warn!("Failed to serialize geometry to WKB: {}", e);
-                            continue;
-                        }
-                    };
-                    time_wkb += wkb_start.elapsed();
-
-                    // Track memory for this record being buffered in sorter
-                    // Record size = fixed overhead + geometry_wkb.len() + properties.len()
-                    let record_size = RECORD_FIXED_OVERHEAD + wkb.len();
+                    let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
                     memory_tracker.borrow_mut().add(record_size);
 
-                    // Create record with tile_id and coordinates
                     let sorter_start = std::time::Instant::now();
-                    let tid = tile_id(z, tile_coord.x, tile_coord.y);
-                    let record = TileFeatureRecord::new(
-                        tid,
-                        z,
-                        tile_coord.x,
-                        tile_coord.y,
-                        feat_idx,
-                        wkb,
-                        vec![], // Empty properties for now
-                    );
-
                     sorter.borrow_mut().add(record);
                     time_sorter_add += sorter_start.elapsed();
                     *records_written.borrow_mut() += 1;
+                }
+
+                if total_tiles_for_geom > 10000 {
+                    let elapsed = geom_tile_start.elapsed().as_secs_f64();
+                    let rate = total_tiles_for_geom as f64 / elapsed.max(0.001);
+                    eprintln!(
+                        "      geom {} PARALLEL done: {} tiles in {:.2}s ({:.0} tiles/sec)",
+                        geom_idx, total_tiles_for_geom, elapsed, rate
+                    );
+                }
+            } else {
+                // SEQUENTIAL PATH: Original code for small geometries
+                let mut tiles_processed_for_geom = 0usize;
+
+                for z in config.min_zoom..=config.max_zoom {
+                    let tiles: Vec<_> = tiles_for_bbox(&geom_bbox, z).collect();
+
+                    for tile_coord in tiles.into_iter() {
+                        tiles_processed_for_geom += 1;
+
+                        // Progress every 5000 tiles or 10% for large geometries
+                        if total_tiles_for_geom > 10000 && tiles_processed_for_geom % 5000 == 0 {
+                            let pct = 100.0 * tiles_processed_for_geom as f64
+                                / total_tiles_for_geom as f64;
+                            let elapsed = geom_tile_start.elapsed().as_secs_f64();
+                            let rate = tiles_processed_for_geom as f64 / elapsed.max(0.001);
+                            eprintln!(
+                                "      geom {} progress: {:.1}% ({}/{} tiles, {:.0} tiles/sec)",
+                                geom_idx, pct, tiles_processed_for_geom, total_tiles_for_geom, rate
+                            );
+                        }
+
+                        tiles_touched += 1;
+                        let tile_bounds = tile_coord.bounds();
+                        let buffer = buffer_pixels_to_degrees(
+                            config.buffer_pixels,
+                            &tile_bounds,
+                            config.extent,
+                        );
+
+                        // Check if geometry bbox intersects buffered tile bounds
+                        let buffered_lng_min = tile_bounds.lng_min - buffer;
+                        let buffered_lng_max = tile_bounds.lng_max + buffer;
+                        let buffered_lat_min = tile_bounds.lat_min - buffer;
+                        let buffered_lat_max = tile_bounds.lat_max + buffer;
+
+                        let intersects = geom_bbox.lng_max >= buffered_lng_min
+                            && geom_bbox.lng_min <= buffered_lng_max
+                            && geom_bbox.lat_max >= buffered_lat_min
+                            && geom_bbox.lat_min <= buffered_lat_max;
+
+                        if !intersects {
+                            continue;
+                        }
+
+                        // Clip the pre-simplified geometry to tile bounds
+                        let clip_start = std::time::Instant::now();
+                        let clipped = match clip_geometry(&base_simplified, &tile_bounds, buffer) {
+                            Some(c) => c,
+                            None => continue,
+                        };
+                        time_clip += clip_start.elapsed();
+                        clip_count += 1;
+
+                        // Validate (simplification already done above)
+                        let validated = match filter_valid_geometry(&clipped) {
+                            Some(v) => v,
+                            None => continue,
+                        };
+
+                        // Check dropping rules after clipping
+                        if should_drop_geometry(
+                            &validated,
+                            z,
+                            config.max_zoom,
+                            config.extent,
+                            &tile_bounds,
+                            feat_idx,
+                        ) {
+                            continue;
+                        }
+
+                        // Serialize geometry to WKB
+                        let wkb_start = std::time::Instant::now();
+                        let wkb = match geometry_to_wkb(&validated) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                log::warn!("Failed to serialize geometry to WKB: {}", e);
+                                continue;
+                            }
+                        };
+                        time_wkb += wkb_start.elapsed();
+
+                        // Track memory for this record being buffered in sorter
+                        // Record size = fixed overhead + geometry_wkb.len() + properties.len()
+                        let record_size = RECORD_FIXED_OVERHEAD + wkb.len();
+                        memory_tracker.borrow_mut().add(record_size);
+
+                        // Create record with tile_id and coordinates
+                        let sorter_start = std::time::Instant::now();
+                        let tid = tile_id(z, tile_coord.x, tile_coord.y);
+                        let record = TileFeatureRecord::new(
+                            tid,
+                            z,
+                            tile_coord.x,
+                            tile_coord.y,
+                            feat_idx,
+                            wkb,
+                            vec![], // Empty properties for now
+                        );
+
+                        sorter.borrow_mut().add(record);
+                        time_sorter_add += sorter_start.elapsed();
+                        *records_written.borrow_mut() += 1;
+                    }
                 }
             }
 
@@ -3611,5 +3740,133 @@ mod tests {
         );
 
         let _ = fs::remove_file(output_path);
+    }
+
+    // ========== Large Geometry Parallel Processing Tests ==========
+
+    #[test]
+    fn test_parallel_large_geometry_produces_same_as_sequential() {
+        // Test that parallel processing of large geometries (>1000 tiles)
+        // produces the same result as sequential processing.
+        //
+        // Uses a world-spanning polygon that touches many tiles across zoom levels.
+
+        // Create a large polygon spanning significant longitude range
+        // This will generate >1000 tiles across zoom 0-6
+        let large_poly = Geometry::Polygon(polygon![
+            (x: -150.0, y: -60.0),
+            (x: 150.0, y: -60.0),
+            (x: 150.0, y: 60.0),
+            (x: -150.0, y: 60.0),
+            (x: -150.0, y: -60.0),
+        ]);
+
+        let geometries = vec![large_poly];
+        let bbox = calculate_bbox_from_geometries(&geometries);
+
+        // Count expected tiles - this should exceed the parallel threshold (1000)
+        let config_for_count = TilerConfig::new(0, 6);
+        let total_tiles: usize = (config_for_count.min_zoom..=config_for_count.max_zoom)
+            .map(|z| tiles_for_bbox(&bbox, z).count())
+            .sum();
+        eprintln!("Large geometry will touch {} tiles", total_tiles);
+        assert!(
+            total_tiles > 1000,
+            "Test requires a geometry touching >1000 tiles, got {}",
+            total_tiles
+        );
+
+        // Test 1: TileIterator with sequential vs parallel should match
+        let config_seq = TilerConfig::new(0, 6).with_parallel(false);
+        let iter_seq = TileIterator::new(geometries.clone(), bbox.clone(), config_seq);
+        let tiles_seq: Vec<_> = iter_seq.filter_map(|r| r.ok()).collect();
+
+        let config_par = TilerConfig::new(0, 6).with_parallel(true);
+        let iter_par = TileIterator::new(geometries.clone(), bbox.clone(), config_par);
+        let tiles_par: Vec<_> = iter_par.filter_map(|r| r.ok()).collect();
+
+        assert_eq!(
+            tiles_seq.len(),
+            tiles_par.len(),
+            "Parallel ({}) and sequential ({}) should produce same tile count for large geometry",
+            tiles_par.len(),
+            tiles_seq.len()
+        );
+
+        // Sort and compare coordinates
+        let mut coords_seq: Vec<_> = tiles_seq.iter().map(|t| t.coord).collect();
+        let mut coords_par: Vec<_> = tiles_par.iter().map(|t| t.coord).collect();
+        coords_seq.sort_by_key(|c| (c.z, c.x, c.y));
+        coords_par.sort_by_key(|c| (c.z, c.x, c.y));
+
+        assert_eq!(
+            coords_seq, coords_par,
+            "Parallel should produce same tile coordinates for large geometry"
+        );
+
+        eprintln!(
+            "Large geometry: {} tiles match between parallel and sequential",
+            tiles_seq.len()
+        );
+    }
+
+    #[test]
+    fn test_parallel_external_sort_with_large_geometry() {
+        // Test external sort pipeline with parallel processing enabled
+        // for a large geometry that exceeds the parallel threshold.
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Run with parallel enabled (should use parallel path for large geometries)
+        let config_par = TilerConfig::new(0, 8)
+            .with_quiet(true)
+            .with_parallel(true)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer_par =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+        let _stats_par = generate_tiles_to_writer(fixture, &config_par, &mut writer_par)
+            .expect("Parallel external sort should work");
+
+        let output_par = Path::new("/tmp/test-parallel-external-sort.pmtiles");
+        let _ = fs::remove_file(output_par);
+        let write_stats_par = writer_par.finalize(output_par).expect("Should finalize");
+
+        // Run with parallel disabled
+        let config_seq = TilerConfig::new(0, 8)
+            .with_quiet(true)
+            .with_parallel(false)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer_seq =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+        let _stats_seq = generate_tiles_to_writer(fixture, &config_seq, &mut writer_seq)
+            .expect("Sequential external sort should work");
+
+        let output_seq = Path::new("/tmp/test-sequential-external-sort.pmtiles");
+        let _ = fs::remove_file(output_seq);
+        let write_stats_seq = writer_seq.finalize(output_seq).expect("Should finalize");
+
+        // Both modes should produce the same number of tiles
+        assert_eq!(
+            write_stats_par.total_tiles, write_stats_seq.total_tiles,
+            "Parallel ({}) and sequential ({}) external sort should produce same tile count",
+            write_stats_par.total_tiles, write_stats_seq.total_tiles
+        );
+
+        eprintln!(
+            "External sort: parallel={} tiles, sequential={} tiles",
+            write_stats_par.total_tiles, write_stats_seq.total_tiles
+        );
+
+        let _ = fs::remove_file(output_par);
+        let _ = fs::remove_file(output_seq);
     }
 }
