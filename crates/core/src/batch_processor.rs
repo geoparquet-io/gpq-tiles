@@ -223,6 +223,196 @@ pub fn calculate_bbox(path: &Path) -> Result<TileBounds> {
     Ok(bounds)
 }
 
+/// Row group metadata for streaming processing.
+#[derive(Debug, Clone)]
+pub struct RowGroupInfo {
+    /// Index of the row group in the file
+    pub index: usize,
+    /// Number of rows in this row group
+    pub num_rows: usize,
+}
+
+/// Process geometries in a GeoParquet file row-group by row-group.
+///
+/// This is the streaming-friendly version that yields geometries grouped by row group.
+/// Each row group is processed independently, allowing memory to be freed after each
+/// group is complete.
+///
+/// # Arguments
+///
+/// * `path` - Path to the GeoParquet file
+/// * `callback` - Function called for each row group's geometries: (row_group_info, geometries)
+///
+/// # Returns
+///
+/// Total number of geometries processed
+pub fn process_geometries_by_row_group<F>(path: &Path, mut callback: F) -> Result<usize>
+where
+    F: FnMut(RowGroupInfo, Vec<Geometry<f64>>) -> Result<()>,
+{
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    // Get row group count using the lower-level API
+    let parquet_reader = SerializedFileReader::new(
+        file.try_clone()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to clone file handle: {}", e)))?,
+    )
+    .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
+
+    let num_row_groups = parquet_reader.metadata().num_row_groups();
+
+    let mut total_processed = 0;
+
+    // Process each row group separately
+    for rg_idx in 0..num_row_groups {
+        let file = std::fs::File::open(path)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to reopen file: {}", e)))?;
+
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file)
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to create reader: {}", e)))?;
+
+        // Select only the current row group
+        let reader = builder
+            .with_row_groups(vec![rg_idx])
+            .build()
+            .map_err(|e| Error::GeoParquetRead(format!("Failed to build reader: {}", e)))?;
+
+        let mut row_group_geometries = Vec::new();
+        let mut row_count = 0;
+
+        for batch_result in reader {
+            let batch = batch_result
+                .map_err(|e| Error::GeoParquetRead(format!("Failed to read batch: {}", e)))?;
+
+            // Find geometry column by name
+            let schema = batch.schema();
+            let geom_idx = schema
+                .fields()
+                .iter()
+                .position(|f| f.name() == "geometry" || f.name().contains("geom"))
+                .ok_or_else(|| Error::GeoParquetRead("No geometry column found".to_string()))?;
+
+            let geom_col = batch.column(geom_idx);
+            let geom_field = schema.field(geom_idx);
+
+            // Convert Arrow array to GeoArrow geometry array
+            let geom_array: Arc<dyn GeoArrowArray> =
+                from_arrow_array(geom_col.as_ref(), geom_field).map_err(|e| {
+                    Error::GeoParquetRead(format!("Failed to parse geometry array: {}", e))
+                })?;
+
+            // Extract geometries from this batch into the row group's vector
+            extract_geometries_from_array(geom_array.as_ref(), &mut row_group_geometries)?;
+            row_count += batch.num_rows();
+        }
+
+        let rg_info = RowGroupInfo {
+            index: rg_idx,
+            num_rows: row_count,
+        };
+
+        total_processed += row_group_geometries.len();
+        callback(rg_info, row_group_geometries)?;
+    }
+
+    Ok(total_processed)
+}
+
+/// Extract geometries from a GeoArrow array into a Vec.
+fn extract_geometries_from_array(
+    array: &dyn GeoArrowArray,
+    output: &mut Vec<Geometry<f64>>,
+) -> Result<()> {
+    match array.data_type() {
+        GeoArrowType::Point(_) => {
+            let arr = array.as_point();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::LineString(_) => {
+            let arr = array.as_line_string();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::Polygon(_) => {
+            let arr = array.as_polygon();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::MultiPoint(_) => {
+            let arr = array.as_multi_point();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::MultiLineString(_) => {
+            let arr = array.as_multi_line_string();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::MultiPolygon(_) => {
+            let arr = array.as_multi_polygon();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::Geometry(_) => {
+            let arr = array.as_geometry();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::GeometryCollection(_) => {
+            let arr = array.as_geometry_collection();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::Wkb(_) => {
+            let arr = array.as_wkb::<i32>();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::LargeWkb(_) => {
+            let arr = array.as_wkb::<i64>();
+            extract_typed_array(arr, output)
+        }
+        GeoArrowType::WkbView(_) => {
+            let arr = array.as_wkb_view();
+            extract_typed_array(arr, output)
+        }
+        _ => Err(Error::GeoParquetRead(format!(
+            "Unsupported geometry type: {:?}",
+            array.data_type()
+        ))),
+    }
+}
+
+/// Extract geometries from a typed GeoArrow array into a Vec.
+fn extract_typed_array<'a, A>(accessor: &'a A, output: &mut Vec<Geometry<f64>>) -> Result<()>
+where
+    A: GeoArrowArrayAccessor<'a>,
+    A::Item: ToGeoGeometry<f64>,
+{
+    for (i, item) in accessor.iter().enumerate() {
+        if let Some(geom_result) = item {
+            let geom_trait = geom_result.map_err(|e| {
+                Error::GeoParquetRead(format!("Invalid geometry at index {}: {}", i, e))
+            })?;
+
+            if let Some(geo_geom) = geom_trait.try_to_geometry() {
+                output.push(geo_geom);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Get the number of row groups in a GeoParquet file.
+pub fn get_row_group_count(path: &Path) -> Result<usize> {
+    use parquet::file::reader::FileReader;
+    use parquet::file::serialized_reader::SerializedFileReader;
+
+    let file = std::fs::File::open(path)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to open: {}", e)))?;
+
+    let parquet_reader = SerializedFileReader::new(file)
+        .map_err(|e| Error::GeoParquetRead(format!("Failed to create parquet reader: {}", e)))?;
+
+    Ok(parquet_reader.metadata().num_row_groups())
+}
+
 /// Extract field metadata from a GeoParquet file's schema.
 ///
 /// Returns a mapping of field names to MVT-style types:
@@ -296,6 +486,83 @@ mod tests {
 
         assert!(result.is_ok());
         assert!(count > 100, "Should have many features, got {}", count);
+    }
+
+    #[test]
+    fn test_process_by_row_group_single_group() {
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let mut row_group_count = 0;
+        let mut total_geoms = 0;
+
+        let result = process_geometries_by_row_group(fixture, |info, geoms| {
+            row_group_count += 1;
+            total_geoms += geoms.len();
+            assert_eq!(
+                info.num_rows,
+                geoms.len(),
+                "Row count should match geometry count"
+            );
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(row_group_count >= 1, "Should have at least 1 row group");
+        assert!(
+            total_geoms > 100,
+            "Should have many geometries, got {}",
+            total_geoms
+        );
+    }
+
+    #[test]
+    fn test_process_by_row_group_multi_group() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let mut row_group_count = 0;
+        let mut total_geoms = 0;
+
+        let result = process_geometries_by_row_group(fixture, |_info, geoms| {
+            row_group_count += 1;
+            total_geoms += geoms.len();
+            Ok(())
+        });
+
+        assert!(result.is_ok());
+        assert!(
+            row_group_count > 1,
+            "Should have multiple row groups, got {}",
+            row_group_count
+        );
+        assert!(
+            total_geoms > 100,
+            "Should have many geometries, got {}",
+            total_geoms
+        );
+    }
+
+    #[test]
+    fn test_get_row_group_count() {
+        let fixture = Path::new("../../tests/fixtures/streaming/multi-rowgroup-small.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        let count = get_row_group_count(fixture).expect("Should get row group count");
+        assert!(
+            count > 1,
+            "Multi-rowgroup fixture should have >1 row groups, got {}",
+            count
+        );
     }
 
     #[test]
