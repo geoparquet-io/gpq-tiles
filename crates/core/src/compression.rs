@@ -33,6 +33,7 @@ impl Compression {
     /// Parse compression from string (case-insensitive).
     ///
     /// Valid values: "none", "gzip", "brotli", "zstd"
+    #[allow(clippy::should_implement_trait)]
     pub fn from_str(s: &str) -> Option<Self> {
         match s.to_lowercase().as_str() {
             "none" => Some(Compression::None),

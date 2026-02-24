@@ -4,7 +4,17 @@
 [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Fast GeoParquet → PMTiles converter in Rust. 1.4x faster than tippecanoe on typical workflows.
+Fast GeoParquet → PMTiles converter in Rust.
+
+## Status
+
+**Phase 5 complete** (329 tests passing). Core library and CLI are production-ready. Python bindings are basic but functional — [property filtering, streaming modes, and progress callbacks tracked in #45](https://github.com/geoparquet-io/gpq-tiles/issues/45).
+
+| Interface | Status | Feature Completeness |
+|-----------|--------|---------------------|
+| **CLI** | ✅ Production | Full (property filters, streaming, progress, compression) |
+| **Rust API** | ✅ Production | Full (all core functionality exposed) |
+| **Python API** | ⚠️ Basic | Basic conversion only (see [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45)) |
 
 ## Quick Start
 
@@ -24,7 +34,7 @@ gpq-tiles input.parquet output.pmtiles --exclude-all  # geometry only
 gpq-tiles input.parquet output.pmtiles --compression zstd  # fastest decompression
 ```
 
-**Python:**
+**Python** (basic API — property filters coming in [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45)):
 ```python
 from gpq_tiles import convert
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14, compression="zstd")
@@ -56,8 +66,8 @@ let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
 For optimal performance with large files, optimize your GeoParquet input:
 
 ```bash
-# Hilbert-sort and add row group bboxes with geoparquet-io
-gpq optimize input.parquet -o optimized.parquet --hilbert
+# Check and fix GeoParquet formatting with geoparquet-io
+gpio check all --fix input.parquet
 ```
 
 gpq-tiles will warn if input files aren't optimized. See [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) for file optimization tools.
@@ -95,7 +105,8 @@ cargo tarpaulin --out html    # Coverage report
 |----------|---------|
 | [ROADMAP.md](ROADMAP.md) | Implementation phases and progress |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development workflow, Python setup |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, tippecanoe divergences |
+| [context/ARCHITECTURE.md](context/ARCHITECTURE.md) | Design decisions, tippecanoe divergences |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
 | [CLAUDE.md](CLAUDE.md) | AI assistant instructions |
 
 ## Contributing

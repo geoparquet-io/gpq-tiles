@@ -757,6 +757,7 @@ pub fn generate_tiles_to_writer(
 ///
 /// Same as `generate_tiles_to_writer` but accepts a progress callback for monitoring.
 /// Currently only `StreamingMode::ExternalSort` supports detailed progress reporting.
+#[allow(clippy::type_complexity)]
 pub fn generate_tiles_to_writer_with_progress(
     input_path: &Path,
     config: &TilerConfig,
@@ -797,6 +798,7 @@ pub fn generate_tiles_to_writer_with_progress(
 ///
 /// Memory usage: ~1-2GB for large files (clipped geometries are ~90% smaller than originals)
 /// Speed: 1x (single file pass)
+#[allow(clippy::type_complexity)]
 fn generate_tiles_to_writer_fast(
     input_path: &Path,
     config: &TilerConfig,
@@ -970,6 +972,7 @@ fn generate_tiles_to_writer_fast(
 ///
 /// Memory usage: ~100-200MB peak (only one zoom level's tiles in memory)
 /// Speed: 2-3x slower (re-reads file for each zoom level)
+#[allow(clippy::type_complexity)]
 fn generate_tiles_to_writer_low_memory(
     input_path: &Path,
     config: &TilerConfig,
@@ -1287,7 +1290,7 @@ fn generate_tiles_to_writer_external_sort(
                 Some(rect) => {
                     let bounds =
                         TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                    result.bounds = Some(bounds.clone());
+                    result.bounds = Some(bounds);
                     bounds
                 }
                 None => return result,
@@ -1637,38 +1640,38 @@ fn generate_tiles_to_writer_external_sort(
         let record_tile = (record.z, record.x, record.y);
 
         // Check if we're starting a new tile
-        if current_tile.is_some() && current_tile != Some(record_tile) {
-            // Encode and write the previous tile
-            let (z, x, y) = current_tile.unwrap();
-            let coord = TileCoord::new(x, y, z);
-            let tile_bounds = coord.bounds();
+        if let Some((z, x, y)) = current_tile {
+            if (z, x, y) != record_tile {
+                let coord = TileCoord::new(x, y, z);
+                let tile_bounds = coord.bounds();
 
-            let mut layer_builder =
-                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
-            let mut feature_count = 0;
+                let mut layer_builder =
+                    LayerBuilder::new(&config.layer_name).with_extent(config.extent);
+                let mut feature_count = 0;
 
-            for (geom, feat_idx) in current_features.drain(..) {
-                layer_builder.add_feature(Some(feat_idx), &geom, &[], &tile_bounds);
-                feature_count += 1;
+                for (geom, feat_idx) in current_features.drain(..) {
+                    layer_builder.add_feature(Some(feat_idx), &geom, &[], &tile_bounds);
+                    feature_count += 1;
+                }
+
+                if feature_count > 0 {
+                    let layer = layer_builder.build();
+                    let mut tile_builder = TileBuilder::new();
+                    tile_builder.add_layer(layer);
+                    let tile = tile_builder.build();
+                    let encoded = tile.encode_to_vec();
+
+                    writer
+                        .add_tile_with_count(z, x, y, &encoded, feature_count)
+                        .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
+
+                    tiles_written += 1;
+                }
+
+                // Reset memory tracking for next tile - geometries are released
+                memory_tracker.lock().unwrap().remove(current_tile_memory);
+                current_tile_memory = 0;
             }
-
-            if feature_count > 0 {
-                let layer = layer_builder.build();
-                let mut tile_builder = TileBuilder::new();
-                tile_builder.add_layer(layer);
-                let tile = tile_builder.build();
-                let encoded = tile.encode_to_vec();
-
-                writer
-                    .add_tile_with_count(z, x, y, &encoded, feature_count)
-                    .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
-
-                tiles_written += 1;
-            }
-
-            // Reset memory tracking for next tile - geometries are released
-            memory_tracker.lock().unwrap().remove(current_tile_memory);
-            current_tile_memory = 0;
         }
 
         // Decode WKB back to geometry
@@ -1761,6 +1764,7 @@ pub struct StreamingResult {
 /// # Returns
 ///
 /// A tuple of (tiles, memory_stats) where memory_stats contains peak usage and budget info.
+#[allow(clippy::type_complexity)]
 pub fn generate_tiles_streaming_with_stats(
     input_path: &Path,
     config: &TilerConfig,
@@ -2989,7 +2993,7 @@ mod tests {
 
         // Test with Hilbert curve (default)
         let config_hilbert = TilerConfig::new(0, 2).with_hilbert(true);
-        let iter_hilbert = TileIterator::new(geometries.clone(), bbox.clone(), config_hilbert);
+        let iter_hilbert = TileIterator::new(geometries.clone(), bbox, config_hilbert);
 
         // The TileIterator should sort geometries before processing
         // We verify this by checking that the geometries are sorted
@@ -3006,7 +3010,7 @@ mod tests {
 
         // Test with Z-order
         let config_zorder = TilerConfig::new(0, 2).with_hilbert(false);
-        let iter_zorder = TileIterator::new(geometries.clone(), bbox.clone(), config_zorder);
+        let iter_zorder = TileIterator::new(geometries.clone(), bbox, config_zorder);
 
         // The config should have use_hilbert = false
         assert!(
@@ -3125,12 +3129,12 @@ mod tests {
 
         // Sequential mode
         let config_seq = TilerConfig::new(0, 4).with_parallel(false);
-        let iter_seq = TileIterator::new(geometries.clone(), bbox.clone(), config_seq);
+        let iter_seq = TileIterator::new(geometries.clone(), bbox, config_seq);
         let tiles_seq: Vec<_> = iter_seq.filter_map(|r| r.ok()).collect();
 
         // Parallel mode
         let config_par = TilerConfig::new(0, 4).with_parallel(true);
-        let iter_par = TileIterator::new(geometries.clone(), bbox.clone(), config_par);
+        let iter_par = TileIterator::new(geometries.clone(), bbox, config_par);
         let tiles_par: Vec<_> = iter_par.filter_map(|r| r.ok()).collect();
 
         // Same number of tiles
@@ -3381,7 +3385,10 @@ mod tests {
             return;
         }
 
-        let config = TilerConfig::new(0, 4);
+        // Test at various zoom levels to verify the streaming function works correctly
+        // The fixture contains polygons in Andorra (lat ~42.5, lng ~1.6-1.8)
+        // At zoom 6+, there should be tiles generated
+        let config = TilerConfig::new(0, 6);
 
         let (tiles, stats) =
             generate_tiles_streaming_with_stats(fixture, &config).expect("streaming should work");
@@ -3793,11 +3800,11 @@ mod tests {
 
         // Test 1: TileIterator with sequential vs parallel should match
         let config_seq = TilerConfig::new(0, 6).with_parallel(false);
-        let iter_seq = TileIterator::new(geometries.clone(), bbox.clone(), config_seq);
+        let iter_seq = TileIterator::new(geometries.clone(), bbox, config_seq);
         let tiles_seq: Vec<_> = iter_seq.filter_map(|r| r.ok()).collect();
 
         let config_par = TilerConfig::new(0, 6).with_parallel(true);
-        let iter_par = TileIterator::new(geometries.clone(), bbox.clone(), config_par);
+        let iter_par = TileIterator::new(geometries.clone(), bbox, config_par);
         let tiles_par: Vec<_> = iter_par.filter_map(|r| r.ok()).collect();
 
         assert_eq!(

@@ -77,7 +77,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
             &config,
             |b, config| {
                 b.iter(|| {
-                    let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config)
+                    let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), config)
                         .expect("generate_tiles failed")
                         .collect();
                     black_box(tiles)

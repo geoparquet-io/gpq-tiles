@@ -12,7 +12,7 @@ use gpq_tiles_core::pipeline::{
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::PropertyFilter;
 use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -236,8 +236,8 @@ fn main() -> Result<()> {
 
 /// Print a succinct summary of the conversion
 fn print_summary(
-    input: &PathBuf,
-    output: &PathBuf,
+    input: &Path,
+    output: &Path,
     write_stats: &gpq_tiles_core::pmtiles_writer::StreamingWriteStats,
     peak_memory: usize,
     duration: Duration,
@@ -290,7 +290,7 @@ fn format_number(n: u64) -> String {
 
 /// Run tile generation with progress bars for ExternalSort mode
 fn run_with_progress(
-    input: &PathBuf,
+    input: &Path,
     config: &TilerConfig,
     writer: &mut StreamingPmtilesWriter,
     verbose: bool,

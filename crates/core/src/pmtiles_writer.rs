@@ -969,9 +969,10 @@ impl StreamingPmtilesWriter {
         data: &[u8],
         feature_count: usize,
     ) -> std::io::Result<()> {
-        let temp_file = self.temp_file.as_mut().ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::Other, "Writer already finalized")
-        })?;
+        let temp_file = self
+            .temp_file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("Writer already finalized"))?;
 
         let id = tile_id(z, x, y);
         self.stats.total_tiles += 1;

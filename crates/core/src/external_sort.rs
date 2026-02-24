@@ -185,7 +185,7 @@ impl TileFeatureSorter {
     pub fn sort(self) -> std::io::Result<impl Iterator<Item = std::io::Result<TileFeatureRecord>>> {
         let sorter = ExternalSorter::new().with_segment_size(self.sort_buffer_size);
 
-        sorter.sort(self.records.into_iter())
+        sorter.sort(self.records)
     }
 }
 

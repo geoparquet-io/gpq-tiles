@@ -1,0 +1,62 @@
+site_name: gpq-tiles
+site_description: Fast GeoParquet → PMTiles converter in Rust
+site_author: Nissim Lebovits
+site_url: https://geoparquet-io.github.io/gpq-tiles/
+repo_name: geoparquet-io/gpq-tiles
+repo_url: https://github.com/geoparquet-io/gpq-tiles
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  palette:
+    - scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to dark mode
+    - scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to light mode
+  features:
+    - navigation.top
+    - navigation.sections
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/geoparquet-io/gpq-tiles
+      name: gpq-tiles on GitHub
+
+plugins:
+  - search
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.highlight
+  - tables
+  - toc:
+      permalink: true
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - API Reference: api-reference.md
+  - Advanced Usage: advanced-usage.md
+  - Architecture: architecture.md
+  - Development: development.md
+  - Roadmap: roadmap.md
+  - Contributing: contributing.md
+  - Changelog: changelog.md

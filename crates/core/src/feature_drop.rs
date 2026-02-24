@@ -1052,7 +1052,7 @@ mod tests {
             let area = polygon_area_in_tile_coords(&polygon, &tile_bounds, extent);
             // Allow some tolerance in area calculation
             assert!(
-                area >= 1.5 && area <= 2.5,
+                (1.5..=2.5).contains(&area),
                 "Polygon {} should be ~2 sq pixels, got {}",
                 i,
                 area
@@ -1074,7 +1074,7 @@ mod tests {
         // Allow 20% margin for statistical variance
         let drop_ratio = drop_count as f64 / num_tests as f64;
         assert!(
-            drop_ratio >= 0.3 && drop_ratio <= 0.7,
+            (0.3..=0.7).contains(&drop_ratio),
             "Expected ~50% drop rate for 2 sq pixel polygons, got {:.0}% ({} dropped, {} kept)",
             drop_ratio * 100.0,
             drop_count,
