@@ -24,6 +24,10 @@ pub struct GeoParquetQuality {
     pub has_row_group_bboxes: bool,
     /// Number of row groups in the file
     pub row_group_count: usize,
+    /// Total number of rows in the file
+    pub total_rows: usize,
+    /// Average rows per row group
+    pub avg_rows_per_group: usize,
     /// File size in bytes
     pub file_size_bytes: u64,
     /// Percentage of row groups with overlapping bboxes (None if not checked)
@@ -32,12 +36,16 @@ pub struct GeoParquetQuality {
     pub is_hilbert_sorted: Option<bool>,
 }
 
+/// Minimum recommended rows per row group for efficient processing
+pub const MIN_RECOMMENDED_ROWS_PER_GROUP: usize = 100;
+
 impl GeoParquetQuality {
     /// Returns true if the file is well-optimized for streaming
     pub fn is_optimized(&self) -> bool {
         self.has_geo_metadata
             && (self.row_group_count <= 1 || self.has_row_group_bboxes)
             && self.is_hilbert_sorted.unwrap_or(true)
+            && self.avg_rows_per_group >= MIN_RECOMMENDED_ROWS_PER_GROUP
     }
 
     /// Returns a list of optimization suggestions
@@ -51,6 +59,17 @@ impl GeoParquetQuality {
         if self.row_group_count > 1 && !self.has_row_group_bboxes {
             suggestions
                 .push("Row groups lack bounding box metadata - cannot skip spatially".to_string());
+        }
+
+        // Check for pathologically small row groups (major performance issue!)
+        // Recommended: 50,000-150,000 rows per group, minimum 100 for reasonable perf
+        if self.row_group_count > 1 && self.avg_rows_per_group < MIN_RECOMMENDED_ROWS_PER_GROUP {
+            suggestions.push(format!(
+                "Row groups too small: {} rows/group (need {}+). This causes ~{}x slowdown!",
+                self.avg_rows_per_group,
+                MIN_RECOMMENDED_ROWS_PER_GROUP,
+                MIN_RECOMMENDED_ROWS_PER_GROUP / self.avg_rows_per_group.max(1)
+            ));
         }
 
         // Large file with few row groups
@@ -108,6 +127,12 @@ pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
         .unwrap_or(false);
 
     let row_group_count = parquet_metadata.num_row_groups();
+    let total_rows = parquet_metadata.file_metadata().num_rows() as usize;
+    let avg_rows_per_group = if row_group_count > 0 {
+        total_rows / row_group_count
+    } else {
+        0
+    };
 
     // Check for row group bboxes (would be in column statistics or custom metadata)
     // For now, we check if row groups have statistics on geometry-like columns
@@ -124,6 +149,8 @@ pub fn assess_quality(path: &Path) -> Result<GeoParquetQuality> {
         has_geo_metadata,
         has_row_group_bboxes,
         row_group_count,
+        total_rows,
+        avg_rows_per_group,
         file_size_bytes,
         row_group_overlap_pct: None, // TODO: implement bbox overlap check
         is_hilbert_sorted,
@@ -272,15 +299,30 @@ pub fn emit_quality_warnings(quality: &GeoParquetQuality, quiet: bool) {
         return;
     }
 
+    // Check if this is a severe row group issue (major performance impact)
+    let has_row_group_issue =
+        quality.row_group_count > 1 && quality.avg_rows_per_group < MIN_RECOMMENDED_ROWS_PER_GROUP;
+
     eprintln!("\n⚠ Input file not optimized for streaming:");
     for suggestion in &suggestions {
         eprintln!("  • {}", suggestion);
     }
     eprintln!();
-    eprintln!("  For best performance, optimize with geoparquet-io:");
-    eprintln!("    gpq optimize input.parquet -o optimized.parquet --hilbert");
+
+    if has_row_group_issue {
+        eprintln!("  Row group sizing is critical for performance!");
+        eprintln!("  See: https://geoparquet.io/concepts/best-practices/#row-group-sizing");
+        eprintln!();
+        eprintln!("  Fix with gpio:");
+        eprintln!("    gpio convert input.parquet output.parquet --row-group-size 100000");
+    } else {
+        eprintln!("  For best performance, optimize with geoparquet-io:");
+        eprintln!(
+            "    gpio convert input.parquet output.parquet --hilbert --row-group-size 100000"
+        );
+    }
     eprintln!();
-    eprintln!("  Proceeding anyway (may use more memory)...\n");
+    eprintln!("  Proceeding anyway (may be slow)...\n");
 }
 
 #[cfg(test)]

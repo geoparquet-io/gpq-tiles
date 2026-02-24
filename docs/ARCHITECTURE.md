@@ -69,6 +69,24 @@ Validated against tippecanoe v2.49.0 using `open-buildings.parquet` (~1000 build
 - Area preservation after clip+simplify: 88%
 - All zoom levels produce valid MVT tiles
 
+## GeoParquet File Structure: Critical Performance Factor
+
+**Row group size dramatically affects performance.** Our pipeline has per-row-group overhead (memory tracking, progress reporting, sorter flushes), so files with many small row groups are pathologically slow.
+
+| File | Size | Rows | Row Groups | Rows/Group | Performance |
+|------|------|------|------------|------------|-------------|
+| ADM4 | 3.2 GB | 363,783 | 364 | ~1,000 | ✅ Good (3 min) |
+| ADM2 | 1.9 GB | 43,064 | 4,307 | ~10 | ❌ Very slow |
+
+**Rule of thumb:** Aim for 1,000+ rows per row group. Files with <100 rows/group will have significant overhead.
+
+**Why this happens:**
+- Each row group triggers progress callbacks, memory tracking, and sorter operations
+- The external sort flushes buffers based on record count, not row groups
+- Small row groups = more overhead per feature processed
+
+**Recommendation:** If you control file creation, use larger row groups. If processing files with small row groups, consider consolidating them first with tools like DuckDB or gpio.
+
 ## Streaming Processing
 
 ### The Challenge
