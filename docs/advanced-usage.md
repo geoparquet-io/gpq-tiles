@@ -11,14 +11,14 @@
 cargo install geoparquet-io
 
 # Check and fix GeoParquet formatting
-gpio check --fix input.parquet
+gpio check all --fix input.parquet
 ```
 
 gpq-tiles will warn if input files lack optimization metadata:
 
 ```
 ⚠ WARNING: File lacks spatial metadata (row group bboxes).
-  For optimal performance, use: gpio check --fix
+  For optimal performance, use: gpio check all --fix
 ```
 
 **Why this matters:**
@@ -67,7 +67,7 @@ gpq-tiles large.parquet output.pmtiles --streaming-mode low-memory
 **Fast mode:**
 - Processes one row group at a time
 - Memory bounded by largest row group (typically 100-200MB)
-- Requires well-formatted input (`gpio check --fix`)
+- Requires well-formatted input (`gpio check all --fix`)
 
 **Low-memory mode:**
 - Sorts features to disk
@@ -332,7 +332,7 @@ match generate_tiles_to_writer(path, &config, &mut writer) {
 
 **Solution:**
 ```bash
-gpio check --fix input.parquet
+gpio check all --fix input.parquet
 gpq-tiles input.parquet output.pmtiles
 ```
 
@@ -348,7 +348,7 @@ gpq-tiles input.parquet output.pmtiles
 
 2. Optimize input file (improves row-group locality):
    ```bash
-   gpio check --fix input.parquet
+   gpio check all --fix input.parquet
    ```
 
 3. Reduce zoom range:
@@ -360,7 +360,7 @@ gpq-tiles input.parquet output.pmtiles
 
 **Common causes:**
 
-1. **Unoptimized input** — Use `gpio check --fix`
+1. **Unoptimized input** — Use `gpio check all --fix`
 2. **Too many properties** — Filter with `--include` or `--exclude`
 3. **Excessive zoom levels** — Reduce `--max-zoom`
 4. **Slow compression** — Use `--compression zstd` instead of brotli
@@ -385,7 +385,7 @@ gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 18
 **Solution:**
 ```bash
 # Check and fix with geoparquet-io
-gpio check --fix input.parquet
+gpio check all --fix input.parquet
 gpq-tiles input.parquet output.pmtiles
 ```
 

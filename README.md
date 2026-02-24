@@ -67,7 +67,7 @@ For optimal performance with large files, optimize your GeoParquet input:
 
 ```bash
 # Check and fix GeoParquet formatting with geoparquet-io
-gpio check --fix input.parquet
+gpio check all --fix input.parquet
 ```
 
 gpq-tiles will warn if input files aren't optimized. See [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) for file optimization tools.
