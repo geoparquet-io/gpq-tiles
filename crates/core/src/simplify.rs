@@ -56,10 +56,32 @@ pub fn simplify_for_zoom(geom: &Geometry<f64>, zoom: u8, extent: u32) -> Geometr
         Geometry::Point(_) | Geometry::MultiPoint(_) => geom.clone(),
 
         // Apply RDP simplification to line/polygon types
-        Geometry::LineString(ls) => Geometry::LineString(ls.simplify(&tolerance)),
+        // Guard against degenerate geometries: geo::Simplify panics on linestrings
+        // with < 2 points. Return unchanged; they'll be filtered by filter_valid_geometry.
+        Geometry::LineString(ls) => {
+            if ls.0.len() < 2 {
+                return geom.clone();
+            }
+            Geometry::LineString(ls.simplify(&tolerance))
+        }
         Geometry::Polygon(poly) => Geometry::Polygon(poly.simplify(&tolerance)),
         Geometry::MultiPolygon(mp) => Geometry::MultiPolygon(mp.simplify(&tolerance)),
-        Geometry::MultiLineString(mls) => Geometry::MultiLineString(mls.simplify(&tolerance)),
+        Geometry::MultiLineString(mls) => {
+            // Handle degenerate linestrings within the multi - return unchanged
+            // (they'll be filtered by filter_valid_geometry later)
+            let simplified_lines: Vec<LineString<f64>> = mls
+                .0
+                .iter()
+                .map(|ls| {
+                    if ls.0.len() < 2 {
+                        ls.clone()
+                    } else {
+                        ls.simplify(&tolerance)
+                    }
+                })
+                .collect();
+            Geometry::MultiLineString(MultiLineString::new(simplified_lines))
+        }
 
         // GeometryCollection and other types pass through unchanged
         other => other.clone(),

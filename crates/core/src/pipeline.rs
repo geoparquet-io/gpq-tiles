@@ -3381,7 +3381,10 @@ mod tests {
             return;
         }
 
-        let config = TilerConfig::new(0, 4);
+        // Test at various zoom levels to verify the streaming function works correctly
+        // The fixture contains polygons in Andorra (lat ~42.5, lng ~1.6-1.8)
+        // At zoom 6+, there should be tiles generated
+        let config = TilerConfig::new(0, 6);
 
         let (tiles, stats) =
             generate_tiles_streaming_with_stats(fixture, &config).expect("streaming should work");
