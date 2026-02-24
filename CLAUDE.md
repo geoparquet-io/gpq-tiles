@@ -12,12 +12,23 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Prefer concise, DRY documentation. One doc, one purpose.**
 
+### Folder Structure
+
+| Folder | Purpose |
+|--------|---------|
+| `docs/` | Human-facing documentation only (mkdocs site content) |
+| `context/` | AI/developer context: architecture, plans, design decisions |
+
+### Key Documents
+
 | Document | Purpose | When to Update |
 |----------|---------|----------------|
 | `README.md` | Quick start, links to other docs | Major user-facing changes |
 | `ROADMAP.md` | Implementation phases, progress tracking | Phase milestones, test counts |
-| `docs/ARCHITECTURE.md` | Design decisions, tippecanoe divergences | Algorithm changes, new divergences |
+| `context/ARCHITECTURE.md` | Design decisions, tippecanoe divergences | Algorithm changes, new divergences |
+| `context/plans/` | Implementation plans and design docs | New features, major changes |
 | `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup | New tools, workflow changes |
+| `CONTRIBUTING.md` | How to contribute, commit conventions | Process changes |
 | `CLAUDE.md` | AI assistant instructions | Process changes, new pitfalls |
 
 **Rules:**
@@ -25,6 +36,8 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 - Never duplicate content across docs
 - Delete docs that serve no unique purpose
 - Update test counts in ROADMAP.md, not elsewhere
+- `docs/` is ONLY for mkdocs human-facing content
+- `context/` is for architecture, plans, and AI context
 
 ## Critical Constraints
 
@@ -72,7 +85,7 @@ DO NOT:
 let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
 ```
 
-**See also:** `docs/plans/2026-02-23-streaming-design.md` for streaming architecture details.
+**See also:** `context/plans/2026-02-23-streaming-design.md` for streaming architecture details.
 
 ### 3. Reference Implementations (CRITICAL)
 
@@ -88,7 +101,7 @@ let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
 // We do Y because [Rust limitation / performance / etc.]
 ```
 
-Document all divergences in `docs/ARCHITECTURE.md`.
+Document all divergences in `context/ARCHITECTURE.md`.
 
 ## Architecture
 
@@ -128,6 +141,22 @@ cargo run --package gpq-tiles -- input.parquet output.pmtiles
 5. **rstar**: Listed in deps but we use space-filling curves for spatial indexing instead
 6. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
 7. **Streaming vs non-streaming**: `generate_tiles_streaming()` exists but `generate_tiles()` is the default. Streaming is for files larger than memory
+
+## Commit Convention
+
+We use [Conventional Commits](https://www.conventionalcommits.org/). See `CONTRIBUTING.md` for details.
+
+```bash
+# Examples
+feat: add WKT geometry encoding support
+fix: guard against degenerate linestrings in simplify
+perf(core): parallelize geometry processing
+docs: update ROADMAP with Phase 9
+
+# With scope
+feat(cli): add --streaming-mode flag
+fix(core): prevent OOM on large files
+```
 
 ## Setup
 
