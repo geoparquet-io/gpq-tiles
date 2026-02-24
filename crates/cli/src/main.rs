@@ -64,9 +64,25 @@ struct Args {
     #[arg(short = 'X', long = "exclude-all")]
     exclude_all: bool,
 
-    /// Compression algorithm for tiles (gzip, brotli, zstd, none)
-    #[arg(long, default_value = "gzip")]
+    /// Compression algorithm for tiles (zstd, gzip, brotli, none)
+    ///
+    /// Zstd is recommended: faster encoding/decoding than gzip at similar ratios.
+    #[arg(long, default_value = "zstd")]
     compression: String,
+
+    /// Disable parallel tile generation within large geometries
+    ///
+    /// By default, geometries that produce >1000 tiles are processed in parallel.
+    /// Use this flag to disable for debugging or deterministic output.
+    #[arg(long)]
+    no_parallel: bool,
+
+    /// Disable parallel geometry processing within row groups
+    ///
+    /// By default, geometries within each row group are processed in parallel.
+    /// Use this flag to disable for debugging or deterministic output.
+    #[arg(long)]
+    no_parallel_geoms: bool,
 
     /// Enable verbose logging with progress bars
     #[arg(short, long)]
@@ -160,6 +176,8 @@ fn main() -> Result<()> {
         .with_layer_name(&layer_name)
         .with_property_filter(property_filter)
         .with_streaming_mode(streaming_mode)
+        .with_parallel(!args.no_parallel)
+        .with_parallel_geoms(!args.no_parallel_geoms)
         .with_quiet(use_progress); // Suppress log output when we have progress bars
 
     // Print configuration in verbose mode
@@ -170,6 +188,11 @@ fn main() -> Result<()> {
         eprintln!("  Zoom: {}-{}", args.min_zoom, args.max_zoom);
         eprintln!("  Streaming mode: {:?}", args.streaming_mode);
         eprintln!("  Compression: {}", args.compression);
+        eprintln!(
+            "  Parallel: {} (tiles), {} (geoms)",
+            if args.no_parallel { "off" } else { "on" },
+            if args.no_parallel_geoms { "off" } else { "on" }
+        );
         eprintln!();
     }
 

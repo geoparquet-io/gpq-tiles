@@ -89,6 +89,39 @@ cargo bench -- --save-baseline before
 cargo bench -- --baseline before
 ```
 
+### Large File Benchmarks (ADM4)
+
+**CRITICAL:** For accurate benchmarks, you MUST use `--streaming-mode external-sort`.
+
+The default `fast` mode processes row groups sequentially. Only `external-sort` mode
+enables full parallelization (both `parallel` and `parallel_geoms`), which is 4x faster.
+
+```bash
+# CORRECT: Full parallelization (~3 min on 16-core machine)
+cargo run --release -- input.parquet output.pmtiles \
+    --streaming-mode external-sort \
+    --min-zoom 0 --max-zoom 8
+
+# WRONG: Sequential processing (~12 min) - DO NOT USE FOR BENCHMARKS
+cargo run --release -- input.parquet output.pmtiles \
+    --min-zoom 0 --max-zoom 8
+```
+
+The ADM4 test file (3.3GB, ~364k features) can be downloaded from:
+https://data.fieldmaps.io/edge-matched/humanitarian/intl/adm4_polygons.parquet
+
+Place it in `tests/fixtures/large/` (this directory is gitignored).
+
+**Expected benchmark output with external-sort:**
+```
+⠋ Reading GeoParquet [████████████████████████████████████████] 364/364 row groups | ✓ 363,783 records
+⠋ Sorting by tile ID... ✓ Sorted
+⠋ Encoding tiles [████████████████████████████████████████] 530033/530033 (100%)
+✓ Converted adm4_polygons.parquet → output.pmtiles
+       530,033 tiles in 3 minutes (2889 tiles/sec)
+  5.17 GiB peak memory
+```
+
 ### Code Quality
 
 ```bash

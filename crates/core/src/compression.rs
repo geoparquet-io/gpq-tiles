@@ -23,9 +23,9 @@ use std::io::{self, Write};
 pub enum Compression {
     Unknown = 0,
     None = 1,
-    #[default]
     Gzip = 2,
     Brotli = 3,
+    #[default]
     Zstd = 4,
 }
 
@@ -136,8 +136,12 @@ mod tests {
     }
 
     #[test]
-    fn test_compression_default_is_gzip() {
-        assert_eq!(Compression::default(), Compression::Gzip);
+    fn test_compression_default_is_zstd() {
+        // Zstd is the recommended default for GeoParquet workflows:
+        // - Faster encoding than gzip at similar ratios
+        // - Faster decoding (important for tile serving)
+        // - Recommended by GeoParquet spec
+        assert_eq!(Compression::default(), Compression::Zstd);
     }
 
     #[test]
