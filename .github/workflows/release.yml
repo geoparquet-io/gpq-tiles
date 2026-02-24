@@ -134,6 +134,11 @@ jobs:
           target: x86_64
           manylinux: auto
           args: --release --out dist -m crates/python/Cargo.toml
+          before-script-linux: |
+            # Install protoc inside manylinux container
+            curl -LO https://github.com/protocolbuffers/protobuf/releases/download/v25.1/protoc-25.1-linux-x86_64.zip
+            unzip protoc-25.1-linux-x86_64.zip -d /usr/local
+            rm protoc-25.1-linux-x86_64.zip
 
       - name: Build wheels (macOS)
         if: runner.os == 'macOS'
