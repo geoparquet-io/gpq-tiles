@@ -6,6 +6,16 @@
 
 Fast GeoParquet → PMTiles converter in Rust. 1.4x faster than tippecanoe on typical workflows.
 
+## Status
+
+**Phase 5 complete** (329 tests passing). Core library and CLI are production-ready. Python bindings are basic but functional — [property filtering, streaming modes, and progress callbacks tracked in #45](https://github.com/geoparquet-io/gpq-tiles/issues/45).
+
+| Interface | Status | Feature Completeness |
+|-----------|--------|---------------------|
+| **CLI** | ✅ Production | Full (property filters, streaming, progress, compression) |
+| **Rust API** | ✅ Production | Full (all core functionality exposed) |
+| **Python API** | ⚠️ Basic | Basic conversion only (see [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45)) |
+
 ## Quick Start
 
 ```bash
@@ -24,7 +34,7 @@ gpq-tiles input.parquet output.pmtiles --exclude-all  # geometry only
 gpq-tiles input.parquet output.pmtiles --compression zstd  # fastest decompression
 ```
 
-**Python:**
+**Python** (basic API — property filters coming in [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45)):
 ```python
 from gpq_tiles import convert
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14, compression="zstd")
