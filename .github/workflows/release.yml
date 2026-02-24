@@ -1,15 +1,15 @@
-# Tag-based release workflow for Rust crates
+# Consolidated release workflow for Rust crates and Python wheels
 #
 # This workflow:
-# 1. Detects if the merged commit is a version bump
-# 2. If yes: creates git tag, publishes to crates.io, creates GitHub Release
+# 1. Detects if the push includes a version bump commit
+# 2. If yes: publishes to crates.io and PyPI, creates git tag and GitHub Release
 # 3. If no: exits successfully (normal PR merge)
 #
 # Developer workflow:
 # 1. Update version in Cargo.toml (workspace.package.version)
 # 2. Update CHANGELOG.md
 # 3. Commit: "bump: vX.Y.Z"
-# 4. Merge → this workflow creates tag and publishes
+# 4. Merge to main → this workflow creates tag and publishes to all platforms
 name: Release
 
 on:
@@ -18,10 +18,33 @@ on:
   workflow_dispatch:
 
 jobs:
-  release:
-    name: Release to crates.io
+  check-version:
+    name: Check for version bump
     runs-on: ubuntu-latest
-    if: startsWith(github.event.head_commit.message, 'bump:') || github.event_name == 'workflow_dispatch'
+    outputs:
+      is_bump: ${{ steps.check.outputs.is_bump }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check for version bump commit
+        id: check
+        run: |
+          # Check current commit and parent for 'bump:' prefix
+          # Needed because PR merges create a merge commit, but the bump is in parent
+          if git log -2 --format=%B | grep -q "^bump:"; then
+            echo "is_bump=true" >> $GITHUB_OUTPUT
+            echo "Found version bump in recent commits"
+          else
+            echo "is_bump=false" >> $GITHUB_OUTPUT
+          fi
+
+  release-rust:
+    name: Release to crates.io
+    needs: check-version
+    if: needs.check-version.outputs.is_bump == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
@@ -98,3 +121,104 @@ jobs:
             --notes "See [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details."
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  build-wheels:
+    name: Build wheels (${{ matrix.os }})
+    needs: check-version
+    if: needs.check-version.outputs.is_bump == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install protoc (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y protobuf-compiler
+
+      - name: Install protoc (macOS)
+        if: runner.os == 'macOS'
+        run: brew install protobuf
+
+      - name: Install protoc (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build wheels (Linux)
+        if: runner.os == 'Linux'
+        uses: PyO3/maturin-action@v1
+        with:
+          target: x86_64
+          manylinux: auto
+          args: --release --out dist -m crates/python/Cargo.toml
+
+      - name: Build wheels (macOS)
+        if: runner.os == 'macOS'
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist -m crates/python/Cargo.toml
+
+      - name: Build wheels (Windows)
+        if: runner.os == 'Windows'
+        uses: PyO3/maturin-action@v1
+        with:
+          args: --release --out dist -m crates/python/Cargo.toml
+
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.os }}
+          path: dist
+
+  build-sdist:
+    name: Build source distribution
+    needs: check-version
+    if: needs.check-version.outputs.is_bump == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          command: sdist
+          args: --out dist -m crates/python/Cargo.toml
+
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: dist
+
+  publish-python:
+    name: Publish to PyPI
+    needs: [check-version, build-wheels, build-sdist]
+    if: needs.check-version.outputs.is_bump == 'true' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write  # Required for trusted publishing
+    steps:
+      - name: Download all wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          print-hash: true
+          # Uses trusted publishing (OIDC) by default
+          # Falls back to PYPI_API_TOKEN if trusted publishing not configured
