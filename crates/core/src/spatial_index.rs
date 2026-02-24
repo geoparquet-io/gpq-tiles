@@ -368,7 +368,7 @@ pub fn spatial_index_for_geometry(geom: &Geometry<f64>, use_hilbert: bool) -> u6
 ///
 /// // Geometries near each other spatially are now adjacent in the list
 /// ```
-pub fn sort_geometries(geometries: &mut Vec<Geometry<f64>>, use_hilbert: bool) {
+pub fn sort_geometries(geometries: &mut [Geometry<f64>], use_hilbert: bool) {
     geometries.sort_by_cached_key(|geom| {
         let (wx, wy) = geometry_world_coords(geom).unwrap_or((0, 0));
         if use_hilbert {

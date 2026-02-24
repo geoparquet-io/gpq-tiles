@@ -236,7 +236,7 @@ mod tests {
         // With feature dropping implemented, we should be in a reasonable range
         // We tend to drop slightly more aggressively (0.78x at Z8)
         assert!(
-            ratio >= 0.3 && ratio <= 2.0,
+            (0.3..=2.0).contains(&ratio),
             "Z8 feature count ratio ({:.2}x) should be between 0.3x and 2.0x of tippecanoe",
             ratio
         );

@@ -380,7 +380,7 @@ mod tests {
         let mut props = HashMap::new();
         props.insert("int_val".to_string(), PropertyValue::Int(-42));
         props.insert("uint_val".to_string(), PropertyValue::UInt(42));
-        props.insert("float_val".to_string(), PropertyValue::Float(3.14159));
+        props.insert("float_val".to_string(), PropertyValue::Float(3.14158));
 
         let bytes = serialize_properties(&props).expect("serialize should succeed");
         let restored = deserialize_properties(&bytes).expect("deserialize should succeed");

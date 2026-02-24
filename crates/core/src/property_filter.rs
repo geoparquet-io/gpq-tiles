@@ -15,9 +15,10 @@ use std::collections::HashSet;
 /// - `Include` corresponds to `-y` flag (whitelist)
 /// - `Exclude` corresponds to `-x` flag (blacklist)
 /// - `ExcludeAll` corresponds to `-X` flag (geometry only)
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum PropertyFilter {
     /// Include all properties (no filtering)
+    #[default]
     None,
     /// Include only the specified properties (whitelist)
     /// Corresponds to tippecanoe's `-y` flag
@@ -28,12 +29,6 @@ pub enum PropertyFilter {
     /// Exclude all properties, keep only geometry
     /// Corresponds to tippecanoe's `-X` flag
     ExcludeAll,
-}
-
-impl Default for PropertyFilter {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 impl PropertyFilter {
