@@ -198,6 +198,11 @@ pub struct TilerConfig {
     /// When enabled, tiles within each zoom level are processed in parallel.
     /// Zoom levels are still processed sequentially to preserve feature dropping semantics.
     pub parallel: bool,
+    /// Enable parallel geometry processing within row groups (default: true)
+    /// When enabled, multiple geometries are processed simultaneously within each row group.
+    /// This is orthogonal to `parallel` which parallelizes tiles within large geometries.
+    /// Both can be enabled for maximum parallelism on datasets with many geometries.
+    pub parallel_geoms: bool,
     /// Property filter for controlling which attributes are included in output tiles.
     /// Matches tippecanoe's -x (exclude), -y (include), and -X (exclude-all) flags.
     /// Geometry columns are always preserved regardless of filter settings.
@@ -235,6 +240,8 @@ impl Default for TilerConfig {
             use_hilbert: true,
             // Parallel processing is enabled by default for performance
             parallel: true,
+            // Parallel geometry processing within row groups is also enabled by default
+            parallel_geoms: true,
             // No property filtering by default - include all properties
             property_filter: PropertyFilter::None,
             // No memory budget by default - rely on row group streaming
@@ -333,6 +340,18 @@ impl TilerConfig {
     /// Disable this for debugging or when you need deterministic single-threaded execution.
     pub fn with_parallel(mut self, parallel: bool) -> Self {
         self.parallel = parallel;
+        self
+    }
+
+    /// Enable or disable parallel geometry processing within row groups.
+    ///
+    /// When enabled (default), multiple geometries are processed simultaneously within
+    /// each row group. This is orthogonal to `parallel` which parallelizes tiles within
+    /// large geometries - both can be enabled for maximum parallelism.
+    ///
+    /// Disable this for debugging or when you need deterministic single-threaded execution.
+    pub fn with_parallel_geoms(mut self, parallel_geoms: bool) -> Self {
+        self.parallel_geoms = parallel_geoms;
         self
     }
 
@@ -1165,18 +1184,20 @@ fn generate_tiles_to_writer_external_sort(
     use crate::pmtiles_writer::tile_id;
     use crate::wkb::{geometry_to_wkb, wkb_to_geometry};
     use geo::BoundingRect;
-    use std::cell::RefCell;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Mutex;
     use std::time::Instant;
 
     let start_time = Instant::now();
 
-    let memory_tracker = RefCell::new(match config.memory_budget {
+    // Thread-safe state for parallel geometry processing
+    let memory_tracker = Mutex::new(match config.memory_budget {
         Some(budget) => MemoryTracker::with_budget(budget),
         None => MemoryTracker::new(),
     });
 
-    let global_bounds = RefCell::new(TileBounds::empty());
-    let global_feature_index = RefCell::new(0u64);
+    let global_bounds = Mutex::new(TileBounds::empty());
+    let global_feature_index = AtomicU64::new(0);
 
     // Get total row group count for progress tracking
     let total_row_groups = get_row_group_count(input_path).unwrap_or(1);
@@ -1184,7 +1205,7 @@ fn generate_tiles_to_writer_external_sort(
     // Phase 1: Read GeoParquet, clip geometries, write to sorter
     // Buffer size: 100K records is ~50-100MB depending on geometry complexity
     let sort_buffer_size = 100_000;
-    let sorter = RefCell::new(TileFeatureSorter::new(sort_buffer_size));
+    let sorter = Mutex::new(TileFeatureSorter::new(sort_buffer_size));
 
     // TileFeatureRecord fixed overhead: tile_id(8) + z(1) + x(4) + y(4) + feature_id(8) = 25 bytes
     const RECORD_FIXED_OVERHEAD: usize = 25;
@@ -1199,7 +1220,8 @@ fn generate_tiles_to_writer_external_sort(
         log::info!("Phase 1: Reading GeoParquet and writing to external sorter");
     }
 
-    let records_written = RefCell::new(0u64);
+    let records_written = AtomicU64::new(0);
+    let geoms_processed = AtomicU64::new(0);
 
     process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
         let features_in_group = geometries.len();
@@ -1209,7 +1231,7 @@ fn generate_tiles_to_writer_external_sort(
                 row_group: rg_info.index,
                 total_row_groups,
                 features_in_group,
-                records_written: *records_written.borrow(),
+                records_written: records_written.load(Ordering::Relaxed),
             });
         }
         if !config.quiet {
@@ -1223,90 +1245,78 @@ fn generate_tiles_to_writer_external_sort(
 
         // PROFILING: Track time spent in each phase
         let rg_start = std::time::Instant::now();
-        let mut time_sort = std::time::Duration::ZERO;
-        let mut time_clip = std::time::Duration::ZERO;
-        let mut time_simplify = std::time::Duration::ZERO;
-        let mut time_wkb = std::time::Duration::ZERO;
-        let mut time_sorter_add = std::time::Duration::ZERO;
-        let mut clip_count = 0u64;
-        let mut tiles_touched = 0u64;
 
         // Sort geometries within row group for better locality
         let sort_start = std::time::Instant::now();
         let mut sorted = geometries;
         sort_geometries(&mut sorted, config.use_hilbert);
-        time_sort = sort_start.elapsed();
+        let time_sort = sort_start.elapsed();
 
         let num_geoms = sorted.len();
-        for (geom_idx, geom) in sorted.into_iter().enumerate() {
-            let feat_idx = *global_feature_index.borrow();
-            *global_feature_index.borrow_mut() += 1;
 
-            // Progress within row group every 100 geometries
-            if geom_idx % 100 == 0 && geom_idx > 0 {
-                eprintln!(
-                    "    geom {}/{} | tiles_touched so far: {}",
-                    geom_idx, num_geoms, tiles_touched
-                );
-            }
+        // Assign feature indices upfront for all geometries in this row group
+        // This ensures deterministic feature IDs regardless of parallel execution order
+        let base_feat_idx = global_feature_index.fetch_add(num_geoms as u64, Ordering::SeqCst);
 
-            let geom_start = std::time::Instant::now();
-            let tiles_before = tiles_touched;
+        // Result type for per-geometry processing stats
+        struct GeomResult {
+            records: Vec<TileFeatureRecord>,
+            time_clip: std::time::Duration,
+            time_simplify: std::time::Duration,
+            time_wkb: std::time::Duration,
+            clip_count: u64,
+            tiles_touched: u64,
+            bounds: Option<TileBounds>,
+        }
+
+        // Process geometries - either in parallel or sequentially based on config
+        let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
+            let feat_idx = base_feat_idx + geom_idx as u64;
+
+            let mut result = GeomResult {
+                records: Vec::new(),
+                time_clip: std::time::Duration::ZERO,
+                time_simplify: std::time::Duration::ZERO,
+                time_wkb: std::time::Duration::ZERO,
+                clip_count: 0,
+                tiles_touched: 0,
+                bounds: None,
+            };
 
             let geom_bbox = match geom.bounding_rect() {
                 Some(rect) => {
                     let bounds =
                         TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                    global_bounds.borrow_mut().expand(&bounds);
+                    result.bounds = Some(bounds.clone());
                     bounds
                 }
-                None => continue,
+                None => return result,
             };
 
             // Pre-simplify geometry ONCE at the MAX zoom level tolerance
             let simplify_start = std::time::Instant::now();
             let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
-            time_simplify += simplify_start.elapsed();
+            result.time_simplify = simplify_start.elapsed();
 
             // Count total tiles for this geometry across all zoom levels (for progress)
             let total_tiles_for_geom: usize = (config.min_zoom..=config.max_zoom)
                 .map(|z| tiles_for_bbox(&geom_bbox, z).count())
                 .sum();
 
-            // Warn if this geometry will touch a lot of tiles
-            if total_tiles_for_geom > 10000 {
-                eprintln!(
-                    "    LARGE GEOM {}: {} total tiles across all zooms (bbox: lng=[{:.2},{:.2}] lat=[{:.2},{:.2}])",
-                    geom_idx, total_tiles_for_geom,
-                    geom_bbox.lng_min, geom_bbox.lng_max, geom_bbox.lat_min, geom_bbox.lat_max
-                );
-            }
-
-            let geom_tile_start = std::time::Instant::now();
-
-            // Threshold for parallel processing: overhead not worth it for small geom
+            // Threshold for parallel tile processing within a single geometry (PR #36)
             const PARALLEL_THRESHOLD: usize = 1000;
 
             // Process tiles - parallel for large geometries, sequential for small
             if config.parallel && total_tiles_for_geom >= PARALLEL_THRESHOLD {
-                // PARALLEL PATH: Collect all tile coords, process in parallel, batch-add to sorter
+                // PARALLEL PATH (PR #36): Process tiles within this geometry in parallel
 
                 // Collect all (z, tile_coord) pairs across all zoom levels
                 let all_tiles: Vec<(u8, TileCoord)> = (config.min_zoom..=config.max_zoom)
                     .flat_map(|z| tiles_for_bbox(&geom_bbox, z).map(move |tc| (z, tc)))
                     .collect();
 
-                if total_tiles_for_geom > 10000 {
-                    eprintln!(
-                        "      geom {} PARALLEL: processing {} tiles across {} threads",
-                        geom_idx,
-                        all_tiles.len(),
-                        rayon::current_num_threads()
-                    );
-                }
-
                 // Process tiles in parallel - each returns Option<(record, clip_time, wkb_time)>
-                let results: Vec<_> = all_tiles
+                let tile_results: Vec<_> = all_tiles
                     .into_par_iter()
                     .filter_map(|(z, tile_coord)| {
                         let tile_bounds = tile_coord.bounds();
@@ -1378,58 +1388,26 @@ fn generate_tiles_to_writer_external_sort(
                     })
                     .collect();
 
-                // Aggregate results (single-threaded) - preserves determinism via sort
-                tiles_touched += total_tiles_for_geom as u64;
+                // Aggregate results
+                result.tiles_touched = total_tiles_for_geom as u64;
 
                 // Sort by tile_id for deterministic insertion order
-                let mut sorted_results = results;
+                let mut sorted_results = tile_results;
                 sorted_results.sort_by_key(|(r, _, _)| r.tile_id);
 
                 for (record, clip_elapsed, wkb_elapsed) in sorted_results {
-                    time_clip += clip_elapsed;
-                    time_wkb += wkb_elapsed;
-                    clip_count += 1;
-
-                    let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
-                    memory_tracker.borrow_mut().add(record_size);
-
-                    let sorter_start = std::time::Instant::now();
-                    sorter.borrow_mut().add(record);
-                    time_sorter_add += sorter_start.elapsed();
-                    *records_written.borrow_mut() += 1;
-                }
-
-                if total_tiles_for_geom > 10000 {
-                    let elapsed = geom_tile_start.elapsed().as_secs_f64();
-                    let rate = total_tiles_for_geom as f64 / elapsed.max(0.001);
-                    eprintln!(
-                        "      geom {} PARALLEL done: {} tiles in {:.2}s ({:.0} tiles/sec)",
-                        geom_idx, total_tiles_for_geom, elapsed, rate
-                    );
+                    result.time_clip += clip_elapsed;
+                    result.time_wkb += wkb_elapsed;
+                    result.clip_count += 1;
+                    result.records.push(record);
                 }
             } else {
                 // SEQUENTIAL PATH: Original code for small geometries
-                let mut tiles_processed_for_geom = 0usize;
-
                 for z in config.min_zoom..=config.max_zoom {
                     let tiles: Vec<_> = tiles_for_bbox(&geom_bbox, z).collect();
 
                     for tile_coord in tiles.into_iter() {
-                        tiles_processed_for_geom += 1;
-
-                        // Progress every 5000 tiles or 10% for large geometries
-                        if total_tiles_for_geom > 10000 && tiles_processed_for_geom % 5000 == 0 {
-                            let pct = 100.0 * tiles_processed_for_geom as f64
-                                / total_tiles_for_geom as f64;
-                            let elapsed = geom_tile_start.elapsed().as_secs_f64();
-                            let rate = tiles_processed_for_geom as f64 / elapsed.max(0.001);
-                            eprintln!(
-                                "      geom {} progress: {:.1}% ({}/{} tiles, {:.0} tiles/sec)",
-                                geom_idx, pct, tiles_processed_for_geom, total_tiles_for_geom, rate
-                            );
-                        }
-
-                        tiles_touched += 1;
+                        result.tiles_touched += 1;
                         let tile_bounds = tile_coord.bounds();
                         let buffer = buffer_pixels_to_degrees(
                             config.buffer_pixels,
@@ -1458,8 +1436,8 @@ fn generate_tiles_to_writer_external_sort(
                             Some(c) => c,
                             None => continue,
                         };
-                        time_clip += clip_start.elapsed();
-                        clip_count += 1;
+                        result.time_clip += clip_start.elapsed();
+                        result.clip_count += 1;
 
                         // Validate (simplification already done above)
                         let validated = match filter_valid_geometry(&clipped) {
@@ -1488,15 +1466,9 @@ fn generate_tiles_to_writer_external_sort(
                                 continue;
                             }
                         };
-                        time_wkb += wkb_start.elapsed();
-
-                        // Track memory for this record being buffered in sorter
-                        // Record size = fixed overhead + geometry_wkb.len() + properties.len()
-                        let record_size = RECORD_FIXED_OVERHEAD + wkb.len();
-                        memory_tracker.borrow_mut().add(record_size);
+                        result.time_wkb += wkb_start.elapsed();
 
                         // Create record with tile_id and coordinates
-                        let sorter_start = std::time::Instant::now();
                         let tid = tile_id(z, tile_coord.x, tile_coord.y);
                         let record = TileFeatureRecord::new(
                             tid,
@@ -1508,40 +1480,82 @@ fn generate_tiles_to_writer_external_sort(
                             vec![], // Empty properties for now
                         );
 
-                        sorter.borrow_mut().add(record);
-                        time_sorter_add += sorter_start.elapsed();
-                        *records_written.borrow_mut() += 1;
+                        result.records.push(record);
                     }
                 }
             }
 
-            // Per-geometry profiling for geometries touching many tiles
-            let geom_tiles = tiles_touched - tiles_before;
-            let geom_elapsed = geom_start.elapsed();
-            if geom_tiles > 1000 || geom_elapsed.as_secs_f64() > 1.0 {
-                eprintln!(
-                    "    SLOW GEOM {}: {} tiles in {:.2}s ({:.0} tiles/sec)",
-                    geom_idx,
-                    geom_tiles,
-                    geom_elapsed.as_secs_f64(),
-                    geom_tiles as f64 / geom_elapsed.as_secs_f64().max(0.001)
-                );
+            result
+        };
+
+        // Collect results - parallel or sequential based on config
+        let results: Vec<GeomResult> = if config.parallel_geoms {
+            // PARALLEL GEOMETRY PROCESSING (Issue #37)
+            sorted
+                .into_iter()
+                .enumerate()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(idx, geom)| process_geometry(idx, geom))
+                .collect()
+        } else {
+            // SEQUENTIAL GEOMETRY PROCESSING (original behavior)
+            sorted
+                .into_iter()
+                .enumerate()
+                .map(|(idx, geom)| process_geometry(idx, geom))
+                .collect()
+        };
+
+        // Aggregate all results and write to sorter
+        let mut time_clip = std::time::Duration::ZERO;
+        let mut time_simplify = std::time::Duration::ZERO;
+        let mut time_wkb = std::time::Duration::ZERO;
+        let mut time_sorter_add = std::time::Duration::ZERO;
+        let mut clip_count = 0u64;
+        let mut tiles_touched = 0u64;
+
+        for result in results {
+            time_clip += result.time_clip;
+            time_simplify += result.time_simplify;
+            time_wkb += result.time_wkb;
+            clip_count += result.clip_count;
+            tiles_touched += result.tiles_touched;
+
+            // Update global bounds
+            if let Some(bounds) = result.bounds {
+                global_bounds.lock().unwrap().expand(&bounds);
             }
+
+            // Add records to sorter
+            let sorter_start = std::time::Instant::now();
+            {
+                let mut sorter_guard = sorter.lock().unwrap();
+                let mut tracker_guard = memory_tracker.lock().unwrap();
+                for record in result.records {
+                    let record_size = RECORD_FIXED_OVERHEAD + record.geometry_wkb.len();
+                    tracker_guard.add(record_size);
+                    sorter_guard.add(record);
+                    records_written.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+            time_sorter_add += sorter_start.elapsed();
         }
 
-        // PROFILING: Log timing breakdown
-        let rg_total = rg_start.elapsed();
-        eprintln!(
-            "  PROFILE RG {}: total={:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles_touched={}",
+        geoms_processed.fetch_add(num_geoms as u64, Ordering::Relaxed);
+
+        // Log timing at debug level (use RUST_LOG=debug to see)
+        log::debug!(
+            "RG {}: {:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles={}",
             rg_info.index,
-            rg_total.as_secs_f64(),
+            rg_start.elapsed().as_secs_f64(),
             time_sort.as_secs_f64(),
             time_clip.as_secs_f64(),
             clip_count,
             time_simplify.as_secs_f64(),
             time_wkb.as_secs_f64(),
             time_sorter_add.as_secs_f64(),
-            tiles_touched
+            tiles_touched,
         );
 
         Ok(())
@@ -1549,10 +1563,10 @@ fn generate_tiles_to_writer_external_sort(
 
     // After Phase 1, sorter memory is released when it starts sorting to disk
     // Reset current memory as records are now on disk during sort
-    let phase1_peak = memory_tracker.borrow().peak();
-    memory_tracker.borrow_mut().reset_current();
+    let phase1_peak = memory_tracker.lock().unwrap().peak();
+    memory_tracker.lock().unwrap().reset_current();
 
-    let total_records = sorter.borrow().len() as u64;
+    let total_records = sorter.lock().unwrap().len() as u64;
 
     if let Some(ref cb) = progress {
         cb(ProgressEvent::Phase1Complete {
@@ -1578,6 +1592,7 @@ fn generate_tiles_to_writer_external_sort(
 
     let sorted_iter = sorter
         .into_inner()
+        .unwrap()
         .sort()
         .map_err(|e| Error::PMTilesWrite(format!("External sort failed: {}", e)))?;
 
@@ -1652,7 +1667,7 @@ fn generate_tiles_to_writer_external_sort(
             }
 
             // Reset memory tracking for next tile - geometries are released
-            memory_tracker.borrow_mut().remove(current_tile_memory);
+            memory_tracker.lock().unwrap().remove(current_tile_memory);
             current_tile_memory = 0;
         }
 
@@ -1662,7 +1677,7 @@ fn generate_tiles_to_writer_external_sort(
 
         // Track memory for decoded geometry
         let geom_size = estimate_geometry_size(&geom);
-        memory_tracker.borrow_mut().add(geom_size);
+        memory_tracker.lock().unwrap().add(geom_size);
         current_tile_memory += geom_size;
 
         // Add to current tile's features
@@ -1701,9 +1716,9 @@ fn generate_tiles_to_writer_external_sort(
         }
     }
 
-    writer.set_bounds(&global_bounds.into_inner());
+    writer.set_bounds(&global_bounds.into_inner().unwrap());
 
-    let stats = MemoryStats::from_tracker(&memory_tracker.borrow());
+    let stats = MemoryStats::from_tracker(&memory_tracker.into_inner().unwrap());
     let duration = start_time.elapsed();
 
     if let Some(ref cb) = progress {
@@ -3863,6 +3878,93 @@ mod tests {
 
         eprintln!(
             "External sort: parallel={} tiles, sequential={} tiles",
+            write_stats_par.total_tiles, write_stats_seq.total_tiles
+        );
+
+        let _ = fs::remove_file(output_par);
+        let _ = fs::remove_file(output_seq);
+    }
+
+    // ========== Parallel Geometry Processing Tests (Issue #37) ==========
+
+    #[test]
+    fn test_parallel_geoms_config_option() {
+        // Test that parallel_geoms config option is available and has correct default
+        let config_default = TilerConfig::default();
+        assert!(
+            config_default.parallel_geoms,
+            "parallel_geoms should be enabled by default"
+        );
+
+        let config_disabled = TilerConfig::new(0, 10).with_parallel_geoms(false);
+        assert!(
+            !config_disabled.parallel_geoms,
+            "parallel_geoms should be disabled when set to false"
+        );
+
+        let config_enabled = TilerConfig::new(0, 10).with_parallel_geoms(true);
+        assert!(
+            config_enabled.parallel_geoms,
+            "parallel_geoms should be enabled when set to true"
+        );
+    }
+
+    #[test]
+    fn test_parallel_geoms_produces_same_results_as_sequential() {
+        // Test that processing geometries in parallel produces
+        // the same output as sequential processing.
+        // This is critical for determinism.
+        use crate::compression::Compression;
+        use crate::pmtiles_writer::StreamingPmtilesWriter;
+        use std::fs;
+
+        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
+        if !fixture.exists() {
+            eprintln!("Skipping: fixture not found");
+            return;
+        }
+
+        // Run with parallel_geoms enabled (parallel geometry iteration)
+        let config_par = TilerConfig::new(0, 8)
+            .with_quiet(true)
+            .with_parallel(true)
+            .with_parallel_geoms(true)
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer_par =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+        let _stats_par = generate_tiles_to_writer(fixture, &config_par, &mut writer_par)
+            .expect("Parallel geoms external sort should work");
+
+        let output_par = Path::new("/tmp/test-parallel-geoms.pmtiles");
+        let _ = fs::remove_file(output_par);
+        let write_stats_par = writer_par.finalize(output_par).expect("Should finalize");
+
+        // Run with parallel_geoms disabled (sequential geometry iteration)
+        let config_seq = TilerConfig::new(0, 8)
+            .with_quiet(true)
+            .with_parallel(true) // Keep tile parallelism within large geoms
+            .with_parallel_geoms(false) // But process geoms sequentially
+            .with_streaming_mode(StreamingMode::ExternalSort);
+
+        let mut writer_seq =
+            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+        let _stats_seq = generate_tiles_to_writer(fixture, &config_seq, &mut writer_seq)
+            .expect("Sequential geoms external sort should work");
+
+        let output_seq = Path::new("/tmp/test-sequential-geoms.pmtiles");
+        let _ = fs::remove_file(output_seq);
+        let write_stats_seq = writer_seq.finalize(output_seq).expect("Should finalize");
+
+        // Both modes should produce the same number of tiles
+        assert_eq!(
+            write_stats_par.total_tiles, write_stats_seq.total_tiles,
+            "Parallel geoms ({}) and sequential geoms ({}) should produce same tile count",
+            write_stats_par.total_tiles, write_stats_seq.total_tiles
+        );
+
+        eprintln!(
+            "Geometry parallelism: parallel={} tiles, sequential={} tiles",
             write_stats_par.total_tiles, write_stats_seq.total_tiles
         );
 

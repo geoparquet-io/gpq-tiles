@@ -11,10 +11,10 @@ use gpq_tiles_core::pipeline::{
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::PropertyFilter;
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::{HumanBytes, HumanDuration, ProgressBar, ProgressStyle};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -153,13 +153,14 @@ fn main() -> Result<()> {
         CliStreamingMode::ExternalSort => StreamingMode::ExternalSort,
     };
 
-    // Build TilerConfig - quiet when using progress bars
+    // Build TilerConfig - always quiet when using progress bars (which is always for ExternalSort)
+    let use_progress = matches!(args.streaming_mode, CliStreamingMode::ExternalSort);
     let tiler_config = TilerConfig::new(args.min_zoom, args.max_zoom)
         .with_extent(4096)
         .with_layer_name(&layer_name)
         .with_property_filter(property_filter)
         .with_streaming_mode(streaming_mode)
-        .with_quiet(args.verbose); // Suppress log output when we have progress bars
+        .with_quiet(use_progress); // Suppress log output when we have progress bars
 
     // Print configuration in verbose mode
     if args.verbose {
@@ -178,12 +179,11 @@ fn main() -> Result<()> {
     let mut writer =
         StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
 
-    // Run the pipeline with or without progress bars
-    let stats = if args.verbose && matches!(args.streaming_mode, CliStreamingMode::ExternalSort) {
-        // Use progress callback for ExternalSort with verbose mode
-        run_with_progress(&args.input, &tiler_config, &mut writer)?
+    // Run the pipeline with progress bars for ExternalSort mode
+    let stats = if use_progress {
+        run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?
     } else {
-        // Standard execution
+        // Non-ExternalSort modes (legacy)
         if args.verbose {
             eprintln!("Starting tile generation...");
         }
@@ -191,54 +191,78 @@ fn main() -> Result<()> {
             .context("Failed to generate tiles")?
     };
 
-    if args.verbose {
-        eprintln!();
-        eprintln!("Tile generation complete:");
-        eprintln!(
-            "  Peak memory tracked: {} MB",
-            stats.peak_bytes / (1024 * 1024)
-        );
-        eprintln!();
-        eprintln!("Finalizing PMTiles file...");
-    }
-
-    let finalize_start = Instant::now();
+    // Finalize PMTiles file
     let write_stats = writer
         .finalize(&args.output)
         .context("Failed to write PMTiles file")?;
-    let finalize_duration = finalize_start.elapsed();
 
     let total_duration = total_start.elapsed();
 
-    // Print results
-    if args.verbose {
-        eprintln!();
-        eprintln!("Results:");
-        eprintln!("  Total tiles: {}", write_stats.total_tiles);
-        eprintln!("  Unique tiles: {}", write_stats.unique_tiles);
-        eprintln!(
-            "  Bytes written: {} MB",
-            write_stats.bytes_written / (1024 * 1024)
-        );
-        eprintln!(
-            "  Bytes saved (dedup): {} MB",
-            write_stats.bytes_saved_dedup / (1024 * 1024)
-        );
-        eprintln!();
-        eprintln!("Timing:");
-        eprintln!("  Finalize: {:.2}s", finalize_duration.as_secs_f64());
-        eprintln!("  Total: {:.2}s", total_duration.as_secs_f64());
-    }
-
-    println!(
-        "✓ Converted {} to {} ({} tiles in {:.1}s)",
-        args.input.display(),
-        args.output.display(),
-        write_stats.total_tiles,
-        total_duration.as_secs_f64()
+    // Print succinct summary
+    print_summary(
+        &args.input,
+        &args.output,
+        &write_stats,
+        stats.peak_bytes,
+        total_duration,
+        args.verbose,
     );
 
     Ok(())
+}
+
+/// Print a succinct summary of the conversion
+fn print_summary(
+    input: &PathBuf,
+    output: &PathBuf,
+    write_stats: &gpq_tiles_core::pmtiles_writer::StreamingWriteStats,
+    peak_memory: usize,
+    duration: Duration,
+    verbose: bool,
+) {
+    let tiles_per_sec = write_stats.total_tiles as f64 / duration.as_secs_f64();
+
+    println!();
+    println!(
+        "✓ Converted {} → {}",
+        input.file_name().unwrap_or_default().to_string_lossy(),
+        output.file_name().unwrap_or_default().to_string_lossy()
+    );
+    println!(
+        "  {:>12} tiles in {} ({:.0} tiles/sec)",
+        format_number(write_stats.total_tiles),
+        HumanDuration(duration),
+        tiles_per_sec
+    );
+    println!("  {:>12} peak memory", HumanBytes(peak_memory as u64));
+
+    if verbose {
+        println!();
+        println!("Details:");
+        println!(
+            "  Unique tiles: {} ({:.1}% dedup)",
+            format_number(write_stats.unique_tiles),
+            100.0 * (1.0 - write_stats.unique_tiles as f64 / write_stats.total_tiles.max(1) as f64)
+        );
+        println!("  Output size:  {}", HumanBytes(write_stats.bytes_written));
+        println!(
+            "  Dedup saved:  {}",
+            HumanBytes(write_stats.bytes_saved_dedup)
+        );
+    }
+}
+
+/// Format a number with thousands separators
+fn format_number(n: u64) -> String {
+    let s = n.to_string();
+    let mut result = String::new();
+    for (i, c) in s.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            result.push(',');
+        }
+        result.push(c);
+    }
+    result.chars().rev().collect()
 }
 
 /// Run tile generation with progress bars for ExternalSort mode
@@ -246,101 +270,108 @@ fn run_with_progress(
     input: &PathBuf,
     config: &TilerConfig,
     writer: &mut StreamingPmtilesWriter,
+    verbose: bool,
 ) -> Result<gpq_tiles_core::memory::MemoryStats> {
-    // Shared state for progress bar
-    let progress_bar: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
-    let pb_clone = Arc::clone(&progress_bar);
+    use indicatif::MultiProgress;
+
+    // Multi-progress for managing multiple progress bars
+    let multi = MultiProgress::new();
+
+    // Shared state for progress bars
+    let phase1_pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+    let phase2_pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+    let phase3_pb: Arc<Mutex<Option<ProgressBar>>> = Arc::new(Mutex::new(None));
+
+    let phase1_pb_clone = Arc::clone(&phase1_pb);
+    let phase2_pb_clone = Arc::clone(&phase2_pb);
+    let phase3_pb_clone = Arc::clone(&phase3_pb);
+    let multi_clone = multi.clone();
 
     // Track totals for Phase 3
     let total_records: Arc<Mutex<u64>> = Arc::new(Mutex::new(0));
     let total_records_clone = Arc::clone(&total_records);
+    let total_row_groups: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+    let _total_row_groups_clone = Arc::clone(&total_row_groups);
 
     let progress_callback = Box::new(move |event: ProgressEvent| {
-        let mut pb_guard = pb_clone.lock().unwrap();
-
         match event {
-            ProgressEvent::PhaseStart { phase, name } => {
-                // Finish previous progress bar if any
-                if let Some(ref pb) = *pb_guard {
-                    pb.finish_and_clear();
-                }
-
+            ProgressEvent::PhaseStart { phase, name: _ } => {
                 if phase == 1 {
-                    // Phase 1: Reading row groups - indeterminate at first
-                    let pb = ProgressBar::new_spinner();
+                    // Phase 1: Reading row groups - will become determinate when we know total
+                    let pb = multi_clone.add(ProgressBar::new_spinner());
                     pb.set_style(
                         ProgressStyle::default_spinner()
-                            .template("{spinner:.green} Phase 1: {msg}")
+                            .template("{spinner:.cyan} Reading GeoParquet...")
                             .unwrap(),
                     );
-                    pb.set_message(format!("{} - starting...", name));
-                    *pb_guard = Some(pb);
+                    pb.enable_steady_tick(Duration::from_millis(100));
+                    *phase1_pb_clone.lock().unwrap() = Some(pb);
                 } else if phase == 3 {
-                    // Phase 3: Encoding - we know total from Phase 1
+                    // Phase 3: Encoding tiles - determinate
                     let total = *total_records_clone.lock().unwrap();
-                    let pb = ProgressBar::new(total);
+                    let pb = multi_clone.add(ProgressBar::new(total));
                     pb.set_style(
                         ProgressStyle::default_bar()
-                            .template("{spinner:.green} Phase 3: [{bar:40.cyan/blue}] {pos}/{len} records ({percent}%) | {msg}")
+                            .template("{spinner:.cyan} Encoding tiles [{bar:40.cyan/blue}] {pos}/{len} ({percent}%)")
                             .unwrap()
-                            .progress_chars("█▉▊▋▌▍▎▏  "),
+                            .progress_chars("█▓▒░  "),
                     );
-                    pb.set_message("Encoding tiles");
-                    *pb_guard = Some(pb);
+                    *phase3_pb_clone.lock().unwrap() = Some(pb);
                 }
             }
 
             ProgressEvent::Phase1Progress {
                 row_group,
-                total_row_groups,
-                features_in_group,
+                total_row_groups: total_rg,
+                features_in_group: _,
                 records_written,
             } => {
-                if let Some(ref pb) = *pb_guard {
-                    pb.set_message(format!(
-                        "Row group {}/{} ({} features) | {} records written",
-                        row_group + 1,
-                        total_row_groups,
-                        features_in_group,
-                        records_written
-                    ));
+                // Store total row groups for progress calculation
+                *total_row_groups.lock().unwrap() = total_rg;
+
+                if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
+                    // Convert spinner to progress bar once we know the total
+                    if row_group == 0 {
+                        pb.set_length(total_rg as u64);
+                        pb.set_style(
+                            ProgressStyle::default_bar()
+                                .template("{spinner:.cyan} Reading [{bar:40.cyan/blue}] {pos}/{len} row groups | {msg}")
+                                .unwrap()
+                                .progress_chars("█▓▒░  "),
+                        );
+                    }
+                    pb.set_position(row_group as u64 + 1);
+                    pb.set_message(format!("{} records", format_number(records_written)));
                 }
             }
 
             ProgressEvent::Phase1Complete {
                 total_records: total,
-                peak_memory_bytes,
+                peak_memory_bytes: _,
             } => {
                 // Store total for Phase 3
                 *total_records.lock().unwrap() = total;
 
-                if let Some(ref pb) = *pb_guard {
-                    pb.finish_with_message(format!(
-                        "Complete: {} records, peak mem {} MB",
-                        total,
-                        peak_memory_bytes / (1024 * 1024)
-                    ));
+                if let Some(ref pb) = *phase1_pb_clone.lock().unwrap() {
+                    pb.finish_with_message(format!("✓ {} records", format_number(total)));
                 }
-                *pb_guard = None;
             }
 
             ProgressEvent::Phase2Start => {
-                let pb = ProgressBar::new_spinner();
+                let pb = multi_clone.add(ProgressBar::new_spinner());
                 pb.set_style(
                     ProgressStyle::default_spinner()
-                        .template("{spinner:.green} Phase 2: {msg}")
+                        .template("{spinner:.cyan} Sorting by tile ID...")
                         .unwrap(),
                 );
-                pb.set_message("External merge sort by tile_id...");
-                pb.enable_steady_tick(std::time::Duration::from_millis(100));
-                *pb_guard = Some(pb);
+                pb.enable_steady_tick(Duration::from_millis(100));
+                *phase2_pb_clone.lock().unwrap() = Some(pb);
             }
 
             ProgressEvent::Phase2Complete => {
-                if let Some(ref pb) = *pb_guard {
-                    pb.finish_with_message("Sort complete");
+                if let Some(ref pb) = *phase2_pb_clone.lock().unwrap() {
+                    pb.finish_with_message("✓ Sorted");
                 }
-                *pb_guard = None;
             }
 
             ProgressEvent::Phase3Progress {
@@ -348,29 +379,27 @@ fn run_with_progress(
                 records_processed,
                 total_records: _,
             } => {
-                if let Some(ref pb) = *pb_guard {
+                if let Some(ref pb) = *phase3_pb_clone.lock().unwrap() {
                     pb.set_position(records_processed);
-                    pb.set_message(format!("{} tiles written", tiles_written));
+                    if tiles_written % 10000 == 0 {
+                        pb.set_message(format!("{} tiles", format_number(tiles_written)));
+                    }
                 }
             }
 
             ProgressEvent::Complete {
-                total_tiles,
-                peak_memory_bytes,
-                duration_secs,
+                total_tiles: _,
+                peak_memory_bytes: _,
+                duration_secs: _,
             } => {
-                if let Some(ref pb) = *pb_guard {
-                    pb.finish_and_clear();
+                if let Some(ref pb) = *phase3_pb_clone.lock().unwrap() {
+                    pb.finish_with_message("✓ Complete");
                 }
-                eprintln!(
-                    "✓ Generated {} tiles in {:.1}s (peak memory: {} MB)",
-                    total_tiles,
-                    duration_secs,
-                    peak_memory_bytes / (1024 * 1024)
-                );
             }
         }
     });
+
+    let _ = verbose; // Reserved for future use (sub-progress for large geometries)
 
     generate_tiles_to_writer_with_progress(input, config, writer, progress_callback)
         .context("Failed to generate tiles")
