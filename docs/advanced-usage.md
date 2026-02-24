@@ -372,7 +372,7 @@ gpq-tiles input.parquet output.pmtiles
 **Debug:**
 ```bash
 # Check input with geoparquet-io
-gpio info input.parquet
+gpio inspect input.parquet
 
 # Try wider zoom range
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 18
