@@ -4,7 +4,7 @@
 [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
-Fast GeoParquet → PMTiles converter in Rust. 1.4x faster than tippecanoe on typical workflows.
+Fast GeoParquet → PMTiles converter in Rust.
 
 ## Status
 
@@ -66,8 +66,8 @@ let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
 For optimal performance with large files, optimize your GeoParquet input:
 
 ```bash
-# Hilbert-sort and add row group bboxes with geoparquet-io
-gpq optimize input.parquet -o optimized.parquet --hilbert
+# Check and fix GeoParquet formatting with geoparquet-io
+gpio check --fix input.parquet
 ```
 
 gpq-tiles will warn if input files aren't optimized. See [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) for file optimization tools.

@@ -132,8 +132,8 @@ converter.convert("input.parquet", "output.pmtiles")?;
 For best performance, optimize your GeoParquet files first:
 
 ```bash
-# Hilbert-sort and add row group bboxes
-gpq optimize input.parquet -o optimized.parquet --hilbert
+# Check and fix GeoParquet formatting with geoparquet-io
+gpio check --fix input.parquet
 ```
 
 gpq-tiles warns if input files lack optimization. See [geoparquet-io](https://github.com/geoparquet-io/geoparquet-io) for details.
@@ -187,4 +187,4 @@ gpq-tiles large.parquet output.pmtiles --streaming-mode low-memory
 | `fast` | Row-group based | **Fastest** | Memory bounded by largest row group (~100-200MB typical) |
 | `low-memory` | External sort | Slower | Sorts to disk, guaranteed low memory |
 
-Row-group streaming works best with Hilbert-sorted files. Use `gpq optimize --hilbert` for optimal performance.
+Row-group streaming works best with properly formatted files. Use `gpio check --fix` for optimal performance.

@@ -10,20 +10,20 @@
 # Install geoparquet-io
 cargo install geoparquet-io
 
-# Hilbert-sort and add row group bboxes
-gpq optimize input.parquet -o optimized.parquet --hilbert
+# Check and fix GeoParquet formatting
+gpio check --fix input.parquet
 ```
 
 gpq-tiles will warn if input files lack optimization metadata:
 
 ```
 ⚠ WARNING: File lacks spatial metadata (row group bboxes).
-  For optimal performance, use: gpq optimize --hilbert
+  For optimal performance, use: gpio check --fix
 ```
 
 **Why this matters:**
 
-- **Hilbert sorting** — Groups spatially-close features, reducing tile processing overhead
+- **Spatial sorting** — Groups spatially-close features, reducing tile processing overhead
 - **Row group bboxes** — Enables row-group skipping for faster queries
 - **Streaming efficiency** — Well-formatted row groups enable bounded-memory processing
 
@@ -67,7 +67,7 @@ gpq-tiles large.parquet output.pmtiles --streaming-mode low-memory
 **Fast mode:**
 - Processes one row group at a time
 - Memory bounded by largest row group (typically 100-200MB)
-- Requires well-formatted input (`gpq optimize --hilbert`)
+- Requires well-formatted input (`gpio check --fix`)
 
 **Low-memory mode:**
 - Sorts features to disk
@@ -328,12 +328,12 @@ match generate_tiles_to_writer(path, &config, &mut writer) {
 
 ### "File lacks spatial metadata" Warning
 
-**Cause:** Input GeoParquet missing row group bboxes or not Hilbert-sorted.
+**Cause:** Input GeoParquet missing row group bboxes or not spatially sorted.
 
 **Solution:**
 ```bash
-gpq optimize input.parquet -o optimized.parquet --hilbert
-gpq-tiles optimized.parquet output.pmtiles
+gpio check --fix input.parquet
+gpq-tiles input.parquet output.pmtiles
 ```
 
 ### High Memory Usage
@@ -348,7 +348,7 @@ gpq-tiles optimized.parquet output.pmtiles
 
 2. Optimize input file (improves row-group locality):
    ```bash
-   gpq optimize input.parquet -o optimized.parquet --hilbert
+   gpio check --fix input.parquet
    ```
 
 3. Reduce zoom range:
@@ -360,7 +360,7 @@ gpq-tiles optimized.parquet output.pmtiles
 
 **Common causes:**
 
-1. **Unoptimized input** — Use `gpq optimize --hilbert`
+1. **Unoptimized input** — Use `gpio check --fix`
 2. **Too many properties** — Filter with `--include` or `--exclude`
 3. **Excessive zoom levels** — Reduce `--max-zoom`
 4. **Slow compression** — Use `--compression zstd` instead of brotli
@@ -371,14 +371,11 @@ gpq-tiles optimized.parquet output.pmtiles
 
 **Debug:**
 ```bash
-# Check input bounds
-gpq info input.parquet
+# Check input with geoparquet-io
+gpio info input.parquet
 
 # Try wider zoom range
 gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 18
-
-# Verify features exist
-gpq filter input.parquet test.parquet --limit 100
 ```
 
 ### Invalid Geometry Errors
@@ -387,10 +384,9 @@ gpq filter input.parquet test.parquet --limit 100
 
 **Solution:**
 ```bash
-# Validate and repair with geoparquet-io
-gpq validate input.parquet
-gpq repair input.parquet -o repaired.parquet
-gpq-tiles repaired.parquet output.pmtiles
+# Check and fix with geoparquet-io
+gpio check --fix input.parquet
+gpq-tiles input.parquet output.pmtiles
 ```
 
 ---
