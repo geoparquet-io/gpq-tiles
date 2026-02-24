@@ -1267,15 +1267,11 @@ fn generate_tiles_to_writer_external_sort(
             clip_count: u64,
             tiles_touched: u64,
             bounds: Option<TileBounds>,
-            is_large_geom: bool,
-            is_slow_geom: bool,
-            slow_geom_info: Option<(usize, u64, f64)>, // (geom_idx, tiles, secs)
         }
 
         // Process geometries - either in parallel or sequentially based on config
         let process_geometry = |geom_idx: usize, geom: Geometry<f64>| -> GeomResult {
             let feat_idx = base_feat_idx + geom_idx as u64;
-            let geom_start = std::time::Instant::now();
 
             let mut result = GeomResult {
                 records: Vec::new(),
@@ -1285,9 +1281,6 @@ fn generate_tiles_to_writer_external_sort(
                 clip_count: 0,
                 tiles_touched: 0,
                 bounds: None,
-                is_large_geom: false,
-                is_slow_geom: false,
-                slow_geom_info: None,
             };
 
             let geom_bbox = match geom.bounding_rect() {
@@ -1309,11 +1302,6 @@ fn generate_tiles_to_writer_external_sort(
             let total_tiles_for_geom: usize = (config.min_zoom..=config.max_zoom)
                 .map(|z| tiles_for_bbox(&geom_bbox, z).count())
                 .sum();
-
-            // Flag large geometries for reporting
-            if total_tiles_for_geom > 10000 {
-                result.is_large_geom = true;
-            }
 
             // Threshold for parallel tile processing within a single geometry (PR #36)
             const PARALLEL_THRESHOLD: usize = 1000;
@@ -1497,14 +1485,6 @@ fn generate_tiles_to_writer_external_sort(
                 }
             }
 
-            // Check if this was a slow geometry
-            let geom_elapsed = geom_start.elapsed();
-            if result.tiles_touched > 1000 || geom_elapsed.as_secs_f64() > 1.0 {
-                result.is_slow_geom = true;
-                result.slow_geom_info =
-                    Some((geom_idx, result.tiles_touched, geom_elapsed.as_secs_f64()));
-            }
-
             result
         };
 
@@ -1523,17 +1503,7 @@ fn generate_tiles_to_writer_external_sort(
             sorted
                 .into_iter()
                 .enumerate()
-                .map(|(idx, geom)| {
-                    // Progress within row group every 100 geometries (only in sequential mode)
-                    if idx % 100 == 0 && idx > 0 {
-                        let processed = geoms_processed.load(Ordering::Relaxed) + idx as u64;
-                        eprintln!(
-                            "    geom {}/{} | total processed: {}",
-                            idx, num_geoms, processed
-                        );
-                    }
-                    process_geometry(idx, geom)
-                })
+                .map(|(idx, geom)| process_geometry(idx, geom))
                 .collect()
         };
 
@@ -1557,31 +1527,6 @@ fn generate_tiles_to_writer_external_sort(
                 global_bounds.lock().unwrap().expand(&bounds);
             }
 
-            // Report large geometries
-            if result.is_large_geom {
-                if let Some(bounds) = &result.bounds {
-                    eprintln!(
-                        "    LARGE GEOM: {} tiles (bbox: lng=[{:.2},{:.2}] lat=[{:.2},{:.2}])",
-                        result.tiles_touched,
-                        bounds.lng_min,
-                        bounds.lng_max,
-                        bounds.lat_min,
-                        bounds.lat_max
-                    );
-                }
-            }
-
-            // Report slow geometries
-            if let Some((geom_idx, geom_tiles, secs)) = result.slow_geom_info {
-                eprintln!(
-                    "    SLOW GEOM {}: {} tiles in {:.2}s ({:.0} tiles/sec)",
-                    geom_idx,
-                    geom_tiles,
-                    secs,
-                    geom_tiles as f64 / secs.max(0.001)
-                );
-            }
-
             // Add records to sorter
             let sorter_start = std::time::Instant::now();
             {
@@ -1599,12 +1544,11 @@ fn generate_tiles_to_writer_external_sort(
 
         geoms_processed.fetch_add(num_geoms as u64, Ordering::Relaxed);
 
-        // PROFILING: Log timing breakdown
-        let rg_total = rg_start.elapsed();
-        eprintln!(
-            "  PROFILE RG {}: total={:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles_touched={} | mode={}",
+        // Log timing at debug level (use RUST_LOG=debug to see)
+        log::debug!(
+            "RG {}: {:.2}s | sort={:.2}s clip={:.2}s ({} ops) simplify={:.2}s wkb={:.2}s sorter={:.2}s | tiles={}",
             rg_info.index,
-            rg_total.as_secs_f64(),
+            rg_start.elapsed().as_secs_f64(),
             time_sort.as_secs_f64(),
             time_clip.as_secs_f64(),
             clip_count,
@@ -1612,7 +1556,6 @@ fn generate_tiles_to_writer_external_sort(
             time_wkb.as_secs_f64(),
             time_sorter_add.as_secs_f64(),
             tiles_touched,
-            if config.parallel_geoms { "parallel_geoms" } else { "sequential_geoms" }
         );
 
         Ok(())
