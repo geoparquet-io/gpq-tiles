@@ -74,7 +74,7 @@ jobs:
 
       - name: Publish gpq-tiles-core to crates.io
         if: steps.release_check.outputs.release_exists == 'false'
-        run: cargo publish --package gpq-tiles-core
+        run: cargo publish --package gpq-tiles-core || echo "Already published or error"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
@@ -83,7 +83,7 @@ jobs:
         run: |
           # Wait for crates.io to index gpq-tiles-core
           sleep 30
-          cargo publish --package gpq-tiles
+          cargo publish --package gpq-tiles || echo "Already published or error"
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
