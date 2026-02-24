@@ -172,8 +172,9 @@ jobs:
           path: target
           key: ${{ runner.os }}-cargo-bench-target-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Run benchmarks
-        run: cargo bench --all-features
+      - name: Run benchmarks (fast only)
+        run: cargo bench --all-features -- --skip "large_" --skip "external_sort_larger"
+        timeout-minutes: 15
 
       - name: Upload benchmark results
         uses: actions/upload-artifact@v6
