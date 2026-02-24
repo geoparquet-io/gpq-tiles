@@ -2,6 +2,8 @@
 
 [![CI](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml/badge.svg)](https://github.com/geoparquet-io/gpq-tiles/actions/workflows/ci.yml)
 [![codecov](https://codecov.io/gh/geoparquet-io/gpq-tiles/branch/main/graph/badge.svg)](https://codecov.io/gh/geoparquet-io/gpq-tiles)
+[![Crates.io](https://img.shields.io/crates/v/gpq-tiles.svg)](https://crates.io/crates/gpq-tiles)
+[![PyPI](https://img.shields.io/pypi/v/gpq-tiles.svg)](https://pypi.org/project/gpq-tiles/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 
 Fast GeoParquet → PMTiles converter in Rust.
