@@ -10,13 +10,21 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 ## Documentation Philosophy
 
-**Prefer concise, DRY documentation. One doc, one purpose.**
+**Docs must be SUCCINCT. Brevity is a feature, not a bug.**
+
+### Writing Style
+
+- **Short sentences.** Max 15 words when possible.
+- **No fluff.** Cut "In order to", "It should be noted that", etc.
+- **Code > prose.** Show, don't tell.
+- **Tables > paragraphs.** For comparisons and reference material.
+- **One concept per section.** If you need sub-sub-sections, split the doc.
 
 ### Folder Structure
 
 | Folder | Purpose |
 |--------|---------|
-| `docs/` | Human-facing documentation only (mkdocs site content) |
+| `docs/` | Human-facing mkdocs site content. Symlinks to root docs where appropriate. |
 | `context/` | AI/developer context: architecture, plans, design decisions |
 
 ### Key Documents
@@ -36,7 +44,7 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 - Never duplicate content across docs
 - Delete docs that serve no unique purpose
 - Update test counts in ROADMAP.md, not elsewhere
-- `docs/` is ONLY for mkdocs human-facing content
+- `docs/` is ONLY for mkdocs human-facing content (uses symlinks to root docs)
 - `context/` is for architecture, plans, and AI context
 
 ## Critical Constraints

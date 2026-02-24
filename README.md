@@ -95,7 +95,8 @@ cargo tarpaulin --out html    # Coverage report
 |----------|---------|
 | [ROADMAP.md](ROADMAP.md) | Implementation phases and progress |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | Development workflow, Python setup |
-| [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Design decisions, tippecanoe divergences |
+| [context/ARCHITECTURE.md](context/ARCHITECTURE.md) | Design decisions, tippecanoe divergences |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | How to contribute |
 | [CLAUDE.md](CLAUDE.md) | AI assistant instructions |
 
 ## Contributing
