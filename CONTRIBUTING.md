@@ -86,6 +86,44 @@ git commit -m "feat: implement X (TDD green)"
 4. Update documentation if needed
 5. Submit PR with clear description
 
+## Releasing (Maintainers)
+
+Releases are triggered by commits starting with `bump:`.
+
+```bash
+# 1. Update version in Cargo.toml [workspace.package]
+# Edit: version = "0.2.0"
+
+# 2. Update CHANGELOG.md with changes since last release
+
+# 3. Commit with bump prefix
+git add Cargo.toml CHANGELOG.md
+git commit -m "bump: v0.2.0"
+git push
+
+# 4. Workflows auto-trigger:
+#    - release.yml → creates git tag, publishes to crates.io
+#    - python-release.yml → builds wheels, publishes to PyPI
+#    - docs.yml → deploys documentation
+```
+
+**Prerequisites (one-time setup):**
+
+| Secret | Source | Purpose |
+|--------|--------|---------|
+| `CARGO_REGISTRY_TOKEN` | [crates.io/settings/tokens](https://crates.io/settings/tokens) | Publish to crates.io |
+| PyPI trusted publishing | [PyPI project settings](https://pypi.org/manage/project/gpq-tiles/settings/publishing/) | Publish to PyPI |
+
+**Recovery if release fails:**
+```bash
+# Delete orphan tag if needed
+git push origin :refs/tags/vX.Y.Z
+
+# Re-trigger manually
+gh workflow run release.yml --ref main
+gh workflow run python-release.yml --ref main
+```
+
 ## Questions?
 
 Open an issue or start a discussion on GitHub.
