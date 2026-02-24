@@ -1,6 +1,7 @@
 [package]
 name = "gpq-tiles"
 description = "CLI tool for converting GeoParquet to PMTiles vector tiles"
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -16,7 +17,7 @@ name = "gpq-tiles"
 path = "src/main.rs"
 
 [dependencies]
-gpq-tiles-core = { path = "../core" }
+gpq-tiles-core = { path = "../core", version = "0.1.0" }
 clap = { workspace = true }
 anyhow = { workspace = true }
 env_logger = { workspace = true }
