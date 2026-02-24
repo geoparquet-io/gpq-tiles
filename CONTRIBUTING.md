@@ -88,24 +88,31 @@ git commit -m "feat: implement X (TDD green)"
 
 ## Releasing (Maintainers)
 
-Releases are triggered by commits starting with `bump:`.
+Releases use [Commitizen](https://commitizen-tools.github.io/commitizen/) to automatically bump versions and update changelogs.
+
+### Full Release Workflow
 
 ```bash
-# 1. Update version in Cargo.toml [workspace.package]
-# Edit: version = "0.2.0"
+# 1. Create a release branch
+git checkout -b release/v0.2.0
 
-# 2. Update CHANGELOG.md with changes since last release
+# 2. Run commitizen bump (updates version, CHANGELOG.md, commits with "bump:" prefix)
+uv run cz bump --changelog
 
-# 3. Commit with bump prefix
-git add Cargo.toml CHANGELOG.md
-git commit -m "bump: v0.2.0"
-git push
+# 3. Push and open PR
+git push -u origin release/v0.2.0
+gh pr create --title "Release v0.2.0" --body "Automated release bump"
 
-# 4. Workflows auto-trigger:
-#    - release.yml → creates git tag, publishes to crates.io
-#    - python-release.yml → builds wheels, publishes to PyPI
-#    - docs.yml → deploys documentation
+# 4. Merge PR
+# Once merged, release.yml automatically:
+#    - Detects "bump:" commit message
+#    - Creates git tag v0.2.0
+#    - Publishes to crates.io
+#    - Publishes Python wheels to PyPI
+#    - Creates GitHub Release
 ```
+
+The workflow checks `startsWith(github.event.head_commit.message, 'bump:')` which commitizen ensures.
 
 **Prerequisites (one-time setup):**
 
@@ -121,7 +128,6 @@ git push origin :refs/tags/vX.Y.Z
 
 # Re-trigger manually
 gh workflow run release.yml --ref main
-gh workflow run python-release.yml --ref main
 ```
 
 ## Questions?
