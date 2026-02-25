@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gpq-tiles"
-version = "0.1.0"
+version = "0.2.0"
 description = "Fast GeoParquet to PMTiles converter"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -34,7 +34,7 @@ Repository = "https://github.com/geoparquet-io/gpq-tiles"
 dev = ["pytest>=8.0", "pytest-cov", "ruff"]
 
 [dependency-groups]
-dev = ["pytest>=8.0", "pytest-cov", "ruff"]
+dev = ["pytest>=8.0", "pytest-cov", "ruff", "commitizen"]
 
 [tool.maturin]
 # Build using pyo3 bindings
@@ -54,7 +54,7 @@ ignore = []
 
 [tool.commitizen]
 name = "cz_conventional_commits"
-version = "0.1.0"
+version = "0.2.0"
 version_files = [
     "pyproject.toml:^version",
     "../../Cargo.toml:^version"
