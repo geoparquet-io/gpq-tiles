@@ -128,6 +128,7 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", progress_callback=on_progress)
 #[pyfunction]
 #[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, streaming_mode="fast", parallel_tiles=true, parallel_geoms=true, progress_callback=None))]
+#[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn convert(
     py: Python<'_>,
     input: &str,

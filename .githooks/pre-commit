@@ -1,6 +1,8 @@
 #!/bin/sh
 # Pre-commit hook for gpq-tiles
-# Runs cargo fmt check, version consistency check, and syncs READMEs before allowing commit
+# Runs cargo fmt, clippy, version consistency check, and syncs READMEs before allowing commit
+
+set -e
 
 echo "Running cargo fmt check..."
 if ! cargo fmt --all -- --check 2>/dev/null; then
@@ -10,6 +12,15 @@ if ! cargo fmt --all -- --check 2>/dev/null; then
     exit 1
 fi
 echo "Format check passed!"
+
+echo "Running cargo clippy..."
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -20; then
+    echo ""
+    echo "ERROR: Clippy found issues. Fix them before committing."
+    echo ""
+    exit 1
+fi
+echo "Clippy check passed!"
 
 # Check version consistency across workspace
 echo "Checking version consistency..."
