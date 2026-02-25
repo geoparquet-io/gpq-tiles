@@ -14,8 +14,9 @@
 //! See: https://github.com/felt/tippecanoe (clipping documentation)
 
 use geo::{
-    BooleanOps, BoundingRect, Coord, Geometry, LineString, MultiLineString, MultiPolygon, Point,
-    Polygon, Rect,
+    line_intersection::{line_intersection, LineIntersection},
+    BooleanOps, BoundingRect, Coord, Geometry, Line, LineString, MultiLineString, MultiPolygon,
+    Point, Polygon, Rect,
 };
 
 use crate::tile::TileBounds;
@@ -49,6 +50,18 @@ pub fn clip_geometry(
     bounds: &TileBounds,
     buffer: f64,
 ) -> Option<Geometry<f64>> {
+    // Check for self-intersections or other validity issues before clipping.
+    // For now, we just log the detection - fallback logic will be added later.
+    let validation_errors = validate_geometry(geom);
+    if !validation_errors.is_empty() {
+        log::trace!(
+            "Detected invalid geometry before clipping: {:?}",
+            validation_errors
+        );
+        // TODO: Add fallback to BooleanOps intersection for invalid geometries
+        // For now, continue with Sutherland-Hodgman which may produce incorrect results
+    }
+
     let buffered = TileBounds::new(
         bounds.lng_min - buffer,
         bounds.lat_min - buffer,
@@ -89,6 +102,240 @@ pub fn buffer_pixels_to_degrees(buffer_pixels: u32, tile_bounds: &TileBounds, ex
     // Buffer is specified in "screen pixels" where the tile is extent pixels wide
     // Convert to the same units as bounds (degrees)
     tile_bounds.width() * buffer_pixels as f64 / extent as f64
+}
+
+/// Check if a geometry has self-intersections or other validity issues.
+///
+/// Checks for:
+/// - Self-intersections in polygon rings (bowtie/figure-8 patterns)
+/// - Spikes where a ring touches itself
+/// - Invalid holes (self-intersecting interior rings)
+/// - Too few points in rings
+/// - Non-finite coordinates
+///
+/// # Arguments
+///
+/// * `geom` - The geometry to validate
+///
+/// # Returns
+///
+/// A vector of validation error descriptions, or empty vec if valid.
+///
+/// # Example
+///
+/// ```
+/// use geo::{Geometry, Polygon, LineString, Coord};
+/// use gpq_tiles_core::clip::validate_geometry;
+///
+/// // A bowtie (self-intersecting) polygon
+/// let bowtie = Geometry::Polygon(Polygon::new(
+///     LineString::from(vec![
+///         Coord { x: 0.0, y: 0.0 },
+///         Coord { x: 10.0, y: 10.0 },
+///         Coord { x: 10.0, y: 0.0 },
+///         Coord { x: 0.0, y: 10.0 },
+///         Coord { x: 0.0, y: 0.0 },
+///     ]),
+///     vec![],
+/// ));
+///
+/// let errors = validate_geometry(&bowtie);
+/// assert!(!errors.is_empty(), "Bowtie should have validation errors");
+/// ```
+pub fn validate_geometry(geom: &Geometry<f64>) -> Vec<String> {
+    match geom {
+        Geometry::Polygon(poly) => validate_polygon(poly),
+        Geometry::MultiPolygon(mp) => {
+            let mut errors = Vec::new();
+            for (i, poly) in mp.0.iter().enumerate() {
+                for err in validate_polygon(poly) {
+                    errors.push(format!("polygon at index {}: {}", i, err));
+                }
+            }
+            errors
+        }
+        // Points, LineStrings, etc. - just check for non-finite coords
+        _ => validate_coords(geom),
+    }
+}
+
+/// Validate a polygon for self-intersections and other issues.
+fn validate_polygon(poly: &Polygon<f64>) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    // Check exterior ring
+    if let Some(err) = validate_ring(poly.exterior(), "exterior ring") {
+        errors.push(err);
+    }
+
+    // Check interior rings (holes)
+    for (i, interior) in poly.interiors().iter().enumerate() {
+        if let Some(err) = validate_ring(interior, &format!("interior ring at index {}", i)) {
+            errors.push(err);
+        }
+    }
+
+    errors
+}
+
+/// Validate a single ring for self-intersections.
+fn validate_ring(ring: &LineString<f64>, ring_name: &str) -> Option<String> {
+    let coords = &ring.0;
+
+    // Check for too few points (need at least 4 for a closed ring: 3 distinct + closing point)
+    if coords.len() < 4 {
+        return Some(format!(
+            "{} must have at least 3 distinct points",
+            ring_name
+        ));
+    }
+
+    // Check for non-finite coordinates
+    for (idx, coord) in coords.iter().enumerate() {
+        if !coord.x.is_finite() || !coord.y.is_finite() {
+            return Some(format!(
+                "{} has a non-finite coordinate at index {}",
+                ring_name, idx
+            ));
+        }
+    }
+
+    // Check for spikes: a point that appears twice (non-consecutively) indicates a self-touch
+    // This catches cases like: A → B → C → B → D (spike at B)
+    if has_spike(ring) {
+        return Some(format!("{} has a self-intersection", ring_name));
+    }
+
+    // Check for self-intersections by testing all pairs of non-adjacent edges
+    if has_self_intersection(ring) {
+        return Some(format!("{} has a self-intersection", ring_name));
+    }
+
+    None
+}
+
+/// Check if a ring has a "spike" - a vertex that appears twice (non-consecutively).
+///
+/// A spike occurs when the ring goes to a point and returns, like:
+/// `(2,4) → (2,6) → (2,4)` - vertex `(2,4)` appears twice.
+fn has_spike(ring: &LineString<f64>) -> bool {
+    let coords = &ring.0;
+    let n = coords.len();
+
+    if n < 4 {
+        return false;
+    }
+
+    // Check all pairs of vertices (excluding the closing vertex which matches the first)
+    // A spike is when the same coordinate appears at non-adjacent positions
+    let check_len = if coords.first() == coords.last() {
+        n - 1 // Exclude the closing point
+    } else {
+        n
+    };
+
+    for i in 0..check_len {
+        for j in (i + 2)..check_len {
+            // Skip if i=0 and j is the last vertex (they're "adjacent" in a closed ring)
+            if i == 0 && j == check_len - 1 {
+                continue;
+            }
+
+            if coords[i] == coords[j] {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+/// Check if a ring (closed linestring) has self-intersections.
+///
+/// Tests each pair of non-adjacent edges. Adjacent edges share a vertex
+/// and therefore always "intersect" at that vertex, so we skip those.
+fn has_self_intersection(ring: &LineString<f64>) -> bool {
+    let coords = &ring.0;
+    let n = coords.len();
+
+    if n < 4 {
+        return false;
+    }
+
+    // Create edges (last edge connects back to first if ring is closed)
+    let num_edges = if coords.first() == coords.last() {
+        n - 1 // Ring is properly closed
+    } else {
+        n // Ring is not closed, create closing edge implicitly
+    };
+
+    for i in 0..num_edges {
+        let edge_i = Line::new(coords[i], coords[(i + 1) % n]);
+
+        // Only check edges that are not adjacent (j > i + 1)
+        // Also skip the first/last edge pair if they share a vertex
+        for j in (i + 2)..num_edges {
+            // Skip if j is the last edge and i is the first (they share a vertex)
+            if i == 0 && j == num_edges - 1 {
+                continue;
+            }
+
+            let edge_j = Line::new(coords[j], coords[(j + 1) % n]);
+
+            if let Some(intersection) = line_intersection(edge_i, edge_j) {
+                match intersection {
+                    LineIntersection::SinglePoint { intersection, .. } => {
+                        // Check if intersection is at a shared endpoint (valid touch)
+                        // This can happen if non-adjacent edges happen to meet at a shared vertex
+                        // due to complex ring shapes
+                        let is_endpoint_i =
+                            intersection == edge_i.start || intersection == edge_i.end;
+                        let is_endpoint_j =
+                            intersection == edge_j.start || intersection == edge_j.end;
+
+                        // Only count as self-intersection if not both endpoints
+                        // (a proper crossing, not just touching at vertices)
+                        if !(is_endpoint_i && is_endpoint_j) {
+                            return true;
+                        }
+                    }
+                    LineIntersection::Collinear { intersection: _ } => {
+                        // Overlapping edges are a self-intersection
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Check geometry coordinates for non-finite values.
+fn validate_coords(geom: &Geometry<f64>) -> Vec<String> {
+    let mut errors = Vec::new();
+
+    match geom {
+        Geometry::Point(p) => {
+            if !p.x().is_finite() || !p.y().is_finite() {
+                errors.push("Point has non-finite coordinates".to_string());
+            }
+        }
+        Geometry::LineString(ls) => {
+            for (i, coord) in ls.0.iter().enumerate() {
+                if !coord.x.is_finite() || !coord.y.is_finite() {
+                    errors.push(format!(
+                        "LineString has non-finite coordinate at index {}",
+                        i
+                    ));
+                }
+            }
+        }
+        // Other geometry types - basic check
+        _ => {}
+    }
+
+    errors
 }
 
 /// Check if a rectangle intersects the given bounds
@@ -186,6 +433,12 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
 /// Returns `Geometry::Polygon` if clipping results in a single polygon,
 /// or `Geometry::MultiPolygon` if the clip creates multiple disconnected parts
 /// (e.g., a U-shaped polygon clipped across its opening).
+///
+/// # Algorithm Selection
+///
+/// - **Valid polygons**: Use fast Sutherland-Hodgman (O(n))
+/// - **Invalid polygons** (self-intersections, spikes): Fall back to BooleanOps
+///   which handles degenerate cases robustly using Vatti's algorithm
 fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
     let poly_rect = poly.bounding_rect()?;
@@ -202,7 +455,30 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         return Some(Geometry::Polygon(poly.clone()));
     }
 
-    // Use Sutherland-Hodgman for axis-aligned rect clipping (O(n) vs O(n²))
+    // Check if polygon is valid for Sutherland-Hodgman
+    let validation_errors = validate_polygon(poly);
+
+    if validation_errors.is_empty() {
+        // Valid polygon: use fast Sutherland-Hodgman (O(n))
+        clip_polygon_sutherland_hodgman(poly, bounds)
+    } else {
+        // Invalid polygon: fall back to BooleanOps (slower but robust)
+        log::trace!(
+            "using BooleanOps fallback for invalid polygon: {:?}",
+            validation_errors
+        );
+        clip_polygon_boolean_ops(poly, bounds)
+    }
+}
+
+/// Clip a polygon using Sutherland-Hodgman algorithm.
+///
+/// Fast (O(n)) but assumes valid polygon geometry. May produce incorrect
+/// results for self-intersecting polygons.
+fn clip_polygon_sutherland_hodgman(
+    poly: &Polygon<f64>,
+    bounds: &TileBounds,
+) -> Option<Geometry<f64>> {
     let clipped_exterior = sutherland_hodgman_clip(poly.exterior(), bounds);
     if clipped_exterior.0.len() < 3 {
         return None;
@@ -221,6 +497,43 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         clipped_exterior,
         clipped_interiors,
     )))
+}
+
+/// Clip a polygon using BooleanOps intersection.
+///
+/// Slower than Sutherland-Hodgman but handles degenerate geometries
+/// (self-intersections, spikes) robustly using Vatti's algorithm.
+///
+/// # DIVERGENCE FROM TIPPECANOE
+///
+/// Tippecanoe uses custom clipping that may produce different results for
+/// invalid geometries. We prioritize correctness (all output coords within
+/// bounds) over exact tippecanoe parity for these edge cases.
+fn clip_polygon_boolean_ops(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+    let clip_rect = Rect::new(
+        Coord {
+            x: bounds.lng_min,
+            y: bounds.lat_min,
+        },
+        Coord {
+            x: bounds.lng_max,
+            y: bounds.lat_max,
+        },
+    );
+    let clip_poly = clip_rect.to_polygon();
+
+    // BooleanOps::intersection returns MultiPolygon
+    let result: MultiPolygon<f64> = poly.intersection(&clip_poly);
+
+    if result.0.is_empty() {
+        None
+    } else if result.0.len() == 1 {
+        // Single polygon: unwrap from MultiPolygon
+        Some(Geometry::Polygon(result.0.into_iter().next().unwrap()))
+    } else {
+        // Multiple polygons (e.g., from clipping a U-shape)
+        Some(Geometry::MultiPolygon(result))
+    }
 }
 
 /// Sutherland-Hodgman polygon clipping algorithm for axis-aligned rectangles.
@@ -340,11 +653,19 @@ fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<Mult
         return Some(mp.clone());
     }
 
-    // Clip each polygon individually using fast Sutherland-Hodgman
+    // Clip each polygon individually
+    // Note: clip_polygon may return MultiPolygon (from BooleanOps fallback)
     let mut clipped_polys = Vec::new();
     for poly in &mp.0 {
-        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
-            clipped_polys.push(clipped);
+        match clip_polygon(poly, bounds) {
+            Some(Geometry::Polygon(clipped)) => {
+                clipped_polys.push(clipped);
+            }
+            Some(Geometry::MultiPolygon(clipped_mp)) => {
+                // BooleanOps can produce multiple polygons from a single input
+                clipped_polys.extend(clipped_mp.0);
+            }
+            _ => {}
         }
     }
 
@@ -618,5 +939,311 @@ mod tests {
             }
             other => panic!("Expected Polygon or MultiPolygon, got {:?}", other),
         }
+    }
+
+    // ========== Geometry Validation Tests ==========
+
+    #[test]
+    fn test_validate_geometry_valid_polygon() {
+        // Simple valid square
+        let poly = Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 10.0, y: 0.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+
+        let errors = validate_geometry(&poly);
+        assert!(
+            errors.is_empty(),
+            "Valid polygon should have no errors: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_geometry_bowtie_self_intersection() {
+        // Bowtie (figure-8) polygon: edges cross at the center
+        //   (0,10)-----(10,10)
+        //        \   /
+        //         \ /
+        //          X  <-- self-intersection at (5,5)
+        //         / \
+        //        /   \
+        //   (0,0)-----(10,0)
+        let bowtie = Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 10.0, y: 0.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+
+        let errors = validate_geometry(&bowtie);
+        assert!(
+            !errors.is_empty(),
+            "Bowtie should have self-intersection error"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_lowercase().contains("self-intersection")
+                    || e.to_lowercase().contains("self intersection")),
+            "Error should mention self-intersection: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_geometry_spike() {
+        // Spike polygon: ring touches itself
+        //   (0,4)-----(2,4)--(2,6)--(2,4)-----(4,4)
+        //     |                                 |
+        //     |                                 |
+        //   (0,0)-------------------------(4,0)
+        let spike = Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 2.0, y: 4.0 },
+                Coord { x: 2.0, y: 6.0 }, // spike up
+                Coord { x: 2.0, y: 4.0 }, // back down (self-touch)
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+
+        let errors = validate_geometry(&spike);
+        assert!(
+            !errors.is_empty(),
+            "Spike should have self-intersection error"
+        );
+    }
+
+    #[test]
+    fn test_validate_geometry_self_intersecting_hole() {
+        // Valid exterior with a bowtie (self-intersecting) hole
+        let exterior = LineString::from(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 20.0, y: 0.0 },
+            Coord { x: 20.0, y: 20.0 },
+            Coord { x: 0.0, y: 20.0 },
+            Coord { x: 0.0, y: 0.0 },
+        ]);
+
+        // Bowtie hole inside the exterior
+        let hole = LineString::from(vec![
+            Coord { x: 5.0, y: 5.0 },
+            Coord { x: 15.0, y: 15.0 },
+            Coord { x: 15.0, y: 5.0 },
+            Coord { x: 5.0, y: 15.0 },
+            Coord { x: 5.0, y: 5.0 },
+        ]);
+
+        let poly_with_bad_hole = Geometry::Polygon(Polygon::new(exterior, vec![hole]));
+
+        let errors = validate_geometry(&poly_with_bad_hole);
+        assert!(
+            !errors.is_empty(),
+            "Polygon with self-intersecting hole should have errors"
+        );
+        // The error should mention interior ring
+        assert!(
+            errors.iter().any(|e| e.to_lowercase().contains("interior")
+                || e.to_lowercase().contains("self-intersection")),
+            "Error should mention interior or self-intersection: {:?}",
+            errors
+        );
+    }
+
+    #[test]
+    fn test_validate_geometry_valid_point() {
+        let point = Geometry::Point(point!(x: 5.0, y: 5.0));
+        let errors = validate_geometry(&point);
+        assert!(errors.is_empty(), "Valid point should have no errors");
+    }
+
+    #[test]
+    fn test_validate_geometry_valid_linestring() {
+        let ls = Geometry::LineString(LineString::from(vec![
+            Coord { x: 0.0, y: 0.0 },
+            Coord { x: 10.0, y: 10.0 },
+        ]));
+        let errors = validate_geometry(&ls);
+        assert!(errors.is_empty(), "Valid linestring should have no errors");
+    }
+
+    // ========== BooleanOps Fallback Tests ==========
+
+    /// Helper to check all coordinates are within bounds (with small epsilon for floating point)
+    fn all_coords_within_bounds(geom: &Geometry<f64>, bounds: &TileBounds) -> bool {
+        let epsilon = 1e-10;
+        match geom {
+            Geometry::Polygon(poly) => {
+                for coord in poly.exterior().coords() {
+                    if coord.x < bounds.lng_min - epsilon
+                        || coord.x > bounds.lng_max + epsilon
+                        || coord.y < bounds.lat_min - epsilon
+                        || coord.y > bounds.lat_max + epsilon
+                    {
+                        return false;
+                    }
+                }
+                for interior in poly.interiors() {
+                    for coord in interior.coords() {
+                        if coord.x < bounds.lng_min - epsilon
+                            || coord.x > bounds.lng_max + epsilon
+                            || coord.y < bounds.lat_min - epsilon
+                            || coord.y > bounds.lat_max + epsilon
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            Geometry::MultiPolygon(mp) => {
+                mp.0.iter()
+                    .all(|p| all_coords_within_bounds(&Geometry::Polygon(p.clone()), bounds))
+            }
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn test_clip_bowtie_uses_fallback_and_produces_valid_output() {
+        // Bowtie (figure-8) polygon that crosses the clip bounds
+        // The self-intersection at (5,5) should trigger BooleanOps fallback
+        let bounds = TileBounds::new(0.0, 0.0, 8.0, 8.0);
+
+        let bowtie = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -2.0, y: -2.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 10.0, y: -2.0 },
+                Coord { x: -2.0, y: 10.0 },
+                Coord { x: -2.0, y: -2.0 },
+            ]),
+            vec![],
+        );
+
+        // Verify this is detected as invalid
+        let errors = validate_polygon(&bowtie);
+        assert!(!errors.is_empty(), "Bowtie should be detected as invalid");
+
+        // Clip the bowtie
+        let result = clip_polygon(&bowtie, &bounds);
+        assert!(result.is_some(), "Bowtie should produce clipped output");
+
+        // Key assertion: all output coordinates must be within bounds
+        let clipped = result.unwrap();
+        assert!(
+            all_coords_within_bounds(&clipped, &bounds),
+            "BooleanOps fallback should produce output within bounds"
+        );
+    }
+
+    #[test]
+    fn test_clip_spike_uses_fallback_and_produces_valid_output() {
+        // Spike polygon that extends outside the clip bounds
+        let bounds = TileBounds::new(0.0, 0.0, 5.0, 5.0);
+
+        let spike = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 2.0, y: 4.0 },
+                Coord { x: 2.0, y: 8.0 }, // spike up outside bounds
+                Coord { x: 2.0, y: 4.0 }, // back down (self-touch)
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        );
+
+        // Verify this is detected as invalid
+        let errors = validate_polygon(&spike);
+        assert!(!errors.is_empty(), "Spike should be detected as invalid");
+
+        // Clip the spike
+        let result = clip_polygon(&spike, &bounds);
+        assert!(result.is_some(), "Spike should produce clipped output");
+
+        // Key assertion: all output coordinates must be within bounds
+        let clipped = result.unwrap();
+        assert!(
+            all_coords_within_bounds(&clipped, &bounds),
+            "BooleanOps fallback should produce output within bounds"
+        );
+    }
+
+    #[test]
+    fn test_boolean_ops_directly() {
+        // Test the BooleanOps function directly with a simple case
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        // A valid polygon that spans outside bounds
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -5.0, y: -5.0 },
+                Coord { x: 15.0, y: -5.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: -5.0, y: 15.0 },
+                Coord { x: -5.0, y: -5.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon_boolean_ops(&poly, &bounds);
+        assert!(result.is_some());
+
+        let clipped = result.unwrap();
+        assert!(
+            all_coords_within_bounds(&clipped, &bounds),
+            "BooleanOps should clip to bounds"
+        );
+    }
+
+    #[test]
+    fn test_valid_polygon_uses_fast_path() {
+        // A valid polygon should use Sutherland-Hodgman (we verify by checking
+        // that both algorithms produce the same result for valid input)
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        let valid_poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -2.0, y: -2.0 },
+                Coord { x: 12.0, y: -2.0 },
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: -2.0, y: 12.0 },
+                Coord { x: -2.0, y: -2.0 },
+            ]),
+            vec![],
+        );
+
+        // Verify it's valid
+        let errors = validate_polygon(&valid_poly);
+        assert!(errors.is_empty(), "This polygon should be valid");
+
+        // Both methods should produce valid output
+        let sh_result = clip_polygon_sutherland_hodgman(&valid_poly, &bounds);
+        let bo_result = clip_polygon_boolean_ops(&valid_poly, &bounds);
+
+        assert!(sh_result.is_some());
+        assert!(bo_result.is_some());
+
+        // Both should be within bounds
+        assert!(all_coords_within_bounds(&sh_result.unwrap(), &bounds));
+        assert!(all_coords_within_bounds(&bo_result.unwrap(), &bounds));
     }
 }

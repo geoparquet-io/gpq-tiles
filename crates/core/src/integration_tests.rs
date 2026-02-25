@@ -636,4 +636,80 @@ mod tests {
         // Clean up
         let _ = fs::remove_file(&output_path);
     }
+
+    /// Test: Strict validation mode emits warnings for invalid geometries.
+    ///
+    /// This test verifies that when `strict_validation` is enabled:
+    /// 1. The pipeline processes geometries normally (doesn't fail)
+    /// 2. Invalid geometries are detected and logged
+    #[test]
+    fn test_strict_validation_mode() {
+        use crate::pipeline::generate_tiles;
+
+        let input_path = Path::new(FIXTURE_DIR).join("open-buildings.parquet");
+        if !input_path.exists() {
+            eprintln!("Skipping test: fixture not found at {:?}", input_path);
+            return;
+        }
+
+        // Note: In actual use, warnings would be emitted via log::warn!
+        // For this test we just verify the pipeline runs without panicking
+
+        // Test with strict validation enabled
+        let config = TilerConfig::new(10, 10)
+            .with_layer_name("test")
+            .with_strict_validation(true);
+
+        let tiles_result = generate_tiles(&input_path, &config);
+
+        // The pipeline should succeed even with strict validation
+        assert!(
+            tiles_result.is_ok(),
+            "Pipeline with strict validation should succeed"
+        );
+
+        let tiles: Vec<_> = tiles_result.unwrap().filter_map(|r| r.ok()).collect();
+        assert!(!tiles.is_empty(), "Should generate tiles with strict mode");
+
+        println!(
+            "Strict validation test: generated {} tiles without failing",
+            tiles.len()
+        );
+    }
+
+    /// Test: Strict validation detects self-intersecting geometries.
+    ///
+    /// This tests that a known-bad geometry (bowtie) triggers a warning
+    /// when strict validation is enabled.
+    #[test]
+    fn test_strict_validation_detects_bowtie() {
+        use crate::clip::validate_geometry;
+        use geo::{Coord, LineString, Polygon};
+
+        // Create a bowtie (self-intersecting) polygon
+        let bowtie = geo::Geometry::Polygon(Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 10.0, y: 0.0 },
+                Coord { x: 0.0, y: 10.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        ));
+
+        let errors = validate_geometry(&bowtie);
+
+        assert!(
+            !errors.is_empty(),
+            "validate_geometry should detect bowtie self-intersection"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.to_lowercase().contains("self-intersection")),
+            "Error should mention self-intersection: {:?}",
+            errors
+        );
+    }
 }

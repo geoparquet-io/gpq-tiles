@@ -80,6 +80,14 @@ struct Args {
     /// compliance workflows. Significantly slower than parallel processing.
     #[arg(long)]
     deterministic: bool,
+
+    /// Enable strict geometry validation.
+    ///
+    /// When enabled, validates input geometries for issues like self-intersections
+    /// and logs warnings for invalid geometries. Invalid geometries are still
+    /// processed - this mode is useful for diagnosing data quality issues.
+    #[arg(long)]
+    strict: bool,
 }
 
 impl Args {
@@ -147,7 +155,8 @@ fn main() -> Result<()> {
         .with_layer_name(&layer_name)
         .with_property_filter(property_filter)
         .with_quiet(true) // Suppress log output when we have progress bars
-        .with_deterministic(args.deterministic);
+        .with_deterministic(args.deterministic)
+        .with_strict_validation(args.strict);
 
     // Print configuration in verbose mode
     if args.verbose {
@@ -158,6 +167,9 @@ fn main() -> Result<()> {
         eprintln!("  Compression: {}", args.compression);
         if args.deterministic {
             eprintln!("  Processing: deterministic (sequential)");
+        }
+        if args.strict {
+            eprintln!("  Validation: strict (warnings for invalid geometries)");
         }
         eprintln!();
     }

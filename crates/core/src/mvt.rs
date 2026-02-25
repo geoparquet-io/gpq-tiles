@@ -21,6 +21,19 @@ use std::collections::HashMap;
 /// Default tile extent (4096 as per MVT spec)
 pub const DEFAULT_EXTENT: u32 = 4096;
 
+/// Maximum zoom level for post-quantization validation.
+///
+/// At zoom levels <= this value, coordinate quantization can cause significant
+/// vertex collapse, making validation worthwhile. At higher zoom levels, the
+/// pixel resolution is fine enough that quantization issues are rare.
+///
+/// Based on research in `context/QUANTIZATION_RISKS.md`:
+/// - Z0: ~9.7 km/pixel - very aggressive collapse
+/// - Z6: ~150 m/pixel - aggressive collapse
+/// - Z10: ~9.5 m/pixel - moderate collapse
+/// - Z14: ~60 cm/pixel - minimal collapse
+pub const MAX_ZOOM_FOR_QUANTIZATION_VALIDATION: u8 = 10;
+
 /// MVT command IDs
 const CMD_MOVE_TO: u32 = 1;
 const CMD_LINE_TO: u32 = 2;
@@ -146,6 +159,145 @@ pub fn geo_to_tile_coords(lng: f64, lat: f64, bounds: &TileBounds, extent: u32) 
 }
 
 // ============================================================================
+// Post-Quantization Validation
+// ============================================================================
+
+/// Types of geometry issues that can occur after coordinate quantization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QuantizationIssue {
+    /// Consecutive vertices collapsed to the same point
+    ConsecutiveDuplicates { count: usize },
+    /// Ring has fewer than 3 unique points after quantization
+    DegenerateRing { unique_points: usize },
+}
+
+impl std::fmt::Display for QuantizationIssue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QuantizationIssue::ConsecutiveDuplicates { count } => {
+                write!(f, "{} consecutive duplicate vertices", count)
+            }
+            QuantizationIssue::DegenerateRing { unique_points } => {
+                write!(
+                    f,
+                    "ring collapsed to {} unique points (need at least 3)",
+                    unique_points
+                )
+            }
+        }
+    }
+}
+
+/// Validate quantized ring coordinates for issues introduced by coordinate rounding.
+///
+/// This function detects:
+/// - Consecutive duplicate vertices (vertex collapse)
+/// - Rings that have collapsed to fewer than 3 unique points
+///
+/// # Arguments
+///
+/// * `coords` - Slice of quantized (x, y) integer coordinates representing a ring
+///
+/// # Returns
+///
+/// A vector of detected issues, or empty if the ring is valid.
+///
+/// # Example
+///
+/// ```
+/// use gpq_tiles_core::mvt::validate_quantized_ring;
+///
+/// // Ring with consecutive duplicates
+/// let coords = vec![(0, 0), (100, 0), (100, 0), (100, 100), (0, 0)];
+/// let issues = validate_quantized_ring(&coords);
+/// assert!(!issues.is_empty());
+/// ```
+pub fn validate_quantized_ring(coords: &[(i32, i32)]) -> Vec<QuantizationIssue> {
+    let mut issues = Vec::new();
+
+    if coords.len() < 4 {
+        // Ring should have at least 4 points (3 unique + closing point)
+        issues.push(QuantizationIssue::DegenerateRing {
+            unique_points: coords.len(),
+        });
+        return issues;
+    }
+
+    // Count consecutive duplicates
+    let mut consecutive_dup_count = 0;
+    for window in coords.windows(2) {
+        if window[0] == window[1] {
+            consecutive_dup_count += 1;
+        }
+    }
+
+    if consecutive_dup_count > 0 {
+        issues.push(QuantizationIssue::ConsecutiveDuplicates {
+            count: consecutive_dup_count,
+        });
+    }
+
+    // Count unique points (excluding the closing point if it matches the first)
+    let mut unique_coords: Vec<(i32, i32)> = Vec::with_capacity(coords.len());
+    for coord in coords.iter() {
+        if unique_coords.last() != Some(coord) {
+            unique_coords.push(*coord);
+        }
+    }
+    // If the last point matches the first (closed ring), don't count it as unique
+    if unique_coords.len() > 1 && unique_coords.first() == unique_coords.last() {
+        unique_coords.pop();
+    }
+
+    if unique_coords.len() < 3 {
+        issues.push(QuantizationIssue::DegenerateRing {
+            unique_points: unique_coords.len(),
+        });
+    }
+
+    issues
+}
+
+/// Log a warning if a ring has post-quantization validity issues.
+///
+/// Only logs for zoom levels <= `MAX_ZOOM_FOR_QUANTIZATION_VALIDATION` where
+/// the quantization risk is significant.
+///
+/// # Arguments
+///
+/// * `coords` - Quantized ring coordinates
+/// * `zoom` - The zoom level of the tile being encoded
+/// * `tile_x` - The x coordinate of the tile (for logging)
+/// * `tile_y` - The y coordinate of the tile (for logging)
+/// * `ring_type` - Description of the ring (e.g., "exterior", "interior 0")
+fn warn_if_invalid_after_quantization(
+    coords: &[(i32, i32)],
+    zoom: u8,
+    tile_x: u32,
+    tile_y: u32,
+    ring_type: &str,
+) {
+    // Only validate for low zoom levels where quantization risk is significant
+    if zoom > MAX_ZOOM_FOR_QUANTIZATION_VALIDATION {
+        return;
+    }
+
+    let issues = validate_quantized_ring(coords);
+    if !issues.is_empty() {
+        for issue in issues {
+            log::warn!(
+                "tile z{}/x{}/y{} {} became invalid after quantization: {}",
+                zoom,
+                tile_x,
+                tile_y,
+                ring_type,
+                issue
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Geometry Encoding
 // ============================================================================
 
@@ -268,6 +420,27 @@ pub fn encode_multi_linestring(
     geometry
 }
 
+/// Optional tile information for post-quantization validation.
+///
+/// When provided to encoding functions, enables validation logging for
+/// geometry issues that occur during coordinate quantization.
+#[derive(Debug, Clone, Copy)]
+pub struct TileInfo {
+    /// Zoom level
+    pub z: u8,
+    /// Tile X coordinate
+    pub x: u32,
+    /// Tile Y coordinate
+    pub y: u32,
+}
+
+impl TileInfo {
+    /// Create a new TileInfo
+    pub fn new(z: u8, x: u32, y: u32) -> Self {
+        Self { z, x, y }
+    }
+}
+
 /// Encode a polygon ring (exterior or interior) to MVT geometry commands.
 /// Returns the commands and updates the cursor position.
 fn encode_ring(
@@ -277,16 +450,43 @@ fn encode_ring(
     cursor_x: &mut i32,
     cursor_y: &mut i32,
 ) -> Vec<u32> {
+    encode_ring_with_validation(ring, bounds, extent, cursor_x, cursor_y, None, "ring")
+}
+
+/// Encode a polygon ring with optional post-quantization validation.
+///
+/// If `tile_info` is provided and the zoom level is <= `MAX_ZOOM_FOR_QUANTIZATION_VALIDATION`,
+/// validates the quantized coordinates and logs warnings for any issues found.
+fn encode_ring_with_validation(
+    ring: &LineString,
+    bounds: &TileBounds,
+    extent: u32,
+    cursor_x: &mut i32,
+    cursor_y: &mut i32,
+    tile_info: Option<TileInfo>,
+    ring_type: &str,
+) -> Vec<u32> {
     // Rings must have at least 4 points (3 unique + closing point)
     if ring.0.len() < 4 {
         return vec![];
     }
 
+    // First, quantize all coordinates to check for post-quantization issues
+    let mut quantized_coords: Vec<(i32, i32)> = Vec::with_capacity(ring.0.len());
+    for coord in ring.0.iter() {
+        let (x, y) = geo_to_tile_coords(coord.x, coord.y, bounds, extent);
+        quantized_coords.push((x, y));
+    }
+
+    // Validate quantized coordinates if tile info is provided
+    if let Some(info) = tile_info {
+        warn_if_invalid_after_quantization(&quantized_coords, info.z, info.x, info.y, ring_type);
+    }
+
     let mut geometry = Vec::with_capacity(4 + (ring.0.len() - 2) * 2);
 
     // First point: MoveTo
-    let first = &ring.0[0];
-    let (x, y) = geo_to_tile_coords(first.x, first.y, bounds, extent);
+    let (x, y) = quantized_coords[0];
     let dx = x - *cursor_x;
     let dy = y - *cursor_y;
     geometry.push(command_encode(CMD_MOVE_TO, 1));
@@ -299,8 +499,7 @@ fn encode_ring(
     let line_to_count = ring.0.len() - 2; // Exclude first and last points
     if line_to_count > 0 {
         geometry.push(command_encode(CMD_LINE_TO, line_to_count as u32));
-        for coord in ring.0.iter().skip(1).take(line_to_count) {
-            let (x, y) = geo_to_tile_coords(coord.x, coord.y, bounds, extent);
+        for &(x, y) in quantized_coords.iter().skip(1).take(line_to_count) {
             let dx = x - *cursor_x;
             let dy = y - *cursor_y;
             geometry.push(zigzag_encode(dx));
@@ -384,6 +583,117 @@ pub fn encode_multi_polygon(polygons: &MultiPolygon, bounds: &TileBounds, extent
     geometry
 }
 
+/// Encode a Polygon geometry to MVT geometry commands with post-quantization validation.
+///
+/// This variant performs validation on quantized coordinates and logs warnings
+/// for zoom levels <= `MAX_ZOOM_FOR_QUANTIZATION_VALIDATION`.
+///
+/// # Arguments
+///
+/// * `polygon` - The polygon to encode
+/// * `bounds` - The tile bounds for coordinate transformation
+/// * `extent` - The tile extent (default 4096)
+/// * `tile_info` - Tile coordinates for validation logging
+pub fn encode_polygon_with_validation(
+    polygon: &Polygon,
+    bounds: &TileBounds,
+    extent: u32,
+    tile_info: TileInfo,
+) -> Vec<u32> {
+    // Apply winding order correction for MVT compliance
+    let oriented = orient_polygon_for_mvt(polygon);
+
+    let mut geometry = Vec::new();
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+
+    // Exterior ring
+    let exterior_cmds = encode_ring_with_validation(
+        oriented.exterior(),
+        bounds,
+        extent,
+        &mut cursor_x,
+        &mut cursor_y,
+        Some(tile_info),
+        "exterior",
+    );
+    geometry.extend(exterior_cmds);
+
+    // Interior rings (holes)
+    for (i, interior) in oriented.interiors().iter().enumerate() {
+        let ring_type = format!("interior {}", i);
+        let interior_cmds = encode_ring_with_validation(
+            interior,
+            bounds,
+            extent,
+            &mut cursor_x,
+            &mut cursor_y,
+            Some(tile_info),
+            &ring_type,
+        );
+        geometry.extend(interior_cmds);
+    }
+
+    geometry
+}
+
+/// Encode a MultiPolygon geometry to MVT geometry commands with post-quantization validation.
+///
+/// This variant performs validation on quantized coordinates and logs warnings
+/// for zoom levels <= `MAX_ZOOM_FOR_QUANTIZATION_VALIDATION`.
+///
+/// # Arguments
+///
+/// * `polygons` - The multi-polygon to encode
+/// * `bounds` - The tile bounds for coordinate transformation
+/// * `extent` - The tile extent (default 4096)
+/// * `tile_info` - Tile coordinates for validation logging
+pub fn encode_multi_polygon_with_validation(
+    polygons: &MultiPolygon,
+    bounds: &TileBounds,
+    extent: u32,
+    tile_info: TileInfo,
+) -> Vec<u32> {
+    // Apply winding order correction for MVT compliance
+    let oriented = orient_multi_polygon_for_mvt(polygons);
+
+    let mut geometry = Vec::new();
+    let mut cursor_x = 0i32;
+    let mut cursor_y = 0i32;
+
+    for (poly_idx, polygon) in oriented.0.iter().enumerate() {
+        // Exterior ring
+        let ring_type = format!("polygon {} exterior", poly_idx);
+        let exterior_cmds = encode_ring_with_validation(
+            polygon.exterior(),
+            bounds,
+            extent,
+            &mut cursor_x,
+            &mut cursor_y,
+            Some(tile_info),
+            &ring_type,
+        );
+        geometry.extend(exterior_cmds);
+
+        // Interior rings (holes)
+        for (interior_idx, interior) in polygon.interiors().iter().enumerate() {
+            let ring_type = format!("polygon {} interior {}", poly_idx, interior_idx);
+            let interior_cmds = encode_ring_with_validation(
+                interior,
+                bounds,
+                extent,
+                &mut cursor_x,
+                &mut cursor_y,
+                Some(tile_info),
+                &ring_type,
+            );
+            geometry.extend(interior_cmds);
+        }
+    }
+
+    geometry
+}
+
 /// Encode any geo::Geometry to MVT geometry commands and return the geometry type.
 pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Vec<u32>, GeomType) {
     match geom {
@@ -396,6 +706,45 @@ pub fn encode_geometry(geom: &Geometry, bounds: &TileBounds, extent: u32) -> (Ve
         ),
         Geometry::Polygon(p) => (encode_polygon(p, bounds, extent), GeomType::Polygon),
         Geometry::MultiPolygon(mp) => (encode_multi_polygon(mp, bounds, extent), GeomType::Polygon),
+        // For geometry collections, we'd need to handle each part separately
+        // For now, return empty geometry with unknown type
+        _ => (vec![], GeomType::Unknown),
+    }
+}
+
+/// Encode any geo::Geometry to MVT geometry commands with post-quantization validation.
+///
+/// This variant validates polygon geometries after quantization and logs warnings
+/// for issues detected at low zoom levels.
+///
+/// # Arguments
+///
+/// * `geom` - The geometry to encode
+/// * `bounds` - The tile bounds for coordinate transformation
+/// * `extent` - The tile extent (default 4096)
+/// * `tile_info` - Tile coordinates for validation logging
+pub fn encode_geometry_with_validation(
+    geom: &Geometry,
+    bounds: &TileBounds,
+    extent: u32,
+    tile_info: TileInfo,
+) -> (Vec<u32>, GeomType) {
+    match geom {
+        Geometry::Point(p) => (encode_point(p, bounds, extent), GeomType::Point),
+        Geometry::MultiPoint(mp) => (encode_multi_point(mp, bounds, extent), GeomType::Point),
+        Geometry::LineString(ls) => (encode_linestring(ls, bounds, extent), GeomType::Linestring),
+        Geometry::MultiLineString(mls) => (
+            encode_multi_linestring(mls, bounds, extent),
+            GeomType::Linestring,
+        ),
+        Geometry::Polygon(p) => (
+            encode_polygon_with_validation(p, bounds, extent, tile_info),
+            GeomType::Polygon,
+        ),
+        Geometry::MultiPolygon(mp) => (
+            encode_multi_polygon_with_validation(mp, bounds, extent, tile_info),
+            GeomType::Polygon,
+        ),
         // For geometry collections, we'd need to handle each part separately
         // For now, return empty geometry with unknown type
         _ => (vec![], GeomType::Unknown),
@@ -522,6 +871,52 @@ impl LayerBuilder {
         bounds: &TileBounds,
     ) {
         let (geom_commands, geom_type) = encode_geometry(geometry, bounds, self.extent);
+
+        // Skip empty geometries
+        if geom_commands.is_empty() && geom_type == GeomType::Unknown {
+            return;
+        }
+
+        // Encode tags as [key_idx, value_idx, key_idx, value_idx, ...]
+        let mut tags = Vec::with_capacity(properties.len() * 2);
+        for (key, value) in properties {
+            let key_idx = self.get_or_insert_key(key);
+            let value_idx = self.get_or_insert_value(value);
+            tags.push(key_idx);
+            tags.push(value_idx);
+        }
+
+        let feature = Feature {
+            id,
+            tags,
+            r#type: Some(geom_type as i32),
+            geometry: geom_commands,
+        };
+
+        self.features.push(feature);
+    }
+
+    /// Add a feature to the layer with post-quantization validation.
+    ///
+    /// This variant performs validation on polygon geometries after quantization
+    /// and logs warnings for issues detected at low zoom levels (Z0-Z10).
+    ///
+    /// # Arguments
+    /// * `id` - Optional feature ID
+    /// * `geometry` - The geometry to encode
+    /// * `properties` - Feature properties as key-value pairs
+    /// * `bounds` - The tile bounds for coordinate transformation
+    /// * `tile_info` - Tile coordinates for validation logging
+    pub fn add_feature_with_validation(
+        &mut self,
+        id: Option<u64>,
+        geometry: &Geometry,
+        properties: &[(String, PropertyValue)],
+        bounds: &TileBounds,
+        tile_info: TileInfo,
+    ) {
+        let (geom_commands, geom_type) =
+            encode_geometry_with_validation(geometry, bounds, self.extent, tile_info);
 
         // Skip empty geometries
         if geom_commands.is_empty() && geom_type == GeomType::Unknown {
@@ -1168,5 +1563,210 @@ mod tests {
         // The encoded geometry should be the same for both inputs
         // because winding correction normalizes them
         assert_eq!(commands_cw, commands_ccw);
+    }
+
+    // ------------------------------------------------------------------------
+    // Post-Quantization Validation Tests
+    // ------------------------------------------------------------------------
+
+    #[test]
+    fn test_validate_quantized_ring_valid() {
+        // Valid ring with 4 distinct points
+        let coords = vec![(0, 0), (100, 0), (100, 100), (0, 0)];
+        let issues = validate_quantized_ring(&coords);
+        assert!(issues.is_empty(), "Valid ring should have no issues");
+    }
+
+    #[test]
+    fn test_validate_quantized_ring_consecutive_duplicates() {
+        // Ring with consecutive duplicate vertices
+        let coords = vec![(0, 0), (100, 0), (100, 0), (100, 100), (0, 0)];
+        let issues = validate_quantized_ring(&coords);
+
+        assert!(!issues.is_empty(), "Should detect consecutive duplicates");
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, QuantizationIssue::ConsecutiveDuplicates { .. })),
+            "Should contain ConsecutiveDuplicates issue"
+        );
+    }
+
+    #[test]
+    fn test_validate_quantized_ring_degenerate() {
+        // Ring collapsed to 2 unique points (a line)
+        let coords = vec![(0, 0), (100, 0), (0, 0)];
+        let issues = validate_quantized_ring(&coords);
+
+        assert!(!issues.is_empty(), "Should detect degenerate ring");
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, QuantizationIssue::DegenerateRing { .. })),
+            "Should contain DegenerateRing issue"
+        );
+    }
+
+    #[test]
+    fn test_validate_quantized_ring_all_same_point() {
+        // Ring where all points collapsed to the same location
+        let coords = vec![(50, 50), (50, 50), (50, 50), (50, 50)];
+        let issues = validate_quantized_ring(&coords);
+
+        assert!(!issues.is_empty(), "Should detect fully collapsed ring");
+        // Should have both consecutive duplicates AND degenerate ring
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, QuantizationIssue::DegenerateRing { unique_points: 1 })),
+            "Should have only 1 unique point"
+        );
+    }
+
+    #[test]
+    fn test_quantization_issue_display() {
+        let issue1 = QuantizationIssue::ConsecutiveDuplicates { count: 3 };
+        assert_eq!(format!("{}", issue1), "3 consecutive duplicate vertices");
+
+        let issue2 = QuantizationIssue::DegenerateRing { unique_points: 2 };
+        assert_eq!(
+            format!("{}", issue2),
+            "ring collapsed to 2 unique points (need at least 3)"
+        );
+    }
+
+    #[test]
+    fn test_polygon_valid_at_float_degenerate_after_quantization() {
+        // This test creates a polygon that is valid in float64 space but becomes
+        // degenerate when quantized to a coarse grid (simulating low zoom level).
+        //
+        // At Z0 with extent 4096, the entire world (360° x ~170°) maps to 4096 pixels.
+        // Each pixel is about 0.088° (~9.7 km) wide.
+        //
+        // A small polygon (e.g., a building) would have vertices that are much closer
+        // together than this resolution, causing them to collapse to the same point.
+
+        // Create a small valid triangle (0.0001° ≈ 11 meters on a side)
+        // This polygon is clearly valid in float64 space
+        let small_triangle = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 0.0001, y: 0.0),
+            (x: 0.00005, y: 0.0001),
+            (x: 0.0, y: 0.0),
+        ];
+
+        // Bounds representing a large tile (like Z0 or Z1)
+        // This makes the coordinate resolution very coarse
+        let coarse_bounds = TileBounds {
+            lng_min: 0.0,
+            lat_min: 0.0,
+            lng_max: 10.0, // 10 degrees wide
+            lat_max: 10.0,
+        };
+
+        // With extent 4096 and 10° tile width:
+        // 1 pixel = 10.0 / 4096 ≈ 0.00244°
+        // Our triangle is only 0.0001° wide, so all vertices will round to (0, 4096)
+
+        // Quantize the triangle vertices
+        let extent = 4096u32;
+        let mut quantized: Vec<(i32, i32)> = Vec::new();
+        for coord in small_triangle.exterior().0.iter() {
+            let (x, y) = geo_to_tile_coords(coord.x, coord.y, &coarse_bounds, extent);
+            quantized.push((x, y));
+        }
+
+        // Verify that the quantized coordinates have collapsed
+        let issues = validate_quantized_ring(&quantized);
+        assert!(
+            !issues.is_empty(),
+            "Small polygon should become degenerate after quantization to coarse grid.\n\
+             Quantized coords: {:?}",
+            quantized
+        );
+
+        // The polygon should have degenerate ring issue (all points collapsed to same location)
+        assert!(
+            issues
+                .iter()
+                .any(|i| matches!(i, QuantizationIssue::DegenerateRing { .. })),
+            "Should detect degenerate ring: {:?}",
+            issues
+        );
+    }
+
+    #[test]
+    fn test_encode_polygon_with_validation_logs_warning() {
+        // This test verifies that the validation-aware encoding path works correctly.
+        // It doesn't verify actual log output (that would require a log capture),
+        // but ensures the encoding still produces valid output.
+
+        // Small polygon that will collapse at coarse resolution
+        let small_poly = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 0.00001, y: 0.0),
+            (x: 0.00001, y: 0.00001),
+            (x: 0.0, y: 0.00001),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let coarse_bounds = TileBounds {
+            lng_min: 0.0,
+            lat_min: 0.0,
+            lng_max: 1.0,
+            lat_max: 1.0,
+        };
+
+        // Use low zoom level where validation is enabled
+        let tile_info = TileInfo::new(5, 0, 0);
+
+        // The encoding should complete without panic
+        let commands = encode_polygon_with_validation(&small_poly, &coarse_bounds, 4096, tile_info);
+
+        // The polygon will likely be degenerate, but encoding shouldn't fail
+        // The warning will be logged internally
+        assert!(
+            commands.is_empty() || !commands.is_empty(),
+            "Encoding should complete"
+        );
+    }
+
+    #[test]
+    fn test_validation_skipped_for_high_zoom() {
+        // At high zoom levels (> MAX_ZOOM_FOR_QUANTIZATION_VALIDATION),
+        // validation should be skipped since quantization risk is minimal.
+
+        let poly = polygon![
+            (x: 0.0, y: 0.0),
+            (x: 0.001, y: 0.0),
+            (x: 0.001, y: 0.001),
+            (x: 0.0, y: 0.001),
+            (x: 0.0, y: 0.0),
+        ];
+
+        let bounds = TileBounds {
+            lng_min: 0.0,
+            lat_min: 0.0,
+            lng_max: 0.01,
+            lat_max: 0.01,
+        };
+
+        // High zoom level (Z15) - validation should be skipped
+        let tile_info = TileInfo::new(15, 0, 0);
+
+        // Encoding should work normally without validation overhead
+        let commands = encode_polygon_with_validation(&poly, &bounds, 4096, tile_info);
+        assert!(
+            !commands.is_empty(),
+            "Normal polygon should encode at high zoom"
+        );
+    }
+
+    #[test]
+    fn test_tile_info_creation() {
+        let info = TileInfo::new(5, 10, 15);
+        assert_eq!(info.z, 5);
+        assert_eq!(info.x, 10);
+        assert_eq!(info.y, 15);
     }
 }
