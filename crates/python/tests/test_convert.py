@@ -157,3 +157,168 @@ class TestConvertIntegration:
             )
 
             assert output.exists()
+
+
+class TestPropertyFiltering:
+    """Tests for property filtering parameters."""
+
+    def test_convert_accepts_include_parameter(self):
+        """Test that convert() accepts include parameter for property whitelist."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                include=["name", "population"],
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+    def test_convert_accepts_exclude_parameter(self):
+        """Test that convert() accepts exclude parameter for property blacklist."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                exclude=["internal_id"],
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+    def test_convert_accepts_exclude_all_parameter(self):
+        """Test that convert() accepts exclude_all parameter for geometry-only output."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                exclude_all=True,
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+    def test_convert_rejects_include_with_exclude(self):
+        """Test that using both include and exclude raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                include=["name"],
+                exclude=["population"],
+            )
+        assert "include" in str(exc_info.value).lower() or "exclude" in str(exc_info.value).lower()
+
+    def test_convert_rejects_include_with_exclude_all(self):
+        """Test that using include with exclude_all raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                include=["name"],
+                exclude_all=True,
+            )
+        assert "include" in str(exc_info.value).lower() or "exclude" in str(exc_info.value).lower()
+
+    def test_convert_rejects_exclude_with_exclude_all(self):
+        """Test that using exclude with exclude_all raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                exclude=["temp"],
+                exclude_all=True,
+            )
+        assert "exclude" in str(exc_info.value).lower()
+
+
+class TestLayerNameOverride:
+    """Tests for layer_name parameter."""
+
+    def test_convert_accepts_layer_name_parameter(self):
+        """Test that convert() accepts layer_name parameter."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                layer_name="custom_layer",
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+
+@pytest.mark.skipif(
+    not (REALDATA_DIR / "open-buildings.parquet").exists(),
+    reason="Test fixture not available",
+)
+class TestPropertyFilteringIntegration:
+    """Integration tests for property filtering with real data."""
+
+    def test_convert_with_include_filter(self):
+        """Test conversion with include filter."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                include=["area_in_meters"],  # Only include area
+            )
+
+            assert output.exists()
+
+    def test_convert_with_exclude_filter(self):
+        """Test conversion with exclude filter."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                exclude=["confidence"],  # Exclude confidence
+            )
+
+            assert output.exists()
+
+    def test_convert_with_exclude_all(self):
+        """Test conversion with exclude_all (geometry only)."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                exclude_all=True,
+            )
+
+            assert output.exists()
+
+    def test_convert_with_layer_name_override(self):
+        """Test conversion with custom layer name."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                layer_name="buildings",
+            )
+
+            assert output.exists()
