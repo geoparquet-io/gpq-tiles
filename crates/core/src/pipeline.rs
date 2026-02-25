@@ -130,43 +130,9 @@ fn should_drop_geometry(
     }
 }
 
-/// Streaming mode for `generate_tiles_to_writer`.
-///
-/// Controls the memory/speed tradeoff when processing large files.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum StreamingMode {
-    /// Store clipped geometries per tile (default).
-    ///
-    /// - **Memory**: ~1-2GB for large files (stores clipped results, not original geometries)
-    /// - **Speed**: 1x (single file pass)
-    /// - **Best for**: Files up to ~10GB, machines with 8GB+ RAM
-    ///
-    /// After clipping a geometry to a tile, stores only the clipped result (~90% smaller
-    /// than original). All zoom levels processed in a single pass.
-    #[default]
-    Fast,
-
-    /// Process one zoom level at a time, re-reading the file for each.
-    ///
-    /// - **Memory**: ~100-200MB peak (only one zoom level's tiles in memory)
-    /// - **Speed**: 2-3x slower (re-reads file for each zoom level)
-    /// - **Best for**: Very large files (10GB+), memory-constrained environments
-    ///
-    /// Provides true bounded memory by processing zoom levels separately.
-    /// The file is re-read for each zoom level, but OS page cache makes
-    /// subsequent reads fast.
-    LowMemory,
-
-    /// External sort for bounded-memory fast processing.
-    ///
-    /// - **Memory**: ~200-500MB (sort buffer + one row group)
-    /// - **Speed**: ~1x (single file pass + sort + single encode pass)
-    /// - **Best for**: Very large files (10GB+) where Fast OOMs
-    ///
-    /// Writes clipped geometries to temp file, sorts by tile_id using
-    /// external merge sort, then encodes tiles sequentially.
-    ExternalSort,
-}
+// NOTE: StreamingMode enum was removed in v0.4.0.
+// The pipeline now always uses the geometry-centric external sort algorithm,
+// which is both fast AND memory-bounded. See ADR-001 for rationale.
 
 /// Configuration for the tiling pipeline.
 #[derive(Debug, Clone)]
@@ -194,15 +160,6 @@ pub struct TilerConfig {
     /// Hilbert curves have better locality than Z-order curves.
     /// If false, uses Z-order (Morton) curve instead.
     pub use_hilbert: bool,
-    /// Enable parallel tile generation using Rayon (default: true)
-    /// When enabled, tiles within each zoom level are processed in parallel.
-    /// Zoom levels are still processed sequentially to preserve feature dropping semantics.
-    pub parallel: bool,
-    /// Enable parallel geometry processing within row groups (default: true)
-    /// When enabled, multiple geometries are processed simultaneously within each row group.
-    /// This is orthogonal to `parallel` which parallelizes tiles within large geometries.
-    /// Both can be enabled for maximum parallelism on datasets with many geometries.
-    pub parallel_geoms: bool,
     /// Property filter for controlling which attributes are included in output tiles.
     /// Matches tippecanoe's -x (exclude), -y (include), and -X (exclude-all) flags.
     /// Geometry columns are always preserved regardless of filter settings.
@@ -215,9 +172,6 @@ pub struct TilerConfig {
     pub memory_budget: Option<usize>,
     /// Suppress quality warnings and progress output (default: false).
     pub quiet: bool,
-    /// Streaming mode for memory/speed tradeoff (default: Fast).
-    /// See `StreamingMode` for details on each mode.
-    pub streaming_mode: StreamingMode,
 }
 
 impl Default for TilerConfig {
@@ -238,18 +192,12 @@ impl Default for TilerConfig {
             density_max_per_cell: 1,
             // Hilbert curve is the default because it has better locality than Z-order
             use_hilbert: true,
-            // Parallel processing is enabled by default for performance
-            parallel: true,
-            // Parallel geometry processing within row groups is also enabled by default
-            parallel_geoms: true,
             // No property filtering by default - include all properties
             property_filter: PropertyFilter::None,
             // No memory budget by default - rely on row group streaming
             memory_budget: None,
             // Show warnings by default
             quiet: false,
-            // Fast mode by default - better for most use cases
-            streaming_mode: StreamingMode::default(),
         }
     }
 }
@@ -258,17 +206,6 @@ impl TilerConfig {
     /// Suppress quality warnings and progress output.
     pub fn with_quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
-        self
-    }
-
-    /// Set the streaming mode for memory/speed tradeoff.
-    ///
-    /// - `StreamingMode::Fast` (default): Single file pass, ~1-2GB memory for large files
-    /// - `StreamingMode::LowMemory`: Multiple file passes, ~100-200MB memory, 2-3x slower
-    ///
-    /// Use `LowMemory` for very large files (10GB+) or memory-constrained environments.
-    pub fn with_streaming_mode(mut self, mode: StreamingMode) -> Self {
-        self.streaming_mode = mode;
         self
     }
 }
@@ -328,30 +265,6 @@ impl TilerConfig {
     /// the same locality guarantee at quadrant boundaries.
     pub fn with_hilbert(mut self, use_hilbert: bool) -> Self {
         self.use_hilbert = use_hilbert;
-        self
-    }
-
-    /// Enable or disable parallel tile generation.
-    ///
-    /// When enabled (default), tiles within each zoom level are processed in parallel
-    /// using Rayon. Zoom levels are still processed sequentially to preserve feature
-    /// dropping semantics.
-    ///
-    /// Disable this for debugging or when you need deterministic single-threaded execution.
-    pub fn with_parallel(mut self, parallel: bool) -> Self {
-        self.parallel = parallel;
-        self
-    }
-
-    /// Enable or disable parallel geometry processing within row groups.
-    ///
-    /// When enabled (default), multiple geometries are processed simultaneously within
-    /// each row group. This is orthogonal to `parallel` which parallelizes tiles within
-    /// large geometries - both can be enabled for maximum parallelism.
-    ///
-    /// Disable this for debugging or when you need deterministic single-threaded execution.
-    pub fn with_parallel_geoms(mut self, parallel_geoms: bool) -> Self {
-        self.parallel_geoms = parallel_geoms;
         self
     }
 
@@ -743,20 +656,13 @@ pub fn generate_tiles_to_writer(
     writer.set_fields(fields);
     writer.set_layer_name(&config.layer_name);
 
-    // Dispatch based on streaming mode
-    match config.streaming_mode {
-        StreamingMode::Fast => generate_tiles_to_writer_fast(input_path, config, writer),
-        StreamingMode::LowMemory => generate_tiles_to_writer_low_memory(input_path, config, writer),
-        StreamingMode::ExternalSort => {
-            generate_tiles_to_writer_external_sort(input_path, config, writer, None)
-        }
-    }
+    // Always use geometry-centric external sort algorithm (fast + bounded memory)
+    generate_tiles_to_writer_internal(input_path, config, writer, None)
 }
 
 /// Generate tiles directly to a streaming PMTiles writer with progress reporting.
 ///
 /// Same as `generate_tiles_to_writer` but accepts a progress callback for monitoring.
-/// Currently only `StreamingMode::ExternalSort` supports detailed progress reporting.
 #[allow(clippy::type_complexity)]
 pub fn generate_tiles_to_writer_with_progress(
     input_path: &Path,
@@ -784,397 +690,22 @@ pub fn generate_tiles_to_writer_with_progress(
     writer.set_fields(fields);
     writer.set_layer_name(&config.layer_name);
 
-    // Dispatch based on streaming mode
-    match config.streaming_mode {
-        StreamingMode::Fast => generate_tiles_to_writer_fast(input_path, config, writer),
-        StreamingMode::LowMemory => generate_tiles_to_writer_low_memory(input_path, config, writer),
-        StreamingMode::ExternalSort => {
-            generate_tiles_to_writer_external_sort(input_path, config, writer, Some(progress))
-        }
-    }
+    // Always use geometry-centric external sort algorithm (fast + bounded memory)
+    generate_tiles_to_writer_internal(input_path, config, writer, Some(progress))
 }
 
 /// Fast streaming mode: single file pass, stores clipped geometries per tile.
 ///
 /// Memory usage: ~1-2GB for large files (clipped geometries are ~90% smaller than originals)
-/// Speed: 1x (single file pass)
-#[allow(clippy::type_complexity)]
-fn generate_tiles_to_writer_fast(
-    input_path: &Path,
-    config: &TilerConfig,
-    writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
-) -> Result<crate::memory::MemoryStats> {
-    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker};
-    use geo::BoundingRect;
-    use std::collections::HashMap;
-
-    let mut memory_tracker = match config.memory_budget {
-        Some(budget) => MemoryTracker::with_budget(budget),
-        None => MemoryTracker::new(),
-    };
-
-    let mut global_bounds = TileBounds::empty();
-    let mut global_feature_index: u64 = 0;
-
-    // Store CLIPPED geometries per tile (not original geometries!)
-    // Key: (z, x, y), Value: Vec of (clipped_geometry, feature_index)
-    // Clipped geometries are typically 90% smaller than originals
-    let mut tile_features: HashMap<(u8, u32, u32), Vec<(Geometry<f64>, u64)>> = HashMap::new();
-
-    // Process all row groups, accumulating clipped geometries
-    process_geometries_by_row_group(input_path, |rg_info: RowGroupInfo, geometries| {
-        if !config.quiet {
-            log::info!(
-                "Processing row group {} with {} features",
-                rg_info.index,
-                rg_info.num_rows
-            );
-        }
-
-        // Sort geometries within this row group for better locality
-        let mut sorted = geometries;
-        sort_geometries(&mut sorted, config.use_hilbert);
-
-        for geom in sorted {
-            let feat_idx = global_feature_index;
-            global_feature_index += 1;
-
-            let geom_bbox = match geom.bounding_rect() {
-                Some(rect) => {
-                    let bounds =
-                        TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                    global_bounds.expand(&bounds);
-                    bounds
-                }
-                None => continue,
-            };
-
-            // Process all zoom levels for this geometry
-            for z in config.min_zoom..=config.max_zoom {
-                // PERFORMANCE: Pre-simplify geometry BEFORE tile iteration
-                // This reduces 688K coord polygons to ~5K coords, making clipping fast
-                let simplified_geom = simplify_for_zoom(&geom, z, config.extent);
-
-                let tiles = tiles_for_bbox(&geom_bbox, z);
-
-                for tile_coord in tiles {
-                    let tile_bounds = tile_coord.bounds();
-                    let buffer =
-                        buffer_pixels_to_degrees(config.buffer_pixels, &tile_bounds, config.extent);
-
-                    // Check if geometry bbox intersects buffered tile bounds
-                    let buffered_lng_min = tile_bounds.lng_min - buffer;
-                    let buffered_lng_max = tile_bounds.lng_max + buffer;
-                    let buffered_lat_min = tile_bounds.lat_min - buffer;
-                    let buffered_lat_max = tile_bounds.lat_max + buffer;
-
-                    let intersects = geom_bbox.lng_max >= buffered_lng_min
-                        && geom_bbox.lng_min <= buffered_lng_max
-                        && geom_bbox.lat_max >= buffered_lat_min
-                        && geom_bbox.lat_min <= buffered_lat_max;
-
-                    if !intersects {
-                        continue;
-                    }
-
-                    // Clip the pre-simplified geometry to tile bounds
-                    let clipped = match clip_geometry(&simplified_geom, &tile_bounds, buffer) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-
-                    let validated = match filter_valid_geometry(&clipped) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-
-                    // Check dropping rules after clipping
-                    if should_drop_geometry(
-                        &validated,
-                        z,
-                        config.max_zoom,
-                        config.extent,
-                        &tile_bounds,
-                        feat_idx,
-                    ) {
-                        continue;
-                    }
-
-                    // Density dropping
-                    // Note: We skip density dropping in fast mode to keep it simpler
-                    // The LowMemory mode handles it properly per-tile
-
-                    // Store the CLIPPED geometry (not the original!)
-                    // Track memory for the clipped geometry
-                    memory_tracker.add(estimate_geometry_size(&validated));
-                    tile_features
-                        .entry((z, tile_coord.x, tile_coord.y))
-                        .or_default()
-                        .push((validated, feat_idx));
-                }
-            }
-        }
-
-        Ok(())
-    })?;
-
-    // Now encode and write all tiles
-    let mut tile_coords: Vec<_> = tile_features.keys().copied().collect();
-    tile_coords.sort();
-
-    if !config.quiet {
-        log::info!("Writing {} tiles to PMTiles", tile_coords.len());
-    }
-
-    for (z, x, y) in tile_coords {
-        let features = tile_features.remove(&(z, x, y)).unwrap_or_default();
-        let coord = TileCoord::new(x, y, z);
-        let tile_bounds = coord.bounds();
-
-        // Build tile with all features
-        let mut layer_builder = LayerBuilder::new(&config.layer_name).with_extent(config.extent);
-        let mut feature_count = 0;
-
-        for (validated, feat_idx) in features {
-            layer_builder.add_feature(Some(feat_idx), &validated, &[], &tile_bounds);
-            feature_count += 1;
-        }
-
-        if feature_count == 0 {
-            continue;
-        }
-
-        let layer = layer_builder.build();
-        let mut tile_builder = TileBuilder::new();
-        tile_builder.add_layer(layer);
-        let tile = tile_builder.build();
-        let encoded = tile.encode_to_vec();
-
-        writer
-            .add_tile_with_count(z, x, y, &encoded, feature_count)
-            .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
-    }
-
-    writer.set_bounds(&global_bounds);
-
-    let stats = MemoryStats::from_tracker(&memory_tracker);
-    if !config.quiet {
-        log::info!(
-            "Fast streaming complete: peak memory {}",
-            stats.peak_formatted()
-        );
-    }
-
-    Ok(stats)
-}
-
-/// Low-memory streaming mode: processes one zoom level at a time, re-reading the file.
-///
-/// Memory usage: ~100-200MB peak (only one zoom level's tiles in memory)
-/// Speed: 2-3x slower (re-reads file for each zoom level)
-#[allow(clippy::type_complexity)]
-fn generate_tiles_to_writer_low_memory(
-    input_path: &Path,
-    config: &TilerConfig,
-    writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
-) -> Result<crate::memory::MemoryStats> {
-    use crate::memory::{estimate_geometry_size, MemoryStats, MemoryTracker};
-    use geo::BoundingRect;
-    use std::cell::RefCell;
-    use std::collections::HashMap;
-
-    let memory_tracker = RefCell::new(match config.memory_budget {
-        Some(budget) => MemoryTracker::with_budget(budget),
-        None => MemoryTracker::new(),
-    });
-
-    let global_bounds = RefCell::new(TileBounds::empty());
-
-    // Process ONE zoom level at a time
-    // This provides true bounded memory at the cost of re-reading the file
-    for z in config.min_zoom..=config.max_zoom {
-        if !config.quiet {
-            log::info!(
-                "Processing zoom level {} ({} of {})",
-                z,
-                z - config.min_zoom + 1,
-                config.max_zoom - config.min_zoom + 1
-            );
-        }
-
-        // Reset memory tracker for this zoom level (memory is freed between levels)
-        memory_tracker.borrow_mut().reset_current();
-
-        // Tiles for this zoom level only
-        let tile_features: RefCell<HashMap<(u32, u32), Vec<(Geometry<f64>, u64)>>> =
-            RefCell::new(HashMap::new());
-        let global_feature_index = RefCell::new(0u64);
-
-        // Re-read the file for this zoom level
-        process_geometries_by_row_group(input_path, |_rg_info: RowGroupInfo, geometries| {
-            let mut sorted = geometries;
-            sort_geometries(&mut sorted, config.use_hilbert);
-
-            for geom in sorted {
-                let feat_idx = *global_feature_index.borrow();
-                *global_feature_index.borrow_mut() += 1;
-
-                let geom_bbox = match geom.bounding_rect() {
-                    Some(rect) => {
-                        let bounds =
-                            TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y);
-                        if z == config.min_zoom {
-                            // Only update global bounds on first zoom level
-                            global_bounds.borrow_mut().expand(&bounds);
-                        }
-                        bounds
-                    }
-                    None => continue,
-                };
-
-                // PERFORMANCE: Pre-simplify geometry BEFORE tile iteration
-                let simplified_geom = simplify_for_zoom(&geom, z, config.extent);
-
-                // Process ONLY this zoom level
-                let tiles = tiles_for_bbox(&geom_bbox, z);
-
-                for tile_coord in tiles {
-                    let tile_bounds = tile_coord.bounds();
-                    let buffer =
-                        buffer_pixels_to_degrees(config.buffer_pixels, &tile_bounds, config.extent);
-
-                    // Check intersection
-                    let buffered_lng_min = tile_bounds.lng_min - buffer;
-                    let buffered_lng_max = tile_bounds.lng_max + buffer;
-                    let buffered_lat_min = tile_bounds.lat_min - buffer;
-                    let buffered_lat_max = tile_bounds.lat_max + buffer;
-
-                    let intersects = geom_bbox.lng_max >= buffered_lng_min
-                        && geom_bbox.lng_min <= buffered_lng_max
-                        && geom_bbox.lat_max >= buffered_lat_min
-                        && geom_bbox.lat_min <= buffered_lat_max;
-
-                    if !intersects {
-                        continue;
-                    }
-
-                    // Clip the pre-simplified geometry
-                    let clipped = match clip_geometry(&simplified_geom, &tile_bounds, buffer) {
-                        Some(c) => c,
-                        None => continue,
-                    };
-
-                    let validated = match filter_valid_geometry(&clipped) {
-                        Some(v) => v,
-                        None => continue,
-                    };
-
-                    // Check dropping rules
-                    if should_drop_geometry(
-                        &validated,
-                        z,
-                        config.max_zoom,
-                        config.extent,
-                        &tile_bounds,
-                        feat_idx,
-                    ) {
-                        continue;
-                    }
-
-                    // Track memory for the clipped geometry
-                    memory_tracker
-                        .borrow_mut()
-                        .add(estimate_geometry_size(&validated));
-
-                    // Store for this tile (using only x,y since z is fixed)
-                    tile_features
-                        .borrow_mut()
-                        .entry((tile_coord.x, tile_coord.y))
-                        .or_default()
-                        .push((validated, feat_idx));
-                }
-            }
-
-            Ok(())
-        })?;
-
-        // Encode and write tiles for this zoom level
-        let mut features_map = tile_features.into_inner();
-        let mut tile_coords: Vec<_> = features_map.keys().copied().collect();
-        tile_coords.sort();
-
-        for (x, y) in tile_coords {
-            let features = features_map.remove(&(x, y)).unwrap_or_default();
-            let coord = TileCoord::new(x, y, z);
-            let tile_bounds = coord.bounds();
-
-            // Set up density dropper for this tile
-            let mut density_dropper = if config.enable_density_drop {
-                let density_config = DensityDropConfig::new()
-                    .with_cell_size(config.density_cell_size)
-                    .with_max_features_per_cell(config.density_max_per_cell)
-                    .with_zoom_range(0, config.max_zoom);
-                Some(DensityDropper::new(density_config, config.extent))
-            } else {
-                None
-            };
-
-            let mut layer_builder =
-                LayerBuilder::new(&config.layer_name).with_extent(config.extent);
-            let mut feature_count = 0;
-
-            for (validated, feat_idx) in features {
-                // Density dropping
-                if let Some(ref mut dropper) = density_dropper {
-                    if dropper.should_drop_geometry(&validated, &tile_bounds, config.extent, z) {
-                        continue;
-                    }
-                }
-
-                layer_builder.add_feature(Some(feat_idx), &validated, &[], &tile_bounds);
-                feature_count += 1;
-            }
-
-            if feature_count == 0 {
-                continue;
-            }
-
-            let layer = layer_builder.build();
-            let mut tile_builder = TileBuilder::new();
-            tile_builder.add_layer(layer);
-            let tile = tile_builder.build();
-            let encoded = tile.encode_to_vec();
-
-            writer
-                .add_tile_with_count(z, x, y, &encoded, feature_count)
-                .map_err(|e| Error::PMTilesWrite(format!("Failed to write tile: {}", e)))?;
-        }
-
-        // features_map goes out of scope here - memory freed before next zoom level
-    }
-
-    writer.set_bounds(&global_bounds.into_inner());
-
-    let stats = MemoryStats::from_tracker(&memory_tracker.into_inner());
-    if !config.quiet {
-        log::info!(
-            "Low-memory streaming complete: peak memory {}",
-            stats.peak_formatted()
-        );
-    }
-
-    Ok(stats)
-}
-
-/// External sort streaming mode: bounded memory with single file pass.
+/// Geometry-centric tile generation with external sort for bounded memory.
 ///
 /// Phase 1: Read file, clip geometries, write to external sorter
 /// Phase 2: Sort by tile_id (memory-bounded external merge sort)
 /// Phase 3: Read sorted, group by tile, encode MVT, write PMTiles
 ///
 /// Memory usage: O(sort_buffer_size) - configurable, typically 100K-1M records
-/// Speed: ~1.2x slower than Fast (disk I/O for sorting), but single file pass
-fn generate_tiles_to_writer_external_sort(
+/// This is the only tile generation algorithm - geometry-centric with external sort.
+fn generate_tiles_to_writer_internal(
     input_path: &Path,
     config: &TilerConfig,
     writer: &mut crate::pmtiles_writer::StreamingPmtilesWriter,
@@ -1310,7 +841,8 @@ fn generate_tiles_to_writer_external_sort(
             const PARALLEL_THRESHOLD: usize = 1000;
 
             // Process tiles - parallel for large geometries, sequential for small
-            if config.parallel && total_tiles_for_geom >= PARALLEL_THRESHOLD {
+            // Always use parallelism when beneficial (no config flag needed)
+            if total_tiles_for_geom >= PARALLEL_THRESHOLD {
                 // PARALLEL PATH (PR #36): Process tiles within this geometry in parallel
 
                 // Collect all (z, tile_coord) pairs across all zoom levels
@@ -1491,24 +1023,14 @@ fn generate_tiles_to_writer_external_sort(
             result
         };
 
-        // Collect results - parallel or sequential based on config
-        let results: Vec<GeomResult> = if config.parallel_geoms {
-            // PARALLEL GEOMETRY PROCESSING (Issue #37)
-            sorted
-                .into_iter()
-                .enumerate()
-                .collect::<Vec<_>>()
-                .into_par_iter()
-                .map(|(idx, geom)| process_geometry(idx, geom))
-                .collect()
-        } else {
-            // SEQUENTIAL GEOMETRY PROCESSING (original behavior)
-            sorted
-                .into_iter()
-                .enumerate()
-                .map(|(idx, geom)| process_geometry(idx, geom))
-                .collect()
-        };
+        // Always use parallel geometry processing for best performance
+        let results: Vec<GeomResult> = sorted
+            .into_iter()
+            .enumerate()
+            .collect::<Vec<_>>()
+            .into_par_iter()
+            .map(|(idx, geom)| process_geometry(idx, geom))
+            .collect();
 
         // Aggregate all results and write to sorter
         let mut time_clip = std::time::Duration::ZERO;
@@ -2125,22 +1647,6 @@ impl TileIterator {
             .collect()
     }
 
-    /// Process all tiles for a zoom level sequentially.
-    fn process_zoom_level_sequential(&self, zoom: u8) -> Vec<Result<GeneratedTile>> {
-        let tile_coords: Vec<TileCoord> = tiles_for_bbox(&self.bbox, zoom).collect();
-
-        tile_coords
-            .into_iter()
-            .filter_map(|coord| {
-                match Self::process_tile_static(&self.geometries, coord, &self.config) {
-                    Ok(Some(tile)) => Some(Ok(tile)),
-                    Ok(None) => None, // Empty tile, skip
-                    Err(e) => Some(Err(e)),
-                }
-            })
-            .collect()
-    }
-
     /// Fill the tile buffer with tiles from the next zoom level.
     fn fill_buffer(&mut self) -> bool {
         if self.current_zoom > self.config.max_zoom {
@@ -2148,15 +1654,11 @@ impl TileIterator {
             return false;
         }
 
-        // Process tiles for this zoom level
-        let results = if self.config.parallel {
-            self.process_zoom_level_parallel(self.current_zoom)
-        } else {
-            self.process_zoom_level_sequential(self.current_zoom)
-        };
+        // Process tiles for this zoom level (always parallel for performance)
+        let results = self.process_zoom_level_parallel(self.current_zoom);
 
         // Extract successful tiles, propagate errors later
-        self.tile_buffer = results.into_iter().filter_map(|r| r.ok()).collect();
+        self.tile_buffer = results.into_iter().filter_map(Result::ok).collect();
 
         // Sort tiles by coordinates for deterministic output order
         self.tile_buffer
@@ -3080,124 +2582,8 @@ mod tests {
         }
     }
 
-    // ========== Parallel Tile Generation Tests ==========
-
-    #[test]
-    fn test_parallel_config_option() {
-        // Verify the parallel config option works
-        let config_default = TilerConfig::default();
-        assert!(
-            config_default.parallel,
-            "Default should enable parallel processing"
-        );
-
-        let config_parallel = TilerConfig::new(0, 10).with_parallel(true);
-        assert!(
-            config_parallel.parallel,
-            "with_parallel(true) should enable parallel"
-        );
-
-        let config_sequential = TilerConfig::new(0, 10).with_parallel(false);
-        assert!(
-            !config_sequential.parallel,
-            "with_parallel(false) should disable parallel"
-        );
-    }
-
-    #[test]
-    fn test_parallel_produces_same_results_as_sequential() {
-        // Generate tiles with both parallel and sequential modes
-        // Results should be identical (deterministic)
-        let geometries = vec![
-            Geometry::Point(point!(x: 0.0, y: 0.0)),
-            Geometry::Point(point!(x: 0.5, y: 0.5)),
-            Geometry::Point(point!(x: -0.5, y: -0.5)),
-            Geometry::Polygon(polygon![
-                (x: 0.0, y: 0.0),
-                (x: 1.0, y: 0.0),
-                (x: 1.0, y: 1.0),
-                (x: 0.0, y: 1.0),
-                (x: 0.0, y: 0.0),
-            ]),
-            Geometry::LineString(line_string![
-                (x: -1.0, y: -1.0),
-                (x: 1.0, y: 1.0),
-            ]),
-        ];
-
-        let bbox = calculate_bbox_from_geometries(&geometries);
-
-        // Sequential mode
-        let config_seq = TilerConfig::new(0, 4).with_parallel(false);
-        let iter_seq = TileIterator::new(geometries.clone(), bbox, config_seq);
-        let tiles_seq: Vec<_> = iter_seq.filter_map(|r| r.ok()).collect();
-
-        // Parallel mode
-        let config_par = TilerConfig::new(0, 4).with_parallel(true);
-        let iter_par = TileIterator::new(geometries.clone(), bbox, config_par);
-        let tiles_par: Vec<_> = iter_par.filter_map(|r| r.ok()).collect();
-
-        // Same number of tiles
-        assert_eq!(
-            tiles_seq.len(),
-            tiles_par.len(),
-            "Parallel and sequential should produce same number of tiles"
-        );
-
-        // Same tile coordinates (sorted for comparison)
-        let mut coords_seq: Vec<_> = tiles_seq.iter().map(|t| t.coord).collect();
-        let mut coords_par: Vec<_> = tiles_par.iter().map(|t| t.coord).collect();
-        coords_seq.sort_by_key(|c| (c.z, c.x, c.y));
-        coords_par.sort_by_key(|c| (c.z, c.x, c.y));
-
-        assert_eq!(
-            coords_seq, coords_par,
-            "Parallel and sequential should produce tiles for same coordinates"
-        );
-
-        // Same tile data (content must be identical for determinism)
-        // Sort both by coordinates first
-        let mut tiles_seq_sorted = tiles_seq;
-        let mut tiles_par_sorted = tiles_par;
-        tiles_seq_sorted.sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
-        tiles_par_sorted.sort_by_key(|t| (t.coord.z, t.coord.x, t.coord.y));
-
-        for (seq_tile, par_tile) in tiles_seq_sorted.iter().zip(tiles_par_sorted.iter()) {
-            assert_eq!(
-                seq_tile.data, par_tile.data,
-                "Tile data should be identical for coord {:?}",
-                seq_tile.coord
-            );
-        }
-    }
-
-    #[test]
-    fn test_parallel_with_real_fixture() {
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        // Generate tiles with parallel enabled
-        let config = TilerConfig::new(8, 10)
-            .with_layer_name("buildings")
-            .with_parallel(true);
-
-        let tiles_iter = generate_tiles(fixture, &config).expect("Should create iterator");
-        let tiles: Vec<_> = tiles_iter.filter_map(|r| r.ok()).collect();
-
-        assert!(!tiles.is_empty(), "Should generate tiles in parallel mode");
-
-        // Verify tiles are valid
-        for tile in &tiles {
-            let decoded = decode_tile(&tile.data).expect("Should decode MVT");
-            assert_eq!(decoded.layers.len(), 1);
-            assert!(!decoded.layers[0].features.is_empty());
-        }
-
-        println!("Generated {} tiles in parallel mode", tiles.len());
-    }
+    // NOTE: Parallel configuration tests removed in v0.4.0
+    // Parallelism is now always enabled (no config option)
 
     // ========== Property Filter Config Tests ==========
 
@@ -3519,10 +2905,12 @@ mod tests {
         let _ = fs::remove_file(output_path);
     }
 
-    // ========== External Sort Streaming Mode Tests ==========
+    // ========== Production Pipeline Tests ==========
+    // NOTE: v0.4.0 consolidated to a single pipeline algorithm (geometry-centric with external sort).
+    // These tests validate the production code path.
 
     #[test]
-    fn test_external_sort_produces_tiles() {
+    fn test_pipeline_produces_tiles() {
         use crate::compression::Compression;
         use crate::pmtiles_writer::StreamingPmtilesWriter;
         use std::fs;
@@ -3533,25 +2921,20 @@ mod tests {
             return;
         }
 
-        let config = TilerConfig::new(0, 6)
-            .with_quiet(true)
-            .with_streaming_mode(StreamingMode::ExternalSort);
+        let config = TilerConfig::new(0, 6).with_quiet(true);
 
         let mut writer =
             StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
 
-        let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
-            .expect("Should generate tiles with external sort");
+        let stats =
+            generate_tiles_to_writer(fixture, &config, &mut writer).expect("Should generate tiles");
 
-        let output_path = Path::new("/tmp/test-external-sort-basic.pmtiles");
+        let output_path = Path::new("/tmp/test-pipeline-basic.pmtiles");
         let _ = fs::remove_file(output_path);
 
         let write_stats = writer.finalize(output_path).expect("Should finalize");
 
-        assert!(
-            write_stats.total_tiles > 0,
-            "Should produce tiles with external sort mode"
-        );
+        assert!(write_stats.total_tiles > 0, "Should produce tiles");
 
         // Memory tracking should be present
         assert!(
@@ -3564,65 +2947,7 @@ mod tests {
     }
 
     #[test]
-    fn test_external_sort_matches_fast_mode() {
-        use crate::compression::Compression;
-        use crate::pmtiles_writer::StreamingPmtilesWriter;
-        use std::fs;
-
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        // Use small zoom range for faster test
-        let base_config = TilerConfig::new(0, 6).with_quiet(true);
-
-        // Fast mode (default)
-        let fast_config = base_config.clone().with_streaming_mode(StreamingMode::Fast);
-        let mut fast_writer =
-            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create fast writer");
-        generate_tiles_to_writer(fixture, &fast_config, &mut fast_writer)
-            .expect("Fast mode should work");
-
-        let fast_output = Path::new("/tmp/test-external-sort-fast.pmtiles");
-        let _ = fs::remove_file(fast_output);
-        let fast_stats = fast_writer
-            .finalize(fast_output)
-            .expect("Should finalize fast");
-
-        // External sort mode
-        let sort_config = base_config
-            .clone()
-            .with_streaming_mode(StreamingMode::ExternalSort);
-        let mut sort_writer =
-            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create sort writer");
-        generate_tiles_to_writer(fixture, &sort_config, &mut sort_writer)
-            .expect("External sort mode should work");
-
-        let sort_output = Path::new("/tmp/test-external-sort-sorted.pmtiles");
-        let _ = fs::remove_file(sort_output);
-        let sort_stats = sort_writer
-            .finalize(sort_output)
-            .expect("Should finalize sort");
-
-        // Compare tile counts - should be identical or very close
-        // (minor differences can occur due to feature ordering affecting dropping decisions)
-        let ratio = sort_stats.total_tiles as f64 / fast_stats.total_tiles as f64;
-        assert!(
-            ratio > 0.95 && ratio < 1.05,
-            "ExternalSort and Fast should produce similar tile counts: fast={}, sort={}, ratio={}",
-            fast_stats.total_tiles,
-            sort_stats.total_tiles,
-            ratio
-        );
-
-        let _ = fs::remove_file(fast_output);
-        let _ = fs::remove_file(sort_output);
-    }
-
-    #[test]
-    fn test_external_sort_with_multi_row_group() {
+    fn test_pipeline_with_multi_row_group() {
         use crate::compression::Compression;
         use crate::pmtiles_writer::StreamingPmtilesWriter;
         use std::fs;
@@ -3633,9 +2958,7 @@ mod tests {
             return;
         }
 
-        let config = TilerConfig::new(0, 6)
-            .with_quiet(true)
-            .with_streaming_mode(StreamingMode::ExternalSort);
+        let config = TilerConfig::new(0, 6).with_quiet(true);
 
         let mut writer =
             StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
@@ -3643,7 +2966,7 @@ mod tests {
         let _stats = generate_tiles_to_writer(fixture, &config, &mut writer)
             .expect("Should handle multi-row-group file");
 
-        let output_path = Path::new("/tmp/test-external-sort-multi-rg.pmtiles");
+        let output_path = Path::new("/tmp/test-pipeline-multi-rg.pmtiles");
         let _ = fs::remove_file(output_path);
 
         let write_stats = writer.finalize(output_path).expect("Should finalize");
@@ -3657,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn test_external_sort_memory_stays_bounded() {
+    fn test_pipeline_memory_stays_bounded() {
         use crate::compression::Compression;
         use crate::pmtiles_writer::StreamingPmtilesWriter;
         use std::fs;
@@ -3673,7 +2996,6 @@ mod tests {
 
         let config = TilerConfig::new(0, 8)
             .with_quiet(true)
-            .with_streaming_mode(StreamingMode::ExternalSort)
             .with_memory_budget(memory_budget);
 
         let mut writer =
@@ -3682,22 +3004,19 @@ mod tests {
         let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
             .expect("Should generate tiles with memory budget");
 
-        let output_path = Path::new("/tmp/test-external-sort-memory.pmtiles");
+        let output_path = Path::new("/tmp/test-pipeline-memory.pmtiles");
         let _ = fs::remove_file(output_path);
         let _write_stats = writer.finalize(output_path).expect("Should finalize");
 
         // Peak memory should be tracked and within budget
-        // Note: We track what we can, actual memory may be higher due to
-        // untracked allocations, but the trend should be visible
         eprintln!(
-            "External sort memory stats: peak={}KB ({}MB), budget={}MB",
+            "Pipeline memory stats: peak={}KB ({}MB), budget={}MB",
             stats.peak_bytes / 1024,
             stats.peak_bytes / (1024 * 1024),
             memory_budget / (1024 * 1024)
         );
 
         // For small files, peak should be well under budget
-        // (This is more of a sanity check than a strict bound)
         assert!(
             stats.peak_bytes < memory_budget * 2,
             "Peak memory ({}) should be reasonable relative to budget ({})",
@@ -3709,8 +3028,8 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // Run with: cargo test test_external_sort_large_file -- --ignored
-    fn test_external_sort_large_file() {
+    #[ignore] // Run with: cargo test test_pipeline_large_file -- --ignored
+    fn test_pipeline_large_file() {
         // This test uses the 3.3GB adm4_polygons.parquet fixture
         use crate::compression::Compression;
         use crate::pmtiles_writer::StreamingPmtilesWriter;
@@ -3727,16 +3046,15 @@ mod tests {
 
         let config = TilerConfig::new(0, 8) // zoom 0-8 for reasonable test time
             .with_quiet(false) // Show progress for large file
-            .with_streaming_mode(StreamingMode::ExternalSort)
             .with_memory_budget(memory_budget);
 
         let mut writer =
             StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create streaming writer");
 
         let stats = generate_tiles_to_writer(fixture, &config, &mut writer)
-            .expect("External sort should handle large file");
+            .expect("Pipeline should handle large file");
 
-        let output_path = Path::new("/tmp/test-external-sort-large.pmtiles");
+        let output_path = Path::new("/tmp/test-pipeline-large.pmtiles");
         let _ = fs::remove_file(output_path);
         let write_stats = writer.finalize(output_path).expect("Should finalize");
 

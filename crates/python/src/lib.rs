@@ -3,8 +3,7 @@
 //! This module exposes the gpq-tiles-core functionality to Python via pyo3.
 
 use gpq_tiles_core::pipeline::{
-    generate_tiles_to_writer, generate_tiles_to_writer_with_progress, ProgressEvent, StreamingMode,
-    TilerConfig,
+    generate_tiles_to_writer, generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
 };
 use gpq_tiles_core::{Compression, DropDensity, PropertyFilter, StreamingPmtilesWriter};
 use pyo3::prelude::*;
@@ -86,11 +85,6 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     exclude (list[str], optional): Blacklist of property names to exclude. Cannot be used with include or exclude_all.
 ///     exclude_all (bool, optional): Exclude all properties, output geometry only. Defaults to False.
 ///     layer_name (str, optional): Override the layer name (defaults to input filename stem).
-///     streaming_mode (str, optional): Memory/speed tradeoff ("fast", "low-memory"). Defaults to "fast".
-///         - "fast": Single file pass, ~1-2GB memory for large files. Best for files up to ~10GB.
-///         - "low-memory": Process one zoom at a time, ~100-200MB peak. Best for 10GB+ files.
-///     parallel_tiles (bool, optional): Enable parallel tile generation. Defaults to True.
-///     parallel_geoms (bool, optional): Enable parallel geometry processing. Defaults to True.
 ///     progress_callback (callable, optional): A callback function that receives progress events as dicts.
 ///         Each event dict has a "phase" key indicating the event type:
 ///         - "start": Phase started. Keys: phase_num (int), name (str)
@@ -117,17 +111,13 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", exclude=["internal_id"])
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", exclude_all=True)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
-///     >>> # Low memory mode for very large files
-///     >>> convert("huge.parquet", "huge.pmtiles", streaming_mode="low-memory")
-///     >>> # Disable parallelism for debugging
-///     >>> convert("data.parquet", "data.pmtiles", parallel_tiles=False, parallel_geoms=False)
 ///     >>> # With progress callback
 ///     >>> def on_progress(event):
 ///     ...     if event["phase"] == "complete":
 ///     ...         print(f"Generated {event['total_tiles']} tiles")
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", progress_callback=on_progress)
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, streaming_mode="fast", parallel_tiles=true, parallel_geoms=true, progress_callback=None))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, progress_callback=None))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn convert(
     py: Python<'_>,
@@ -141,9 +131,6 @@ fn convert(
     exclude: Option<Vec<String>>,
     exclude_all: bool,
     layer_name: Option<String>,
-    streaming_mode: &str,
-    parallel_tiles: bool,
-    parallel_geoms: bool,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     // Validate progress_callback is callable if provided
@@ -195,24 +182,6 @@ fn convert(
         ))
     })?;
 
-    // Parse streaming mode
-    // Note: If progress_callback is provided, we use ExternalSort mode as it's the only one
-    // that emits progress events
-    let streaming_mode_config = if progress_callback.is_some() {
-        StreamingMode::ExternalSort
-    } else {
-        match streaming_mode.to_lowercase().as_str() {
-            "fast" => StreamingMode::Fast,
-            "low-memory" => StreamingMode::LowMemory,
-            _ => {
-                return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "Invalid streaming mode: '{}'. Valid options: fast, low-memory",
-                    streaming_mode
-                )))
-            }
-        }
-    };
-
     // Derive layer name from input filename if not provided
     let input_path = Path::new(input);
     let output_path_str = output.to_string();
@@ -238,9 +207,6 @@ fn convert(
             DropDensity::High => 1,
         })
         .with_property_filter(property_filter)
-        .with_streaming_mode(streaming_mode_config)
-        .with_parallel(parallel_tiles)
-        .with_parallel_geoms(parallel_geoms)
         .with_quiet(true); // Suppress progress output in Python
 
     // Create streaming writer

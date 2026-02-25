@@ -98,10 +98,19 @@ cargo fmt --all               # Format (required before commit)
 
 # Run the CLI
 cargo run --package gpq-tiles -- input.parquet output.pmtiles
-
-# Python tests
-cd crates/python && uv run pytest
 ```
+
+## CRITICAL: Always Use UV for Python
+
+**NEVER use bare `python`, `pip`, or `poetry`.** Always prefix with `uv run`:
+
+```bash
+cd crates/python && uv sync              # Install/sync deps
+cd crates/python && uv run pytest        # Run tests
+cd crates/python && uv run python script.py  # Run any Python script
+```
+
+This ensures consistent environments and avoids "module not found" errors.
 
 ## Common Pitfalls
 
