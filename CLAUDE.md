@@ -113,6 +113,39 @@ cd crates/python && uv run pytest
 6. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
 7. **Streaming vs non-streaming**: `generate_tiles_streaming()` exists but `generate_tiles()` is the default. Streaming is for files larger than memory
 
+## Version Management (CRITICAL)
+
+**All versions MUST stay synchronized across these files:**
+
+| File | Field |
+|------|-------|
+| `Cargo.toml` | `[workspace.package] version` |
+| `Cargo.toml` | `gpq-tiles-core = { ..., version = "X.Y.Z" }` in `[workspace.dependencies]` |
+| `crates/python/pyproject.toml` | `[project] version` |
+| `.cz.toml` | `version` |
+
+### How to bump versions correctly
+
+```bash
+# ALWAYS bump from repo root, NEVER from crates/python
+uv run cz bump --changelog
+
+# This updates ALL version files listed in .cz.toml
+git push --tags  # Triggers release workflow
+```
+
+### Safeguards in place
+
+1. **Pre-commit hook** (`.githooks/pre-commit`): Validates version consistency before commit
+2. **CI version-check job**: Fails PRs with mismatched versions
+3. **Commitizen config** (`.cz.toml`): Single source of truth for version_files
+
+### DO NOT
+
+- Run `cz bump` from `crates/python/` (it has no commitizen config)
+- Manually edit versions without updating ALL files
+- Merge PRs that fail the version-check CI job
+
 ## Commit Convention
 
 We use [Conventional Commits](https://www.conventionalcommits.org/). See `CONTRIBUTING.md` for details.

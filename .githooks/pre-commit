@@ -26,15 +26,30 @@ echo "Clippy check passed!"
 echo "Checking version consistency..."
 WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 CORE_DEP_VERSION=$(grep 'gpq-tiles-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+PYTHON_VERSION=$(grep -m1 '^version = ' crates/python/pyproject.toml | sed 's/version = "\(.*\)"/\1/')
+
+VERSION_ERROR=0
 
 if [ -n "$CORE_DEP_VERSION" ] && [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]; then
     echo ""
-    echo "ERROR: Version mismatch detected!"
+    echo "ERROR: Cargo version mismatch!"
     echo "  workspace.package.version = $WORKSPACE_VERSION"
     echo "  gpq-tiles-core dependency = $CORE_DEP_VERSION"
+    VERSION_ERROR=1
+fi
+
+if [ -n "$PYTHON_VERSION" ] && [ "$WORKSPACE_VERSION" != "$PYTHON_VERSION" ]; then
     echo ""
-    echo "Update the gpq-tiles-core version in workspace.dependencies to match."
-    echo "Or use 'cz bump' which handles this automatically."
+    echo "ERROR: Python version mismatch!"
+    echo "  workspace.package.version = $WORKSPACE_VERSION"
+    echo "  pyproject.toml version     = $PYTHON_VERSION"
+    VERSION_ERROR=1
+fi
+
+if [ "$VERSION_ERROR" -eq 1 ]; then
+    echo ""
+    echo "Fix: Run 'uv run cz bump --dry-run' to see what cz bump would update,"
+    echo "     or manually sync versions in Cargo.toml and pyproject.toml."
     echo ""
     exit 1
 fi
