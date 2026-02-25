@@ -1,6 +1,8 @@
 #!/bin/sh
 # Pre-commit hook for gpq-tiles
-# Runs cargo fmt check and syncs READMEs before allowing commit
+# Runs cargo fmt, clippy, version consistency check, and syncs READMEs before allowing commit
+
+set -e
 
 echo "Running cargo fmt check..."
 if ! cargo fmt --all -- --check 2>/dev/null; then
@@ -10,6 +12,42 @@ if ! cargo fmt --all -- --check 2>/dev/null; then
     exit 1
 fi
 echo "Format check passed!"
+
+echo "Running cargo clippy..."
+if ! cargo clippy --all-targets --all-features -- -D warnings 2>&1 | tail -20; then
+    echo ""
+    echo "ERROR: Clippy found issues. Fix them before committing."
+    echo ""
+    exit 1
+fi
+echo "Clippy check passed!"
+
+# Check version consistency across workspace
+echo "Checking version consistency..."
+WORKSPACE_VERSION=$(grep -m1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
+CORE_DEP_VERSION=$(grep 'gpq-tiles-core.*version' Cargo.toml | sed 's/.*version = "\([^"]*\)".*/\1/')
+
+if [ -n "$CORE_DEP_VERSION" ] && [ "$WORKSPACE_VERSION" != "$CORE_DEP_VERSION" ]; then
+    echo ""
+    echo "ERROR: Version mismatch detected!"
+    echo "  workspace.package.version = $WORKSPACE_VERSION"
+    echo "  gpq-tiles-core dependency = $CORE_DEP_VERSION"
+    echo ""
+    echo "Update the gpq-tiles-core version in workspace.dependencies to match."
+    echo "Or use 'cz bump' which handles this automatically."
+    echo ""
+    exit 1
+fi
+
+# Verify cargo can resolve dependencies (catches version mismatches)
+if ! cargo metadata --format-version=1 >/dev/null 2>&1; then
+    echo ""
+    echo "ERROR: Cargo dependency resolution failed!"
+    echo "Run 'cargo check' to see the detailed error."
+    echo ""
+    exit 1
+fi
+echo "Version consistency check passed!"
 
 # Sync READMEs to subcrates
 echo "Syncing README.md to subcrates..."

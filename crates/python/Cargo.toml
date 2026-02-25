@@ -14,5 +14,5 @@ name = "gpq_tiles"
 crate-type = ["cdylib"]
 
 [dependencies]
-gpq-tiles-core = { path = "../core" }
+gpq-tiles-core = { workspace = true }
 pyo3 = { workspace = true }

@@ -62,7 +62,15 @@ convert(
     min_zoom: int = 0,
     max_zoom: int = 14,
     drop_density: str = "medium",
-    compression: str = "gzip"
+    compression: str = "gzip",
+    include: list[str] | None = None,
+    exclude: list[str] | None = None,
+    exclude_all: bool = False,
+    layer_name: str | None = None,
+    streaming_mode: str = "fast",
+    parallel_tiles: bool = True,
+    parallel_geoms: bool = True,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> None
 ```
 
@@ -76,13 +84,22 @@ convert(
 | `max_zoom` | `int` | `14` | Maximum zoom level (0-22) |
 | `drop_density` | `str` | `"medium"` | Feature dropping: `"low"`, `"medium"`, `"high"` |
 | `compression` | `str` | `"gzip"` | Compression: `"gzip"`, `"brotli"`, `"zstd"`, `"none"` |
+| `include` | `list[str]` | `None` | Whitelist of property names to include |
+| `exclude` | `list[str]` | `None` | Blacklist of property names to exclude |
+| `exclude_all` | `bool` | `False` | Exclude all properties (geometry only) |
+| `layer_name` | `str` | `None` | Override layer name (default: input filename) |
+| `streaming_mode` | `str` | `"fast"` | Memory mode: `"fast"` or `"low-memory"` |
+| `parallel_tiles` | `bool` | `True` | Enable parallel tile generation |
+| `parallel_geoms` | `bool` | `True` | Enable parallel geometry processing |
+| `progress_callback` | `Callable` | `None` | Callback for progress events |
 
 **Raises:**
 
-- `ValueError` — Invalid parameter value
+- `TypeError` — `progress_callback` is not callable
+- `ValueError` — Invalid parameter value or conflicting filter options
 - `RuntimeError` — Conversion failed (file not found, invalid GeoParquet, etc.)
 
-**Example:**
+**Examples:**
 
 ```python
 from gpq_tiles import convert
@@ -99,11 +116,38 @@ convert(
     compression="zstd",
     drop_density="high"
 )
+
+# Property filtering
+convert("data.parquet", "out.pmtiles", include=["name", "population"])
+convert("data.parquet", "out.pmtiles", exclude=["internal_id"])
+convert("data.parquet", "out.pmtiles", exclude_all=True)  # geometry only
+
+# Large file handling
+convert("huge.parquet", "out.pmtiles", streaming_mode="low-memory")
+
+# Progress callback
+def on_progress(event):
+    if event["phase"] == "complete":
+        print(f"Generated {event['total_tiles']} tiles in {event['duration_secs']:.1f}s")
+    elif event["phase"] == "phase1_progress":
+        print(f"Reading row group {event['row_group']}/{event['total_row_groups']}")
+
+convert("data.parquet", "out.pmtiles", progress_callback=on_progress)
 ```
 
-**Current limitations:**
+**Progress Events:**
 
-Property filtering, streaming modes, and progress callbacks are not yet available. Track progress in [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45).
+When using `progress_callback`, the callback receives a dict with a `"phase"` key:
+
+| Phase | Description | Additional Keys |
+|-------|-------------|-----------------|
+| `"start"` | Phase started | `phase_num`, `name` |
+| `"phase1_progress"` | Reading row groups | `row_group`, `total_row_groups`, `features_in_group`, `records_written` |
+| `"phase1_complete"` | Reading complete | `total_records`, `peak_memory_bytes` |
+| `"phase2_start"` | Sorting started | — |
+| `"phase2_complete"` | Sorting complete | — |
+| `"phase3_progress"` | Encoding tiles | `tiles_written`, `records_processed`, `total_records` |
+| `"complete"` | All done | `total_tiles`, `peak_memory_bytes`, `duration_secs` |
 
 ---
 

@@ -157,3 +157,599 @@ class TestConvertIntegration:
             )
 
             assert output.exists()
+
+
+class TestPropertyFiltering:
+    """Tests for property filtering parameters."""
+
+    def test_convert_accepts_include_parameter(self):
+        """Test that convert() accepts include parameter for property whitelist."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                include=["name", "population"],
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+    def test_convert_accepts_exclude_parameter(self):
+        """Test that convert() accepts exclude parameter for property blacklist."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                exclude=["internal_id"],
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+    def test_convert_accepts_exclude_all_parameter(self):
+        """Test that convert() accepts exclude_all parameter for geometry-only output."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                exclude_all=True,
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+    def test_convert_rejects_include_with_exclude(self):
+        """Test that using both include and exclude raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                include=["name"],
+                exclude=["population"],
+            )
+        assert "include" in str(exc_info.value).lower() or "exclude" in str(exc_info.value).lower()
+
+    def test_convert_rejects_include_with_exclude_all(self):
+        """Test that using include with exclude_all raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                include=["name"],
+                exclude_all=True,
+            )
+        assert "include" in str(exc_info.value).lower() or "exclude" in str(exc_info.value).lower()
+
+    def test_convert_rejects_exclude_with_exclude_all(self):
+        """Test that using exclude with exclude_all raises ValueError."""
+        with pytest.raises(ValueError) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                exclude=["temp"],
+                exclude_all=True,
+            )
+        assert "exclude" in str(exc_info.value).lower()
+
+
+class TestLayerNameOverride:
+    """Tests for layer_name parameter."""
+
+    def test_convert_accepts_layer_name_parameter(self):
+        """Test that convert() accepts layer_name parameter."""
+        # Should accept without TypeError
+        with pytest.raises(Exception) as exc_info:
+            gpq_tiles.convert(
+                input="/nonexistent/file.parquet",
+                output="/tmp/output.pmtiles",
+                layer_name="custom_layer",
+            )
+        # Should fail on file not found, not parameter error
+        assert "TypeError" not in str(type(exc_info.value))
+
+
+class TestStreamingMode:
+    """Tests for streaming_mode parameter."""
+
+    def test_streaming_mode_parameter_exists(self):
+        """Test that streaming_mode parameter is accepted."""
+        # This will fail until the parameter is implemented
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            # Should not raise TypeError about unexpected parameter
+            try:
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    streaming_mode="fast",
+                )
+            except TypeError as e:
+                if "streaming_mode" in str(e):
+                    pytest.fail("streaming_mode parameter not accepted")
+                # Other TypeErrors (like missing file) are expected
+            except Exception:
+                pass  # File not found errors are expected
+
+    def test_streaming_mode_invalid_value(self):
+        """Test error for invalid streaming_mode value."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            with pytest.raises(ValueError) as exc_info:
+                gpq_tiles.convert(
+                    input="/some/input.parquet",
+                    output=str(output),
+                    streaming_mode="invalid_mode",
+                )
+
+            assert "streaming" in str(exc_info.value).lower()
+
+    def test_streaming_mode_accepts_fast(self):
+        """Test that 'fast' streaming_mode is accepted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            # Should not raise ValueError for the mode itself
+            try:
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    streaming_mode="fast",
+                )
+            except ValueError as e:
+                if "streaming" in str(e).lower():
+                    pytest.fail("'fast' should be a valid streaming_mode")
+            except Exception:
+                pass  # File not found errors are expected
+
+    def test_streaming_mode_accepts_low_memory(self):
+        """Test that 'low-memory' streaming_mode is accepted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            # Should not raise ValueError for the mode itself
+            try:
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    streaming_mode="low-memory",
+                )
+            except ValueError as e:
+                if "streaming" in str(e).lower():
+                    pytest.fail("'low-memory' should be a valid streaming_mode")
+            except Exception:
+                pass  # File not found errors are expected
+
+
+class TestParallelControls:
+    """Tests for parallel_tiles and parallel_geoms parameters."""
+
+    def test_parallel_tiles_parameter_exists(self):
+        """Test that parallel_tiles parameter is accepted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            try:
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    parallel_tiles=True,
+                )
+            except TypeError as e:
+                if "parallel_tiles" in str(e):
+                    pytest.fail("parallel_tiles parameter not accepted")
+            except Exception:
+                pass
+
+    def test_parallel_geoms_parameter_exists(self):
+        """Test that parallel_geoms parameter is accepted."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            try:
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    parallel_geoms=True,
+                )
+            except TypeError as e:
+                if "parallel_geoms" in str(e):
+                    pytest.fail("parallel_geoms parameter not accepted")
+            except Exception:
+                pass
+
+    def test_parallel_tiles_accepts_bool(self):
+        """Test that parallel_tiles accepts boolean values."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            for val in [True, False]:
+                try:
+                    gpq_tiles.convert(
+                        input="/nonexistent/file.parquet",
+                        output=str(output),
+                        parallel_tiles=val,
+                    )
+                except TypeError as e:
+                    if "parallel_tiles" in str(e) or "bool" in str(e).lower():
+                        pytest.fail(f"parallel_tiles should accept {val}")
+                except Exception:
+                    pass
+
+    def test_parallel_geoms_accepts_bool(self):
+        """Test that parallel_geoms accepts boolean values."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            for val in [True, False]:
+                try:
+                    gpq_tiles.convert(
+                        input="/nonexistent/file.parquet",
+                        output=str(output),
+                        parallel_geoms=val,
+                    )
+                except TypeError as e:
+                    if "parallel_geoms" in str(e) or "bool" in str(e).lower():
+                        pytest.fail(f"parallel_geoms should accept {val}")
+                except Exception:
+                    pass
+
+
+class TestProgressCallback:
+    """Tests for progress callback functionality."""
+
+    def test_convert_accepts_progress_callback(self):
+        """Verify convert() accepts a progress_callback parameter."""
+        # This should not raise TypeError for unknown parameter
+        import inspect
+
+        sig = inspect.signature(gpq_tiles.convert)
+        param_names = list(sig.parameters.keys())
+        assert "progress_callback" in param_names
+
+    def test_progress_callback_none_is_valid(self):
+        """Test that progress_callback=None is accepted (no callback)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            # Should not raise - None means no callback
+            with pytest.raises(Exception):
+                # Will fail because input doesn't exist, but that's fine
+                # We're just checking the parameter is accepted
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    progress_callback=None,
+                )
+
+    def test_progress_callback_invalid_type_raises(self):
+        """Test that non-callable progress_callback raises TypeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            with pytest.raises(TypeError):
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    progress_callback="not a callable",
+                )
+
+
+@pytest.mark.skipif(
+    not (REALDATA_DIR / "open-buildings.parquet").exists(),
+    reason="Test fixture not available",
+)
+class TestPropertyFilteringIntegration:
+    """Integration tests for property filtering with real data."""
+
+    def test_convert_with_include_filter(self):
+        """Test conversion with include filter."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                include=["area_in_meters"],  # Only include area
+            )
+
+            assert output.exists()
+
+    def test_convert_with_exclude_filter(self):
+        """Test conversion with exclude filter."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                exclude=["confidence"],  # Exclude confidence
+            )
+
+            assert output.exists()
+
+    def test_convert_with_exclude_all(self):
+        """Test conversion with exclude_all (geometry only)."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                exclude_all=True,
+            )
+
+            assert output.exists()
+
+    def test_convert_with_layer_name_override(self):
+        """Test conversion with custom layer name."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                layer_name="buildings",
+            )
+
+            assert output.exists()
+
+
+@pytest.mark.skipif(
+    not (REALDATA_DIR / "open-buildings.parquet").exists(),
+    reason="Test fixture not available",
+)
+class TestStreamingModeIntegration:
+    """Integration tests for streaming_mode with real data."""
+
+    def test_streaming_mode_fast(self):
+        """Test conversion with fast streaming mode."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                streaming_mode="fast",
+            )
+
+            assert output.exists()
+
+    def test_streaming_mode_low_memory(self):
+        """Test conversion with low-memory streaming mode."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                streaming_mode="low-memory",
+            )
+
+            assert output.exists()
+
+
+@pytest.mark.skipif(
+    not (REALDATA_DIR / "open-buildings.parquet").exists(),
+    reason="Test fixture not available",
+)
+class TestParallelControlsIntegration:
+    """Integration tests for parallel controls with real data."""
+
+    def test_parallel_tiles_disabled(self):
+        """Test conversion with parallel_tiles disabled."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                parallel_tiles=False,
+            )
+
+            assert output.exists()
+
+    def test_parallel_geoms_disabled(self):
+        """Test conversion with parallel_geoms disabled."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                parallel_geoms=False,
+            )
+
+            assert output.exists()
+
+    def test_all_params_combined(self):
+        """Test all new parameters together."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=6,
+                streaming_mode="fast",
+                parallel_tiles=True,
+                parallel_geoms=True,
+            )
+
+            assert output.exists()
+
+
+@pytest.mark.skipif(
+    not (REALDATA_DIR / "open-buildings.parquet").exists(),
+    reason="Test fixture not available",
+)
+class TestProgressCallbackIntegration:
+    """Integration tests for progress callback with real data."""
+
+    def test_progress_callback_is_called(self):
+        """Test that progress callback is actually invoked during conversion."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,  # Small range for faster test
+                progress_callback=callback,
+            )
+
+            # Should have received at least some events
+            assert len(events) > 0
+
+    def test_progress_callback_event_structure_phase_start(self):
+        """Test that PhaseStart events have correct structure."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=callback,
+            )
+
+        # Find PhaseStart events
+        phase_start_events = [e for e in events if e.get("phase") == "start"]
+        assert len(phase_start_events) > 0
+
+        # Check structure
+        for event in phase_start_events:
+            assert "phase" in event
+            assert event["phase"] == "start"
+            assert "phase_num" in event
+            assert "name" in event
+            assert isinstance(event["phase_num"], int)
+            assert isinstance(event["name"], str)
+
+    def test_progress_callback_event_structure_complete(self):
+        """Test that Complete event has correct structure."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=callback,
+            )
+
+        # Find Complete event
+        complete_events = [e for e in events if e.get("phase") == "complete"]
+        assert len(complete_events) == 1
+
+        complete = complete_events[0]
+        assert "total_tiles" in complete
+        assert "peak_memory_bytes" in complete
+        assert "duration_secs" in complete
+        assert isinstance(complete["total_tiles"], int)
+        assert isinstance(complete["peak_memory_bytes"], int)
+        assert isinstance(complete["duration_secs"], float)
+
+    def test_progress_callback_receives_all_phases(self):
+        """Test that callback receives events from all processing phases."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=callback,
+            )
+
+        # Extract unique phase types
+        phase_types = {e.get("phase") for e in events}
+
+        # Should have start, progress phases, and complete
+        assert "start" in phase_types
+        assert "complete" in phase_types
+        # At least one progress type (phase1_progress, phase2_start, etc.)
+        progress_phases = {"phase1_progress", "phase1_complete", "phase2_start", "phase2_complete", "phase3_progress"}
+        assert len(phase_types & progress_phases) > 0
+
+    def test_progress_callback_lambda(self):
+        """Test that lambda callbacks work."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        call_count = [0]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=lambda e: call_count.__setitem__(0, call_count[0] + 1),
+            )
+
+        assert call_count[0] > 0

@@ -7,7 +7,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.75"
 authors = ["Nissim Lebovits <nlebovits@pm.me>"]
@@ -18,6 +18,9 @@ keywords = ["geoparquet", "pmtiles", "vector-tiles", "mvt", "geospatial"]
 categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
+# Internal crates
+gpq-tiles-core = { path = "crates/core", version = "0.3.0" }
+
 # Core geospatial dependencies
 geoarrow = "0.4"
 geoarrow-array = "0.4"
