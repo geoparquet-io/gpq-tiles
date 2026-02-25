@@ -223,12 +223,12 @@ jobs:
           key: ${{ runner.os }}-cargo-bench-target-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Run benchmarks (fast only)
-        # Run only fast benchmarks - exclude large_* and external_sort_larger groups
+        # Run only fast benchmarks - exclude large_* groups that take too long
         # Criterion filters by benchmark name prefix
         # IMPORTANT: Use ^parallel_vs_sequential to avoid matching large_parallel_vs_sequential
         run: |
           cargo bench --all-features --bench tiling -- "single_tile|full_pipeline|^parallel_vs_sequential/|density_dropping|hilbert_vs_zorder"
-          cargo bench --all-features --bench streaming -- "streaming_small|streaming_multi_rowgroup|streaming_validation|output_equivalence|streaming_modes"
+          cargo bench --all-features --bench streaming -- "production_small|production_multi_rg"
         timeout-minutes: 15
 
       - name: Upload benchmark results
