@@ -172,6 +172,11 @@ pub struct TilerConfig {
     pub memory_budget: Option<usize>,
     /// Suppress quality warnings and progress output (default: false).
     pub quiet: bool,
+    /// Enable deterministic (sequential) processing for reproducible output.
+    /// When true, disables parallelism to ensure bit-exact reproducibility.
+    /// Useful for debugging, testing, and compliance workflows.
+    /// Default: false (parallel processing enabled for performance).
+    pub deterministic: bool,
 }
 
 impl Default for TilerConfig {
@@ -198,6 +203,8 @@ impl Default for TilerConfig {
             memory_budget: None,
             // Show warnings by default
             quiet: false,
+            // Parallel processing by default for performance
+            deterministic: false,
         }
     }
 }
@@ -206,6 +213,29 @@ impl TilerConfig {
     /// Suppress quality warnings and progress output.
     pub fn with_quiet(mut self, quiet: bool) -> Self {
         self.quiet = quiet;
+        self
+    }
+
+    /// Enable deterministic (sequential) processing for reproducible output.
+    ///
+    /// When enabled, disables all parallel processing to ensure bit-exact
+    /// reproducibility across runs. This is useful for:
+    /// - Debugging race conditions or non-deterministic behavior
+    /// - Golden/snapshot testing where output must match exactly
+    /// - Compliance workflows requiring reproducible output
+    ///
+    /// Default: `false` (parallel processing enabled for performance).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_deterministic(true);
+    /// ```
+    pub fn with_deterministic(mut self, deterministic: bool) -> Self {
+        self.deterministic = deterministic;
         self
     }
 }
@@ -841,8 +871,8 @@ fn generate_tiles_to_writer_internal(
             const PARALLEL_THRESHOLD: usize = 1000;
 
             // Process tiles - parallel for large geometries, sequential for small
-            // Always use parallelism when beneficial (no config flag needed)
-            if total_tiles_for_geom >= PARALLEL_THRESHOLD {
+            // Skip parallelism if deterministic mode is enabled
+            if total_tiles_for_geom >= PARALLEL_THRESHOLD && !config.deterministic {
                 // PARALLEL PATH (PR #36): Process tiles within this geometry in parallel
 
                 // Collect all (z, tile_coord) pairs across all zoom levels
@@ -1023,14 +1053,24 @@ fn generate_tiles_to_writer_internal(
             result
         };
 
-        // Always use parallel geometry processing for best performance
-        let results: Vec<GeomResult> = sorted
-            .into_iter()
-            .enumerate()
-            .collect::<Vec<_>>()
-            .into_par_iter()
-            .map(|(idx, geom)| process_geometry(idx, geom))
-            .collect();
+        // Use parallel or sequential geometry processing based on deterministic flag
+        let results: Vec<GeomResult> = if config.deterministic {
+            // SEQUENTIAL: For reproducible output
+            sorted
+                .into_iter()
+                .enumerate()
+                .map(|(idx, geom)| process_geometry(idx, geom))
+                .collect()
+        } else {
+            // PARALLEL: For performance (default)
+            sorted
+                .into_iter()
+                .enumerate()
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|(idx, geom)| process_geometry(idx, geom))
+                .collect()
+        };
 
         // Aggregate all results and write to sorter
         let mut time_clip = std::time::Duration::ZERO;
@@ -3082,78 +3122,15 @@ mod tests {
         let _ = fs::remove_file(output_path);
     }
 
-    // ========== Large Geometry Parallel Processing Tests ==========
+    // ========== Determinism Tests ==========
+    //
+    // These tests verify that deterministic mode produces the same output as
+    // parallel mode, ensuring reproducibility when needed.
 
     #[test]
-    fn test_parallel_large_geometry_produces_same_as_sequential() {
-        // Test that parallel processing of large geometries (>1000 tiles)
-        // produces the same result as sequential processing.
-        //
-        // Uses a world-spanning polygon that touches many tiles across zoom levels.
-
-        // Create a large polygon spanning significant longitude range
-        // This will generate >1000 tiles across zoom 0-6
-        let large_poly = Geometry::Polygon(polygon![
-            (x: -150.0, y: -60.0),
-            (x: 150.0, y: -60.0),
-            (x: 150.0, y: 60.0),
-            (x: -150.0, y: 60.0),
-            (x: -150.0, y: -60.0),
-        ]);
-
-        let geometries = vec![large_poly];
-        let bbox = calculate_bbox_from_geometries(&geometries);
-
-        // Count expected tiles - this should exceed the parallel threshold (1000)
-        let config_for_count = TilerConfig::new(0, 6);
-        let total_tiles: usize = (config_for_count.min_zoom..=config_for_count.max_zoom)
-            .map(|z| tiles_for_bbox(&bbox, z).count())
-            .sum();
-        eprintln!("Large geometry will touch {} tiles", total_tiles);
-        assert!(
-            total_tiles > 1000,
-            "Test requires a geometry touching >1000 tiles, got {}",
-            total_tiles
-        );
-
-        // Test 1: TileIterator with sequential vs parallel should match
-        let config_seq = TilerConfig::new(0, 6).with_parallel(false);
-        let iter_seq = TileIterator::new(geometries.clone(), bbox, config_seq);
-        let tiles_seq: Vec<_> = iter_seq.filter_map(|r| r.ok()).collect();
-
-        let config_par = TilerConfig::new(0, 6).with_parallel(true);
-        let iter_par = TileIterator::new(geometries.clone(), bbox, config_par);
-        let tiles_par: Vec<_> = iter_par.filter_map(|r| r.ok()).collect();
-
-        assert_eq!(
-            tiles_seq.len(),
-            tiles_par.len(),
-            "Parallel ({}) and sequential ({}) should produce same tile count for large geometry",
-            tiles_par.len(),
-            tiles_seq.len()
-        );
-
-        // Sort and compare coordinates
-        let mut coords_seq: Vec<_> = tiles_seq.iter().map(|t| t.coord).collect();
-        let mut coords_par: Vec<_> = tiles_par.iter().map(|t| t.coord).collect();
-        coords_seq.sort_by_key(|c| (c.z, c.x, c.y));
-        coords_par.sort_by_key(|c| (c.z, c.x, c.y));
-
-        assert_eq!(
-            coords_seq, coords_par,
-            "Parallel should produce same tile coordinates for large geometry"
-        );
-
-        eprintln!(
-            "Large geometry: {} tiles match between parallel and sequential",
-            tiles_seq.len()
-        );
-    }
-
-    #[test]
-    fn test_parallel_external_sort_with_large_geometry() {
-        // Test external sort pipeline with parallel processing enabled
-        // for a large geometry that exceeds the parallel threshold.
+    fn test_deterministic_external_sort_matches_parallel() {
+        // Test that deterministic mode (sequential) produces the same
+        // output as parallel mode. This is critical for reproducibility.
         use crate::compression::Compression;
         use crate::pmtiles_writer::StreamingPmtilesWriter;
         use std::fs;
@@ -3164,136 +3141,67 @@ mod tests {
             return;
         }
 
-        // Run with parallel enabled (should use parallel path for large geometries)
-        let config_par = TilerConfig::new(0, 8)
-            .with_quiet(true)
-            .with_parallel(true)
-            .with_streaming_mode(StreamingMode::ExternalSort);
+        // Run with default (parallel) processing
+        let config_par = TilerConfig::new(0, 8).with_quiet(true);
 
         let mut writer_par =
             StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
         let _stats_par = generate_tiles_to_writer(fixture, &config_par, &mut writer_par)
-            .expect("Parallel external sort should work");
+            .expect("Parallel processing should work");
 
         let output_par = Path::new("/tmp/test-parallel-external-sort.pmtiles");
         let _ = fs::remove_file(output_par);
         let write_stats_par = writer_par.finalize(output_par).expect("Should finalize");
 
-        // Run with parallel disabled
-        let config_seq = TilerConfig::new(0, 8)
+        // Run with deterministic (sequential) processing
+        let config_det = TilerConfig::new(0, 8)
             .with_quiet(true)
-            .with_parallel(false)
-            .with_streaming_mode(StreamingMode::ExternalSort);
+            .with_deterministic(true);
 
-        let mut writer_seq =
+        let mut writer_det =
             StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
-        let _stats_seq = generate_tiles_to_writer(fixture, &config_seq, &mut writer_seq)
-            .expect("Sequential external sort should work");
+        let _stats_det = generate_tiles_to_writer(fixture, &config_det, &mut writer_det)
+            .expect("Deterministic processing should work");
 
-        let output_seq = Path::new("/tmp/test-sequential-external-sort.pmtiles");
-        let _ = fs::remove_file(output_seq);
-        let write_stats_seq = writer_seq.finalize(output_seq).expect("Should finalize");
+        let output_det = Path::new("/tmp/test-deterministic-external-sort.pmtiles");
+        let _ = fs::remove_file(output_det);
+        let write_stats_det = writer_det.finalize(output_det).expect("Should finalize");
 
         // Both modes should produce the same number of tiles
         assert_eq!(
-            write_stats_par.total_tiles, write_stats_seq.total_tiles,
-            "Parallel ({}) and sequential ({}) external sort should produce same tile count",
-            write_stats_par.total_tiles, write_stats_seq.total_tiles
+            write_stats_par.total_tiles, write_stats_det.total_tiles,
+            "Parallel ({}) and deterministic ({}) should produce same tile count",
+            write_stats_par.total_tiles, write_stats_det.total_tiles
         );
 
         eprintln!(
-            "External sort: parallel={} tiles, sequential={} tiles",
-            write_stats_par.total_tiles, write_stats_seq.total_tiles
+            "Determinism test: parallel={} tiles, deterministic={} tiles",
+            write_stats_par.total_tiles, write_stats_det.total_tiles
         );
 
         let _ = fs::remove_file(output_par);
-        let _ = fs::remove_file(output_seq);
+        let _ = fs::remove_file(output_det);
     }
 
-    // ========== Parallel Geometry Processing Tests (Issue #37) ==========
-
     #[test]
-    fn test_parallel_geoms_config_option() {
-        // Test that parallel_geoms config option is available and has correct default
+    fn test_deterministic_config_option() {
+        // Test that deterministic config option is available and has correct default
         let config_default = TilerConfig::default();
         assert!(
-            config_default.parallel_geoms,
-            "parallel_geoms should be enabled by default"
+            !config_default.deterministic,
+            "deterministic should be disabled by default (parallel is faster)"
         );
 
-        let config_disabled = TilerConfig::new(0, 10).with_parallel_geoms(false);
+        let config_enabled = TilerConfig::new(0, 10).with_deterministic(true);
         assert!(
-            !config_disabled.parallel_geoms,
-            "parallel_geoms should be disabled when set to false"
+            config_enabled.deterministic,
+            "deterministic should be enabled when set to true"
         );
 
-        let config_enabled = TilerConfig::new(0, 10).with_parallel_geoms(true);
+        let config_disabled = TilerConfig::new(0, 10).with_deterministic(false);
         assert!(
-            config_enabled.parallel_geoms,
-            "parallel_geoms should be enabled when set to true"
+            !config_disabled.deterministic,
+            "deterministic should be disabled when set to false"
         );
-    }
-
-    #[test]
-    fn test_parallel_geoms_produces_same_results_as_sequential() {
-        // Test that processing geometries in parallel produces
-        // the same output as sequential processing.
-        // This is critical for determinism.
-        use crate::compression::Compression;
-        use crate::pmtiles_writer::StreamingPmtilesWriter;
-        use std::fs;
-
-        let fixture = Path::new("../../tests/fixtures/realdata/open-buildings.parquet");
-        if !fixture.exists() {
-            eprintln!("Skipping: fixture not found");
-            return;
-        }
-
-        // Run with parallel_geoms enabled (parallel geometry iteration)
-        let config_par = TilerConfig::new(0, 8)
-            .with_quiet(true)
-            .with_parallel(true)
-            .with_parallel_geoms(true)
-            .with_streaming_mode(StreamingMode::ExternalSort);
-
-        let mut writer_par =
-            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
-        let _stats_par = generate_tiles_to_writer(fixture, &config_par, &mut writer_par)
-            .expect("Parallel geoms external sort should work");
-
-        let output_par = Path::new("/tmp/test-parallel-geoms.pmtiles");
-        let _ = fs::remove_file(output_par);
-        let write_stats_par = writer_par.finalize(output_par).expect("Should finalize");
-
-        // Run with parallel_geoms disabled (sequential geometry iteration)
-        let config_seq = TilerConfig::new(0, 8)
-            .with_quiet(true)
-            .with_parallel(true) // Keep tile parallelism within large geoms
-            .with_parallel_geoms(false) // But process geoms sequentially
-            .with_streaming_mode(StreamingMode::ExternalSort);
-
-        let mut writer_seq =
-            StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
-        let _stats_seq = generate_tiles_to_writer(fixture, &config_seq, &mut writer_seq)
-            .expect("Sequential geoms external sort should work");
-
-        let output_seq = Path::new("/tmp/test-sequential-geoms.pmtiles");
-        let _ = fs::remove_file(output_seq);
-        let write_stats_seq = writer_seq.finalize(output_seq).expect("Should finalize");
-
-        // Both modes should produce the same number of tiles
-        assert_eq!(
-            write_stats_par.total_tiles, write_stats_seq.total_tiles,
-            "Parallel geoms ({}) and sequential geoms ({}) should produce same tile count",
-            write_stats_par.total_tiles, write_stats_seq.total_tiles
-        );
-
-        eprintln!(
-            "Geometry parallelism: parallel={} tiles, sequential={} tiles",
-            write_stats_par.total_tiles, write_stats_seq.total_tiles
-        );
-
-        let _ = fs::remove_file(output_par);
-        let _ = fs::remove_file(output_seq);
     }
 }

@@ -95,76 +95,57 @@ For a geometry that spans multiple tiles across multiple zoom levels, we need to
 
 **The core problem:** PMTiles requires ALL features for a tile (z,x,y) to be encoded together. We can't write a tile incrementally as we encounter each feature.
 
-### Streaming Modes
+### Algorithm: Geometry-Centric with External Sort
 
-We provide two modes with different memory/speed tradeoffs:
+We use a **single geometry-centric algorithm** with external sort for bounded-memory processing.
+This approach is both fast AND memory-bounded. See `context/adr/001-consolidate-streaming-modes.md` for the decision record.
 
-| Mode | Memory | Speed | How it Works |
-|------|--------|-------|--------------|
-| `LowMemory` | ~750MB | 2-3x slower | Re-reads file for each zoom level |
-| `Fast` | ~1-2GB | 1x | Single pass, stores clipped geometries |
+**How it works:**
 
-### StreamingMode::LowMemory ✅ WORKS
+```
+Phase 1: Read + Clip
+├── For each row group in input file:
+│   ├── Read geometries
+│   ├── Sort by Hilbert index for cache-locality
+│   └── For each geometry:
+│       ├── Simplify once at max_zoom tolerance
+│       ├── For each tile the geometry touches:
+│       │   ├── Clip to tile bounds
+│       │   ├── Serialize to WKB
+│       │   └── Write (tile_id, feature_idx, wkb) to sorter
+│       └── Process in parallel if geometry touches >1000 tiles
+└── Memory bounded by row_group size + sorter buffer
 
-Processes one zoom level at a time, re-reading the input file for each:
+Phase 2: Sort
+├── External merge sort by tile_id
+└── Uses memory-mapped I/O for efficiency
 
-```rust
-for z in min_zoom..=max_zoom {
-    // Re-read file, process only zoom z
-    process_geometries_by_row_group(input_path, |_, geometries| {
-        for geom in geometries {
-            for tile in tiles_for_bbox(&geom.bbox(), z) {
-                let clipped = clip(&geom, &tile);
-                tile_features.entry((x, y)).push(clipped);
-            }
-        }
-    })?;
-
-    // Encode and write all tiles for zoom z
-    for ((x, y), features) in tile_features.drain() {
-        let tile = encode_tile(features);
-        writer.add_tile(z, x, y, &tile)?;
-    }
-    // Memory freed before next zoom level
-}
+Phase 3: Encode
+├── Read sorted records
+├── Group consecutive records by tile_id
+├── Encode MVT tiles
+└── Write to StreamingPmtilesWriter
 ```
 
-**Why it's slow:** For z0-z6 (7 levels), reads a 3.2GB file 7 times = 22.4GB I/O.
+**Complexity comparison:**
 
-**Why it works:** Only one zoom level's worth of clipped geometries in memory at a time.
+| Algorithm | Complexity | Memory |
+|-----------|------------|--------|
+| Tile-centric (old) | O(tiles × geometries) | All geometries in RAM |
+| Geometry-centric (current) | O(geometries × tiles_per_geom) | Row group + sorter buffer |
 
-### StreamingMode::Fast ⚠️ MAY OOM ON VERY LARGE FILES
+For a 363K feature file at z0-z6:
+- Tile-centric: ~36 billion intersection checks
+- Geometry-centric: ~18 million checks (2000× fewer)
 
-Single pass that stores clipped (not original!) geometries per tile:
+### Deterministic Processing
+
+By default, processing is parallelized for speed. Use `--deterministic` (CLI) or `.with_deterministic(true)` (API) for reproducible output:
 
 ```rust
-process_geometries_by_row_group(input_path, |_, geometries| {
-    for geom in geometries {
-        for z in min_zoom..=max_zoom {
-            for tile in tiles_for_bbox(&geom.bbox(), z) {
-                // Store CLIPPED geometry, not original (~90% smaller)
-                let clipped = clip(&geom, &tile);
-                tile_features.entry((z, x, y)).push(clipped);
-            }
-        }
-    }
-})?;
-// Encode all tiles at end
+let config = TilerConfig::new(0, 14)
+    .with_deterministic(true);  // Sequential processing
 ```
-
-**Key optimization:** Stores clipped geometries (~90% smaller than originals) instead of cloning original geometries.
-
-**Why it may OOM:** For very large files with features spanning many tiles, clipped geometry accumulation can still exceed memory. A 3.2GB file with 363K features at z0-z6 accumulates ~1-2GB of clipped geometries.
-
-### Planned: External Sort Approach
-
-For true bounded-memory fast processing:
-
-1. **Sort phase:** Write `(tile_id, clipped_geometry)` pairs to temp file
-2. **External sort:** Sort temp file by tile_id (can use memory-mapped merge sort)
-3. **Encode phase:** Read sorted file, encode each tile's features together
-
-This would give Fast mode's speed with LowMemory mode's memory bounds.
 
 ### StreamingPmtilesWriter
 
@@ -180,16 +161,16 @@ The `StreamingPmtilesWriter` solves the memory problem for **output** (tiles):
 **Usage:**
 
 ```rust
-use gpq_tiles_core::pipeline::{generate_tiles_to_writer, StreamingMode, TilerConfig};
+use gpq_tiles_core::pipeline::{generate_tiles_to_writer, TilerConfig};
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::compression::Compression;
 
 // Create streaming writer
 let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)?;
 
-// Generate tiles - use LowMemory for very large files
+// Generate tiles with optional memory budget
 let config = TilerConfig::new(0, 14)
-    .with_streaming_mode(StreamingMode::LowMemory);
+    .with_memory_budget(4 * 1024 * 1024 * 1024);  // 4GB advisory budget
 generate_tiles_to_writer(Path::new("large.parquet"), &config, &mut writer)?;
 
 // Finalize assembles: header + directory + metadata + tile_data

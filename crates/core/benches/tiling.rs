@@ -26,6 +26,7 @@ fn load_small_fixture() -> Vec<geo::Geometry<f64>> {
 }
 
 /// Load geometries from the large fixture (17K features)
+#[allow(dead_code)] // Reserved for production-scale benchmarks
 fn load_large_fixture() -> Vec<geo::Geometry<f64>> {
     load_fixture(FIXTURE_LARGE)
 }

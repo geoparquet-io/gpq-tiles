@@ -72,6 +72,14 @@ struct Args {
     /// Enable verbose logging with progress bars
     #[arg(short, long)]
     verbose: bool,
+
+    /// Enable deterministic (sequential) processing for reproducible output.
+    ///
+    /// When enabled, disables parallel processing to ensure bit-exact
+    /// reproducibility across runs. Useful for debugging, testing, and
+    /// compliance workflows. Significantly slower than parallel processing.
+    #[arg(long)]
+    deterministic: bool,
 }
 
 impl Args {
@@ -138,7 +146,8 @@ fn main() -> Result<()> {
         .with_extent(4096)
         .with_layer_name(&layer_name)
         .with_property_filter(property_filter)
-        .with_quiet(true); // Suppress log output when we have progress bars
+        .with_quiet(true) // Suppress log output when we have progress bars
+        .with_deterministic(args.deterministic);
 
     // Print configuration in verbose mode
     if args.verbose {
@@ -147,6 +156,9 @@ fn main() -> Result<()> {
         eprintln!("  Output: {}", args.output.display());
         eprintln!("  Zoom: {}-{}", args.min_zoom, args.max_zoom);
         eprintln!("  Compression: {}", args.compression);
+        if args.deterministic {
+            eprintln!("  Processing: deterministic (sequential)");
+        }
         eprintln!();
     }
 

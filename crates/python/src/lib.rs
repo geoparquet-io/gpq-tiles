@@ -85,6 +85,9 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     exclude (list[str], optional): Blacklist of property names to exclude. Cannot be used with include or exclude_all.
 ///     exclude_all (bool, optional): Exclude all properties, output geometry only. Defaults to False.
 ///     layer_name (str, optional): Override the layer name (defaults to input filename stem).
+///     deterministic (bool, optional): Enable deterministic (sequential) processing for reproducible output. Defaults to False.
+///         When True, disables parallelism to ensure bit-exact reproducibility across runs.
+///         Useful for debugging, testing, and compliance workflows. Significantly slower.
 ///     progress_callback (callable, optional): A callback function that receives progress events as dicts.
 ///         Each event dict has a "phase" key indicating the event type:
 ///         - "start": Phase started. Keys: phase_num (int), name (str)
@@ -111,13 +114,15 @@ fn progress_event_to_dict(py: Python<'_>, event: &ProgressEvent) -> PyResult<Py<
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", exclude=["internal_id"])
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", exclude_all=True)
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", layer_name="my_layer")
+///     >>> # With deterministic (sequential) processing
+///     >>> convert("buildings.parquet", "buildings.pmtiles", deterministic=True)
 ///     >>> # With progress callback
 ///     >>> def on_progress(event):
 ///     ...     if event["phase"] == "complete":
 ///     ...         print(f"Generated {event['total_tiles']} tiles")
 ///     >>> convert("buildings.parquet", "buildings.pmtiles", progress_callback=on_progress)
 #[pyfunction]
-#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, progress_callback=None))]
+#[pyo3(signature = (input, output, min_zoom=0, max_zoom=14, drop_density="medium", compression="gzip", include=None, exclude=None, exclude_all=false, layer_name=None, deterministic=false, progress_callback=None))]
 #[allow(clippy::too_many_arguments)] // Python API mirrors CLI flags; grouping into struct would hurt usability
 fn convert(
     py: Python<'_>,
@@ -131,6 +136,7 @@ fn convert(
     exclude: Option<Vec<String>>,
     exclude_all: bool,
     layer_name: Option<String>,
+    deterministic: bool,
     progress_callback: Option<Py<PyAny>>,
 ) -> PyResult<()> {
     // Validate progress_callback is callable if provided
@@ -207,7 +213,8 @@ fn convert(
             DropDensity::High => 1,
         })
         .with_property_filter(property_filter)
-        .with_quiet(true); // Suppress progress output in Python
+        .with_quiet(true) // Suppress progress output in Python
+        .with_deterministic(deterministic);
 
     // Create streaming writer
     let mut writer = StreamingPmtilesWriter::new(compression_config).map_err(|e| {

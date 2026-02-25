@@ -1,11 +1,11 @@
 //! Test streaming PMTiles writer with a large GeoParquet file.
 //!
 //! Usage:
-//!   cargo run --example test_large_file --release [path_to_large_file.parquet] [--low-memory]
+//!   cargo run --example test_large_file --release [path_to_large_file.parquet] [--deterministic]
 //!
 //! Options:
-//!   --low-memory    Use LowMemory streaming mode (slower but ~100-200MB memory)
-//!                   Default is Fast mode (~1-2GB memory)
+//!   --deterministic    Use deterministic (sequential) processing for reproducible output.
+//!                      Default is parallel processing (faster).
 //!
 //! If no path is provided, uses the default test fixture location.
 
@@ -13,7 +13,7 @@ use std::path::Path;
 use std::time::Instant;
 
 use gpq_tiles_core::compression::Compression;
-use gpq_tiles_core::pipeline::{generate_tiles_to_writer, StreamingMode, TilerConfig};
+use gpq_tiles_core::pipeline::{generate_tiles_to_writer, TilerConfig};
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -21,7 +21,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Parse args
     let args: Vec<String> = std::env::args().collect();
-    let low_memory = args.iter().any(|a| a == "--low-memory");
+    let deterministic = args.iter().any(|a| a == "--deterministic");
     let input_path = args
         .iter()
         .skip(1)
@@ -53,7 +53,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let file_size = std::fs::metadata(&input_path)?.len();
-    let mode_name = if low_memory { "LowMemory" } else { "Fast" };
+    let mode_name = if deterministic {
+        "Deterministic (sequential)"
+    } else {
+        "Parallel"
+    };
 
     println!("=== Streaming PMTiles Writer Test ===");
     println!("Input: {:?}", input_path);
@@ -61,19 +65,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "File size: {:.2} GB",
         file_size as f64 / 1024.0 / 1024.0 / 1024.0
     );
-    println!("Streaming mode: {}", mode_name);
+    println!("Processing mode: {}", mode_name);
     println!();
-
-    // Configuration - adjust zoom levels as needed
-    let streaming_mode = if low_memory {
-        StreamingMode::LowMemory
-    } else {
-        StreamingMode::Fast
-    };
 
     let config = TilerConfig::new(0, 6)
         .with_layer_name("features")
-        .with_streaming_mode(streaming_mode)
+        .with_deterministic(deterministic)
         .with_memory_budget(512 * 1024 * 1024); // 512MB budget
 
     let output_path = Path::new("/tmp/streaming-test-output.pmtiles");
