@@ -190,7 +190,7 @@ jobs:
   bench:
     name: Benchmark
     runs-on: ubuntu-latest
-    if: false  # Temporarily disabled
+    if: github.ref == 'refs/heads/main'
     steps:
       - uses: actions/checkout@v6
         with:
