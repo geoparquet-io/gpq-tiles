@@ -5,7 +5,7 @@
 [![Crates.io](https://img.shields.io/crates/v/gpq-tiles.svg)](https://crates.io/crates/gpq-tiles)
 [![PyPI](https://img.shields.io/pypi/v/gpq-tiles.svg)](https://pypi.org/project/gpq-tiles/)
 
-Fast GeoParquet → PMTiles converter. 1.4x faster than tippecanoe.
+Fast GeoParquet → PMTiles converter in Rust.
 
 ## Install
 
@@ -30,7 +30,6 @@ convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
 - **[Getting Started](docs/getting-started.md)** — Installation, basic usage, property filtering
 - **[Advanced Usage](docs/advanced-usage.md)** — Performance tuning, streaming, CI/CD
 - **[API Reference](docs/api-reference.md)** — CLI flags, Rust API, Python API
-- **[ROADMAP](ROADMAP.md)** — Implementation phases and progress
 
 ## Development
 
