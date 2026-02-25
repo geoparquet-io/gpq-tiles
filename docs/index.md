@@ -36,8 +36,9 @@ let tiles = generate_tiles(Path::new("input.parquet"), &config)?;
 ## Next Steps
 
 - [Getting Started](getting-started.md) — Installation and basic usage
+- [Advanced Usage](advanced-usage.md) — Performance tuning, streaming, CI/CD
+- [API Reference](api-reference.md) — CLI flags, Rust API, Python API
 - [Architecture](architecture.md) — Design decisions and internals
-- [Roadmap](roadmap.md) — Planned features and progress
 
 ## License
 
