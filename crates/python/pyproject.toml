@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "gpq-tiles"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fast GeoParquet to PMTiles converter"
 readme = "README.md"
 license = { text = "Apache-2.0" }
@@ -52,16 +52,7 @@ target-version = "py39"
 select = ["E", "F", "I", "UP"]
 ignore = []
 
-[tool.commitizen]
-name = "cz_conventional_commits"
-version = "0.2.0"
-version_files = [
-    "pyproject.toml:^version",
-    "../../Cargo.toml:^version",
-    "../cli/Cargo.toml:gpq-tiles-core.*version"
-]
-tag_format = "v$version"
-update_changelog_on_bump = true
+# Note: Commitizen config is in root .cz.toml - run `cz bump` from repo root
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
