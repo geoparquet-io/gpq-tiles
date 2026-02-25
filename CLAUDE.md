@@ -112,6 +112,28 @@ cd crates/python && uv run python script.py  # Run any Python script
 
 This ensures consistent environments and avoids "module not found" errors.
 
+## Git Workflow
+
+### Branch Protection
+
+**The `main` branch is protected.** You cannot push directly to main.
+
+All changes must go through pull requests:
+```bash
+# Create a feature branch
+git checkout -b fix/my-fix
+git push -u origin fix/my-fix
+
+# Create PR
+gh pr create --title "fix: description" --body "..."
+```
+
+### DO NOT
+
+- Push directly to `main` (will be rejected)
+- Force push to any shared branch
+- Merge your own PRs without CI passing
+
 ## Common Pitfalls
 
 1. **geozero vs geoarrow**: Don't use geozero for bulk geometry extraction
@@ -120,7 +142,7 @@ This ensures consistent environments and avoids "module not found" errors.
 4. **CI workflow**: Use `dtolnay/rust-toolchain`, not `rust-action`
 5. **rstar**: Listed in deps but we use space-filling curves for spatial indexing instead
 6. **Python tooling**: Always use `uv` for Python work (not pip/poetry). See `DEVELOPMENT.md` for setup
-7. **Streaming vs non-streaming**: `generate_tiles_streaming()` exists but `generate_tiles()` is the default. Streaming is for files larger than memory
+7. **Streaming vs non-streaming**: Use `generate_tiles_to_writer()` for the production pipeline. `TileIterator` is deprecated
 
 ## Version Management (CRITICAL)
 
