@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2026-02-25
+
+### Added
+
+**Python API Enhancements** (closes [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45))
+
+- Property filtering: `include`, `exclude`, `exclude_all` parameters
+- Layer name override: `layer_name` parameter
+- Streaming mode: `streaming_mode` parameter (`"fast"` or `"low-memory"`)
+- Parallel controls: `parallel_tiles`, `parallel_geoms` parameters
+- Progress callbacks: `progress_callback` parameter with detailed phase events
+
+Python API now has full feature parity with CLI.
+
+### Changed
+
+- Refactored Python bindings from `Converter::convert()` to `generate_tiles_to_writer()` API
+- Progress callback automatically uses `ExternalSort` mode (only mode with progress events)
+
+## [0.2.0] - 2026-02-25
+
+### Fixed
+
+- Release workflow setup and version synchronization
+
 ## [0.1.0] - 2026-02-24
 
 ### Added
@@ -70,8 +95,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Row-group streaming: memory bounded by largest row group (~100-200MB typical)
 
 ### Notes
-- **CLI and Rust API**: Production-ready with full feature set
-- **Python API**: Basic conversion only; property filters, streaming modes, and progress callbacks tracked in [#45](https://github.com/geoparquet-io/gpq-tiles/issues/45)
 - Tested against tippecanoe v2.49.0 for MVT output compliance
 
+[0.3.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.3.0
+[0.2.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.2.0
 [0.1.0]: https://github.com/geoparquet-io/gpq-tiles/releases/tag/v0.1.0
