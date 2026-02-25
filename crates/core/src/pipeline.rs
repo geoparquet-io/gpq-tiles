@@ -24,7 +24,7 @@ use geo::Geometry;
 use crate::batch_processor::{
     extract_field_metadata, extract_geometries, process_geometries_by_row_group, RowGroupInfo,
 };
-use crate::clip::{buffer_pixels_to_degrees, clip_geometry};
+use crate::clip::{buffer_pixels_to_degrees, clip_geometry, validate_geometry};
 use crate::feature_drop::{
     should_drop_multipoint, should_drop_point, should_drop_tiny_line, should_drop_tiny_multiline,
     should_drop_tiny_polygon, DensityDropConfig, DensityDropper, DEFAULT_TINY_POLYGON_THRESHOLD,
@@ -177,6 +177,11 @@ pub struct TilerConfig {
     /// Useful for debugging, testing, and compliance workflows.
     /// Default: false (parallel processing enabled for performance).
     pub deterministic: bool,
+    /// Enable strict geometry validation (default: false).
+    /// When true, validates input geometries for issues like self-intersections
+    /// and logs warnings (using tracing::warn!) for invalid geometries.
+    /// Invalid geometries are still processed - this is for diagnostic purposes.
+    pub strict_validation: bool,
 }
 
 impl Default for TilerConfig {
@@ -205,6 +210,8 @@ impl Default for TilerConfig {
             quiet: false,
             // Parallel processing by default for performance
             deterministic: false,
+            // Strict validation is opt-in
+            strict_validation: false,
         }
     }
 }
@@ -236,6 +243,31 @@ impl TilerConfig {
     /// ```
     pub fn with_deterministic(mut self, deterministic: bool) -> Self {
         self.deterministic = deterministic;
+        self
+    }
+
+    /// Enable strict geometry validation.
+    ///
+    /// When enabled, validates input geometries for issues like:
+    /// - Self-intersections (bowtie/figure-8 patterns)
+    /// - Spikes where a ring touches itself
+    /// - Non-finite coordinates
+    ///
+    /// Invalid geometries are logged with `tracing::warn!` but still processed.
+    /// This mode is useful for diagnosing data quality issues without failing the pipeline.
+    ///
+    /// Default: `false` (no validation warnings).
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use gpq_tiles_core::pipeline::TilerConfig;
+    ///
+    /// let config = TilerConfig::new(0, 14)
+    ///     .with_strict_validation(true);
+    /// ```
+    pub fn with_strict_validation(mut self, strict: bool) -> Self {
+        self.strict_validation = strict;
         self
     }
 }
@@ -857,6 +889,18 @@ fn generate_tiles_to_writer_internal(
                 None => return result,
             };
 
+            // Strict validation: Check for geometry issues before processing
+            if config.strict_validation {
+                let validation_errors = validate_geometry(&geom);
+                if !validation_errors.is_empty() {
+                    log::warn!(
+                        "Invalid geometry detected (feature_index={}): {:?}",
+                        feat_idx,
+                        validation_errors
+                    );
+                }
+            }
+
             // Pre-simplify geometry ONCE at the MAX zoom level tolerance
             let simplify_start = std::time::Instant::now();
             let base_simplified = simplify_for_zoom(&geom, config.max_zoom, config.extent);
@@ -1375,7 +1419,19 @@ pub fn generate_tiles_streaming_with_stats(
         sort_geometries(&mut sorted, config_clone.use_hilbert);
 
         // For each geometry, find all tiles it intersects across all zoom levels
-        for geom in sorted {
+        for (geom_idx, geom) in sorted.into_iter().enumerate() {
+            // Strict validation: Check for geometry issues before processing
+            if config_clone.strict_validation {
+                let validation_errors = validate_geometry(&geom);
+                if !validation_errors.is_empty() {
+                    log::warn!(
+                        "Invalid geometry detected (feature_index={}): {:?}",
+                        global_feature_index + geom_idx as u64,
+                        validation_errors
+                    );
+                }
+            }
+
             let geom_bbox = match geom.bounding_rect() {
                 Some(rect) => {
                     TileBounds::new(rect.min().x, rect.min().y, rect.max().x, rect.max().y)
@@ -1610,6 +1666,21 @@ impl TileIterator {
         let mut feature_count = 0;
 
         for (idx, geom) in geometries.iter().enumerate() {
+            // Strict validation: Check for geometry issues before processing
+            if config.strict_validation {
+                let validation_errors = validate_geometry(geom);
+                if !validation_errors.is_empty() {
+                    log::warn!(
+                        "Invalid geometry detected (feature_index={}, tile=z{}/x{}/y{}): {:?}",
+                        idx,
+                        coord.z,
+                        coord.x,
+                        coord.y,
+                        validation_errors
+                    );
+                }
+            }
+
             // PERFORMANCE: Simplify first to reduce coord count, then clip
             let simplified = simplify_for_zoom(geom, coord.z, config.extent);
             if let Some(clipped) = clip_geometry(&simplified, &bounds, buffer) {
