@@ -57,7 +57,8 @@ name = "cz_conventional_commits"
 version = "0.2.0"
 version_files = [
     "pyproject.toml:^version",
-    "../../Cargo.toml:^version"
+    "../../Cargo.toml:^version",
+    "../cli/Cargo.toml:gpq-tiles-core.*version"
 ]
 tag_format = "v$version"
 update_changelog_on_bump = true
