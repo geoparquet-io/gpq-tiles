@@ -16,6 +16,21 @@ Design decisions and tippecanoe divergences.
 | Metadata | Basic `vector_layers` | Full layer/field/tilestats | Field metadata planned |
 | Simplification | Custom tolerance formula | `tile.cpp` | Tuned to match output quality |
 | Density dropping | Grid-cell limiting | Hilbert-gap selection | Simpler, similar results |
+| **Geometry validation** | Detect + route around | Wagyu repair | See `CLIPPING_ROBUSTNESS.md` |
+
+## Geometry Clipping
+
+**DIVERGENCE**: Tippecanoe uses [Wagyu](https://github.com/nickolasclarke/geo-clipper) for polygon clipping, which **repairs** invalid geometries. We use Sutherland-Hodgman for speed, with a fallback to `geo::BooleanOps` for invalid input. We **detect** invalid geometries but do **not repair** them.
+
+**Key implications:**
+- Our clipped output renders correctly
+- Clipped geometry may still be technically invalid for downstream GIS processing
+- Full tippecanoe parity would require Wagyu port or GEOS bindings
+
+**Detailed documentation:** See `context/CLIPPING_ROBUSTNESS.md` for:
+- Test infrastructure (206 wagyu fixtures)
+- Validation strategy (dual-layer: input + output)
+- Quantization risks at low zoom levels
 
 ## Density-Based Dropping
 

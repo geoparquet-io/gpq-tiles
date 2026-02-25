@@ -193,6 +193,8 @@ feat(cli): add --streaming-mode flag
 | Document | Purpose |
 |----------|---------|
 | `context/ARCHITECTURE.md` | Design decisions, tippecanoe divergences |
+| `context/CLIPPING_ROBUSTNESS.md` | Polygon clipping edge cases, validation strategy |
+| `context/QUANTIZATION_RISKS.md` | Coordinate quantization analysis |
 | `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup |
 | `CONTRIBUTING.md` | How to contribute, commit conventions, releases |
 
