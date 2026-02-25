@@ -22,7 +22,16 @@ gpq-tiles input.parquet output.pmtiles --min-zoom 0 --max-zoom 14
 
 ```python
 from gpq_tiles import convert
+
+# Basic
 convert("input.parquet", "output.pmtiles", min_zoom=0, max_zoom=14)
+
+# With property filtering and progress
+convert(
+    "buildings.parquet", "buildings.pmtiles",
+    include=["name", "height"],
+    progress_callback=lambda e: print(f"{e['phase']}: {e.get('total_tiles', '...')}")
+)
 ```
 
 ## Documentation
