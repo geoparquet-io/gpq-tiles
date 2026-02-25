@@ -4,6 +4,7 @@ version = "0.3.0"
 tag_format = "v$version"
 version_files = [
     "Cargo.toml:^version",
+    "Cargo.toml:gpq-tiles-core.*version",
 ]
 update_changelog_on_bump = true
 changelog_file = "CHANGELOG.md"

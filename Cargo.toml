@@ -18,6 +18,9 @@ keywords = ["geoparquet", "pmtiles", "vector-tiles", "mvt", "geospatial"]
 categories = ["science", "data-structures", "encoding"]
 
 [workspace.dependencies]
+# Internal crates
+gpq-tiles-core = { path = "crates/core", version = "0.3.0" }
+
 # Core geospatial dependencies
 geoarrow = "0.4"
 geoarrow-array = "0.4"
