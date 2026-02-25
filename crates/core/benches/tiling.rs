@@ -6,11 +6,13 @@
 //
 // Fixtures:
 // - open-buildings.parquet (1K features) - quick tests
-// - fieldmaps-madagascar-adm4.parquet (17K features) - parallelization benchmarks
+// - fieldmaps-madagascar-adm4.parquet (17K features) - production-scale benchmarks
 
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use gpq_tiles_core::batch_processor::extract_geometries;
-use gpq_tiles_core::pipeline::{generate_single_tile, generate_tiles_from_geometries, TilerConfig};
+use gpq_tiles_core::compression::Compression;
+use gpq_tiles_core::pipeline::{generate_single_tile, generate_tiles_to_writer, TilerConfig};
+use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::tile::TileCoord;
 use std::path::Path;
 
@@ -24,6 +26,7 @@ fn load_small_fixture() -> Vec<geo::Geometry<f64>> {
 }
 
 /// Load geometries from the large fixture (17K features)
+#[allow(dead_code)] // Reserved for production-scale benchmarks
 fn load_large_fixture() -> Vec<geo::Geometry<f64>> {
     load_fixture(FIXTURE_LARGE)
 }
@@ -39,7 +42,13 @@ fn load_fixture(fixture_path: &str) -> Vec<geo::Geometry<f64>> {
     extract_geometries(path).expect("Failed to load fixture geometries")
 }
 
+/// Check if a fixture file exists
+fn fixture_exists(fixture_path: &str) -> bool {
+    Path::new(fixture_path).exists()
+}
+
 /// Benchmark single tile generation at various zoom levels
+/// This tests the core tile encoding logic in isolation.
 fn bench_single_tile(c: &mut Criterion) {
     let geometries = load_small_fixture();
     let config = TilerConfig::new(0, 14);
@@ -62,25 +71,34 @@ fn bench_single_tile(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark full pipeline at various zoom ranges
+/// Benchmark full production pipeline at various zoom ranges
+/// This tests the actual code path used in production (geometry-centric, parallel).
 fn bench_full_pipeline(c: &mut Criterion) {
-    let geometries = load_small_fixture();
+    if !fixture_exists(FIXTURE_SMALL) {
+        eprintln!("Skipping full_pipeline benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_SMALL);
 
     let mut group = c.benchmark_group("full_pipeline");
-    group.throughput(Throughput::Elements(geometries.len() as u64));
+    // Throughput is measured in features (not tiles, since tile count varies by zoom)
+    group.throughput(Throughput::Elements(1000)); // ~1K features in small fixture
 
     // Benchmark different zoom ranges
     for max_zoom in [8, 10] {
-        let config = TilerConfig::new(0, max_zoom);
+        let config = TilerConfig::new(0, max_zoom).with_quiet(true);
         group.bench_with_input(
             BenchmarkId::new("max_zoom", max_zoom),
             &config,
             |b, config| {
                 b.iter(|| {
-                    let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), config)
-                        .expect("generate_tiles failed")
-                        .collect();
-                    black_box(tiles)
+                    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
+                        .expect("Should create writer");
+                    let stats = generate_tiles_to_writer(fixture_path, config, &mut writer)
+                        .expect("generate_tiles failed");
+                    // Don't finalize - we just want to measure tile generation
+                    black_box(stats)
                 })
             },
         );
@@ -89,67 +107,42 @@ fn bench_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmark parallel vs sequential tile generation
-fn bench_parallel_vs_sequential(c: &mut Criterion) {
-    let geometries = load_small_fixture();
-
-    let mut group = c.benchmark_group("parallel_vs_sequential");
-    group.throughput(Throughput::Elements(geometries.len() as u64));
-
-    // Sequential
-    let config_seq = TilerConfig::new(0, 10).with_parallel(false);
-    group.bench_function("sequential_z0_10", |b| {
-        b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_seq)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
-        })
-    });
-
-    // Parallel
-    let config_par = TilerConfig::new(0, 10).with_parallel(true);
-    group.bench_function("parallel_z0_10", |b| {
-        b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_par)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
-        })
-    });
-
-    group.finish();
-}
-
 /// Benchmark with density dropping enabled vs disabled
 fn bench_density_dropping(c: &mut Criterion) {
-    let geometries = load_small_fixture();
+    if !fixture_exists(FIXTURE_SMALL) {
+        eprintln!("Skipping density_dropping benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_SMALL);
 
     let mut group = c.benchmark_group("density_dropping");
-    group.throughput(Throughput::Elements(geometries.len() as u64));
+    group.throughput(Throughput::Elements(1000));
 
     // Without density dropping (default)
-    let config_no_drop = TilerConfig::new(0, 10);
+    let config_no_drop = TilerConfig::new(0, 10).with_quiet(true);
     group.bench_function("no_density_drop", |b| {
         b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_no_drop)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_no_drop, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
         })
     });
 
     // With density dropping
     let config_with_drop = TilerConfig::new(0, 10)
         .with_density_drop(true)
-        .with_density_cell_size(32);
+        .with_density_cell_size(32)
+        .with_quiet(true);
     group.bench_function("with_density_drop", |b| {
         b.iter(|| {
-            let tiles: Vec<_> =
-                generate_tiles_from_geometries(geometries.clone(), &config_with_drop)
-                    .expect("generate_tiles failed")
-                    .collect();
-            black_box(tiles)
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_with_drop, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
         })
     });
 
@@ -158,93 +151,109 @@ fn bench_density_dropping(c: &mut Criterion) {
 
 /// Benchmark Hilbert vs Z-order sorting
 fn bench_hilbert_vs_zorder(c: &mut Criterion) {
-    let geometries = load_small_fixture();
+    if !fixture_exists(FIXTURE_SMALL) {
+        eprintln!("Skipping hilbert_vs_zorder benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_SMALL);
 
     let mut group = c.benchmark_group("hilbert_vs_zorder");
-    group.throughput(Throughput::Elements(geometries.len() as u64));
+    group.throughput(Throughput::Elements(1000));
 
     // Hilbert (default)
-    let config_hilbert = TilerConfig::new(0, 10).with_hilbert(true);
+    let config_hilbert = TilerConfig::new(0, 10).with_hilbert(true).with_quiet(true);
     group.bench_function("hilbert", |b| {
         b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_hilbert)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_hilbert, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
         })
     });
 
     // Z-order
-    let config_zorder = TilerConfig::new(0, 10).with_hilbert(false);
+    let config_zorder = TilerConfig::new(0, 10).with_hilbert(false).with_quiet(true);
     group.bench_function("zorder", |b| {
         b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_zorder)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
+            let mut writer =
+                StreamingPmtilesWriter::new(Compression::Gzip).expect("Should create writer");
+            let stats = generate_tiles_to_writer(fixture_path, &config_zorder, &mut writer)
+                .expect("generate_tiles failed");
+            black_box(stats)
         })
     });
 
     group.finish();
 }
 
-/// Benchmark parallel vs sequential on LARGE fixture (17K features)
-/// This is the main benchmark for demonstrating parallelization speedup.
-fn bench_large_parallel_vs_sequential(c: &mut Criterion) {
-    let geometries = load_large_fixture();
-
-    let mut group = c.benchmark_group("large_parallel_vs_sequential");
-    group.throughput(Throughput::Elements(geometries.len() as u64));
-    // Increase sample size for more accurate results on larger dataset
-    group.sample_size(20);
-
-    // Sequential - expect ~2-3 seconds
-    let config_seq = TilerConfig::new(0, 10).with_parallel(false);
-    group.bench_function("sequential_17k_z0_10", |b| {
-        b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_seq)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
-        })
-    });
-
-    // Parallel - expect significant speedup (4-8x on multi-core)
-    let config_par = TilerConfig::new(0, 10).with_parallel(true);
-    group.bench_function("parallel_17k_z0_10", |b| {
-        b.iter(|| {
-            let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), &config_par)
-                .expect("generate_tiles failed")
-                .collect();
-            black_box(tiles)
-        })
-    });
-
-    group.finish();
-}
-
-/// Benchmark full pipeline on large fixture at different zoom ranges
+/// Benchmark production pipeline on LARGE fixture (17K features)
+/// This is the main benchmark for measuring real-world performance.
 fn bench_large_full_pipeline(c: &mut Criterion) {
-    let geometries = load_large_fixture();
+    if !fixture_exists(FIXTURE_LARGE) {
+        eprintln!("Skipping large_full_pipeline benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_LARGE);
 
     let mut group = c.benchmark_group("large_full_pipeline");
-    group.throughput(Throughput::Elements(geometries.len() as u64));
+    group.throughput(Throughput::Elements(17465)); // ~17K features in large fixture
     group.sample_size(10);
 
     for max_zoom in [8, 10, 12] {
-        let config = TilerConfig::new(0, max_zoom);
+        let config = TilerConfig::new(0, max_zoom).with_quiet(true);
         group.bench_with_input(
             BenchmarkId::new("max_zoom", max_zoom),
             &config,
             |b, config| {
                 b.iter(|| {
-                    let tiles: Vec<_> = generate_tiles_from_geometries(geometries.clone(), config)
-                        .expect("generate_tiles failed")
-                        .collect();
-                    black_box(tiles)
+                    let mut writer = StreamingPmtilesWriter::new(Compression::Gzip)
+                        .expect("Should create writer");
+                    let stats = generate_tiles_to_writer(fixture_path, config, &mut writer)
+                        .expect("generate_tiles failed");
+                    black_box(stats)
                 })
             },
         );
+    }
+
+    group.finish();
+}
+
+/// Benchmark compression algorithms on the large fixture
+fn bench_compression(c: &mut Criterion) {
+    if !fixture_exists(FIXTURE_LARGE) {
+        eprintln!("Skipping compression benchmark: fixture not found");
+        return;
+    }
+
+    let fixture_path = Path::new(FIXTURE_LARGE);
+
+    let mut group = c.benchmark_group("compression");
+    group.throughput(Throughput::Elements(17465));
+    group.sample_size(10);
+
+    let config = TilerConfig::new(0, 10).with_quiet(true);
+
+    for compression in [Compression::None, Compression::Gzip, Compression::Zstd] {
+        let name = match compression {
+            Compression::None => "none",
+            Compression::Gzip => "gzip",
+            Compression::Zstd => "zstd",
+            Compression::Brotli => "brotli",
+            _ => "unknown",
+        };
+        group.bench_function(name, |b| {
+            b.iter(|| {
+                let mut writer =
+                    StreamingPmtilesWriter::new(compression).expect("Should create writer");
+                let stats = generate_tiles_to_writer(fixture_path, &config, &mut writer)
+                    .expect("generate_tiles failed");
+                black_box(stats)
+            })
+        });
     }
 
     group.finish();
@@ -254,15 +263,14 @@ criterion_group!(
     benches,
     bench_single_tile,
     bench_full_pipeline,
-    bench_parallel_vs_sequential,
     bench_density_dropping,
     bench_hilbert_vs_zorder,
 );
 
 criterion_group!(
     name = large_benches;
-    config = Criterion::default().sample_size(20);
-    targets = bench_large_parallel_vs_sequential, bench_large_full_pipeline
+    config = Criterion::default().sample_size(10);
+    targets = bench_large_full_pipeline, bench_compression
 );
 
 criterion_main!(benches, large_benches);

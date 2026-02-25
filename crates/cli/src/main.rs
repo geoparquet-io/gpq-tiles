@@ -3,11 +3,10 @@
 //! This is a thin wrapper around the gpq-tiles-core library.
 
 use anyhow::{Context, Result};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use gpq_tiles_core::compression::Compression;
 use gpq_tiles_core::pipeline::{
-    generate_tiles_to_writer, generate_tiles_to_writer_with_progress, ProgressEvent, StreamingMode,
-    TilerConfig,
+    generate_tiles_to_writer_with_progress, ProgressEvent, TilerConfig,
 };
 use gpq_tiles_core::pmtiles_writer::StreamingPmtilesWriter;
 use gpq_tiles_core::PropertyFilter;
@@ -70,37 +69,17 @@ struct Args {
     #[arg(long, default_value = "zstd")]
     compression: String,
 
-    /// Disable parallel tile generation within large geometries
-    ///
-    /// By default, geometries that produce >1000 tiles are processed in parallel.
-    /// Use this flag to disable for debugging or deterministic output.
-    #[arg(long)]
-    no_parallel: bool,
-
-    /// Disable parallel geometry processing within row groups
-    ///
-    /// By default, geometries within each row group are processed in parallel.
-    /// Use this flag to disable for debugging or deterministic output.
-    #[arg(long)]
-    no_parallel_geoms: bool,
-
     /// Enable verbose logging with progress bars
     #[arg(short, long)]
     verbose: bool,
 
-    /// Streaming mode for processing large files
-    #[arg(long, value_enum, default_value = "fast")]
-    streaming_mode: CliStreamingMode,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum CliStreamingMode {
-    /// Fast mode: single pass, ~1-2GB memory for large files
-    Fast,
-    /// Low memory mode: re-reads file per zoom level, ~100MB memory
-    LowMemory,
-    /// External sort: tippecanoe-style disk-based sort, bounded memory
-    ExternalSort,
+    /// Enable deterministic (sequential) processing for reproducible output.
+    ///
+    /// When enabled, disables parallel processing to ensure bit-exact
+    /// reproducibility across runs. Useful for debugging, testing, and
+    /// compliance workflows. Significantly slower than parallel processing.
+    #[arg(long)]
+    deterministic: bool,
 }
 
 impl Args {
@@ -162,23 +141,13 @@ fn main() -> Result<()> {
             .to_string()
     });
 
-    // Map CLI streaming mode to core streaming mode
-    let streaming_mode = match args.streaming_mode {
-        CliStreamingMode::Fast => StreamingMode::Fast,
-        CliStreamingMode::LowMemory => StreamingMode::LowMemory,
-        CliStreamingMode::ExternalSort => StreamingMode::ExternalSort,
-    };
-
-    // Build TilerConfig - always quiet when using progress bars (which is always for ExternalSort)
-    let use_progress = matches!(args.streaming_mode, CliStreamingMode::ExternalSort);
+    // Build TilerConfig - always quiet since we use progress bars
     let tiler_config = TilerConfig::new(args.min_zoom, args.max_zoom)
         .with_extent(4096)
         .with_layer_name(&layer_name)
         .with_property_filter(property_filter)
-        .with_streaming_mode(streaming_mode)
-        .with_parallel(!args.no_parallel)
-        .with_parallel_geoms(!args.no_parallel_geoms)
-        .with_quiet(use_progress); // Suppress log output when we have progress bars
+        .with_quiet(true) // Suppress log output when we have progress bars
+        .with_deterministic(args.deterministic);
 
     // Print configuration in verbose mode
     if args.verbose {
@@ -186,13 +155,10 @@ fn main() -> Result<()> {
         eprintln!("  Input: {}", args.input.display());
         eprintln!("  Output: {}", args.output.display());
         eprintln!("  Zoom: {}-{}", args.min_zoom, args.max_zoom);
-        eprintln!("  Streaming mode: {:?}", args.streaming_mode);
         eprintln!("  Compression: {}", args.compression);
-        eprintln!(
-            "  Parallel: {} (tiles), {} (geoms)",
-            if args.no_parallel { "off" } else { "on" },
-            if args.no_parallel_geoms { "off" } else { "on" }
-        );
+        if args.deterministic {
+            eprintln!("  Processing: deterministic (sequential)");
+        }
         eprintln!();
     }
 
@@ -202,17 +168,8 @@ fn main() -> Result<()> {
     let mut writer =
         StreamingPmtilesWriter::new(compression).context("Failed to create PMTiles writer")?;
 
-    // Run the pipeline with progress bars for ExternalSort mode
-    let stats = if use_progress {
-        run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?
-    } else {
-        // Non-ExternalSort modes (legacy)
-        if args.verbose {
-            eprintln!("Starting tile generation...");
-        }
-        generate_tiles_to_writer(&args.input, &tiler_config, &mut writer)
-            .context("Failed to generate tiles")?
-    };
+    // Run the pipeline with progress bars
+    let stats = run_with_progress(&args.input, &tiler_config, &mut writer, args.verbose)?;
 
     // Finalize PMTiles file
     let write_stats = writer
