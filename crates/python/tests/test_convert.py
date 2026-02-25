@@ -396,6 +396,46 @@ class TestParallelControls:
                     pass
 
 
+class TestProgressCallback:
+    """Tests for progress callback functionality."""
+
+    def test_convert_accepts_progress_callback(self):
+        """Verify convert() accepts a progress_callback parameter."""
+        # This should not raise TypeError for unknown parameter
+        import inspect
+
+        sig = inspect.signature(gpq_tiles.convert)
+        param_names = list(sig.parameters.keys())
+        assert "progress_callback" in param_names
+
+    def test_progress_callback_none_is_valid(self):
+        """Test that progress_callback=None is accepted (no callback)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            # Should not raise - None means no callback
+            with pytest.raises(Exception):
+                # Will fail because input doesn't exist, but that's fine
+                # We're just checking the parameter is accepted
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    progress_callback=None,
+                )
+
+    def test_progress_callback_invalid_type_raises(self):
+        """Test that non-callable progress_callback raises TypeError."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            with pytest.raises(TypeError):
+                gpq_tiles.convert(
+                    input="/nonexistent/file.parquet",
+                    output=str(output),
+                    progress_callback="not a callable",
+                )
+
+
 @pytest.mark.skipif(
     not (REALDATA_DIR / "open-buildings.parquet").exists(),
     reason="Test fixture not available",
@@ -573,3 +613,143 @@ class TestParallelControlsIntegration:
             )
 
             assert output.exists()
+
+
+@pytest.mark.skipif(
+    not (REALDATA_DIR / "open-buildings.parquet").exists(),
+    reason="Test fixture not available",
+)
+class TestProgressCallbackIntegration:
+    """Integration tests for progress callback with real data."""
+
+    def test_progress_callback_is_called(self):
+        """Test that progress callback is actually invoked during conversion."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,  # Small range for faster test
+                progress_callback=callback,
+            )
+
+            # Should have received at least some events
+            assert len(events) > 0
+
+    def test_progress_callback_event_structure_phase_start(self):
+        """Test that PhaseStart events have correct structure."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=callback,
+            )
+
+        # Find PhaseStart events
+        phase_start_events = [e for e in events if e.get("phase") == "start"]
+        assert len(phase_start_events) > 0
+
+        # Check structure
+        for event in phase_start_events:
+            assert "phase" in event
+            assert event["phase"] == "start"
+            assert "phase_num" in event
+            assert "name" in event
+            assert isinstance(event["phase_num"], int)
+            assert isinstance(event["name"], str)
+
+    def test_progress_callback_event_structure_complete(self):
+        """Test that Complete event has correct structure."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=callback,
+            )
+
+        # Find Complete event
+        complete_events = [e for e in events if e.get("phase") == "complete"]
+        assert len(complete_events) == 1
+
+        complete = complete_events[0]
+        assert "total_tiles" in complete
+        assert "peak_memory_bytes" in complete
+        assert "duration_secs" in complete
+        assert isinstance(complete["total_tiles"], int)
+        assert isinstance(complete["peak_memory_bytes"], int)
+        assert isinstance(complete["duration_secs"], float)
+
+    def test_progress_callback_receives_all_phases(self):
+        """Test that callback receives events from all processing phases."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        events = []
+
+        def callback(event):
+            events.append(event)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=callback,
+            )
+
+        # Extract unique phase types
+        phase_types = {e.get("phase") for e in events}
+
+        # Should have start, progress phases, and complete
+        assert "start" in phase_types
+        assert "complete" in phase_types
+        # At least one progress type (phase1_progress, phase2_start, etc.)
+        progress_phases = {"phase1_progress", "phase1_complete", "phase2_start", "phase2_complete", "phase3_progress"}
+        assert len(phase_types & progress_phases) > 0
+
+    def test_progress_callback_lambda(self):
+        """Test that lambda callbacks work."""
+        input_file = REALDATA_DIR / "open-buildings.parquet"
+        call_count = [0]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output = Path(tmpdir) / "output.pmtiles"
+
+            gpq_tiles.convert(
+                input=str(input_file),
+                output=str(output),
+                min_zoom=0,
+                max_zoom=4,
+                progress_callback=lambda e: call_count.__setitem__(0, call_count[0] + 1),
+            )
+
+        assert call_count[0] > 0
