@@ -6,47 +6,6 @@ GeoParquet → PMTiles converter in Rust. Library-first design with CLI and Pyth
 
 **Goal:** Faster than tippecanoe for typical GeoParquet workflows, with native Arrow integration.
 
-**Status:** Phase 5 complete (329 tests). See `ROADMAP.md` for details.
-
-## Documentation Philosophy
-
-**Docs must be SUCCINCT. Brevity is a feature, not a bug.**
-
-### Writing Style
-
-- **Short sentences.** Max 15 words when possible.
-- **No fluff.** Cut "In order to", "It should be noted that", etc.
-- **Code > prose.** Show, don't tell.
-- **Tables > paragraphs.** For comparisons and reference material.
-- **One concept per section.** If you need sub-sub-sections, split the doc.
-
-### Folder Structure
-
-| Folder | Purpose |
-|--------|---------|
-| `docs/` | Human-facing mkdocs site content. Symlinks to root docs where appropriate. |
-| `context/` | AI/developer context: architecture, plans, design decisions |
-
-### Key Documents
-
-| Document | Purpose | When to Update |
-|----------|---------|----------------|
-| `README.md` | Quick start, links to other docs | Major user-facing changes |
-| `ROADMAP.md` | Implementation phases, progress tracking | Phase milestones, test counts |
-| `context/ARCHITECTURE.md` | Design decisions, tippecanoe divergences | Algorithm changes, new divergences |
-| `context/plans/` | Implementation plans and design docs | New features, major changes |
-| `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup | New tools, workflow changes |
-| `CONTRIBUTING.md` | How to contribute, commit conventions | Process changes |
-| `CLAUDE.md` | AI assistant instructions | Process changes, new pitfalls |
-
-**Rules:**
-- Keep README lean — link out, don't duplicate
-- Never duplicate content across docs
-- Delete docs that serve no unique purpose
-- Update test counts in ROADMAP.md, not elsewhere
-- `docs/` is ONLY for mkdocs human-facing content (uses symlinks to root docs)
-- `context/` is for architecture, plans, and AI context
-
 ## Critical Constraints
 
 ### 1. Test-Driven Development (TDD) is MANDATORY
@@ -93,8 +52,6 @@ DO NOT:
 let geom: geo::Geometry = geozero::wkb::Wkb(wkb.to_vec()).to_geo();
 ```
 
-**See also:** `context/plans/2026-02-23-streaming-design.md` for streaming architecture details.
-
 ### 3. Reference Implementations (CRITICAL)
 
 **All algorithms MUST match tippecanoe behavior as closely as possible.**
@@ -134,10 +91,16 @@ TilerConfig { min_zoom, max_zoom, ... }       // Pipeline configuration
 
 ```bash
 cargo build                   # Build
-cargo test                    # Test (262 Rust tests)
-cargo bench                   # Benchmarks
+cargo test                    # Run all tests
+cargo bench                   # Run all benchmarks
+cargo bench -- "single_tile"  # Run specific benchmark group
 cargo fmt --all               # Format (required before commit)
+
+# Run the CLI
 cargo run --package gpq-tiles -- input.parquet output.pmtiles
+
+# Python tests
+cd crates/python && uv run pytest
 ```
 
 ## Common Pitfalls
@@ -155,16 +118,19 @@ cargo run --package gpq-tiles -- input.parquet output.pmtiles
 We use [Conventional Commits](https://www.conventionalcommits.org/). See `CONTRIBUTING.md` for details.
 
 ```bash
-# Examples
 feat: add WKT geometry encoding support
 fix: guard against degenerate linestrings in simplify
 perf(core): parallelize geometry processing
-docs: update ROADMAP with Phase 9
-
-# With scope
 feat(cli): add --streaming-mode flag
-fix(core): prevent OOM on large files
 ```
+
+## Key Documents
+
+| Document | Purpose |
+|----------|---------|
+| `context/ARCHITECTURE.md` | Design decisions, tippecanoe divergences |
+| `DEVELOPMENT.md` | Day-to-day dev workflow, Python setup |
+| `CONTRIBUTING.md` | How to contribute, commit conventions, releases |
 
 ## Setup
 
