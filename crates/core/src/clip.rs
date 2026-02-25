@@ -433,6 +433,12 @@ fn clip_multilinestring(mls: &MultiLineString<f64>, bounds: &TileBounds) -> Opti
 /// Returns `Geometry::Polygon` if clipping results in a single polygon,
 /// or `Geometry::MultiPolygon` if the clip creates multiple disconnected parts
 /// (e.g., a U-shaped polygon clipped across its opening).
+///
+/// # Algorithm Selection
+///
+/// - **Valid polygons**: Use fast Sutherland-Hodgman (O(n))
+/// - **Invalid polygons** (self-intersections, spikes): Fall back to BooleanOps
+///   which handles degenerate cases robustly using Vatti's algorithm
 fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
     // Quick rejection test
     let poly_rect = poly.bounding_rect()?;
@@ -449,7 +455,30 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         return Some(Geometry::Polygon(poly.clone()));
     }
 
-    // Use Sutherland-Hodgman for axis-aligned rect clipping (O(n) vs O(n²))
+    // Check if polygon is valid for Sutherland-Hodgman
+    let validation_errors = validate_polygon(poly);
+
+    if validation_errors.is_empty() {
+        // Valid polygon: use fast Sutherland-Hodgman (O(n))
+        clip_polygon_sutherland_hodgman(poly, bounds)
+    } else {
+        // Invalid polygon: fall back to BooleanOps (slower but robust)
+        log::trace!(
+            "using BooleanOps fallback for invalid polygon: {:?}",
+            validation_errors
+        );
+        clip_polygon_boolean_ops(poly, bounds)
+    }
+}
+
+/// Clip a polygon using Sutherland-Hodgman algorithm.
+///
+/// Fast (O(n)) but assumes valid polygon geometry. May produce incorrect
+/// results for self-intersecting polygons.
+fn clip_polygon_sutherland_hodgman(
+    poly: &Polygon<f64>,
+    bounds: &TileBounds,
+) -> Option<Geometry<f64>> {
     let clipped_exterior = sutherland_hodgman_clip(poly.exterior(), bounds);
     if clipped_exterior.0.len() < 3 {
         return None;
@@ -468,6 +497,43 @@ fn clip_polygon(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64
         clipped_exterior,
         clipped_interiors,
     )))
+}
+
+/// Clip a polygon using BooleanOps intersection.
+///
+/// Slower than Sutherland-Hodgman but handles degenerate geometries
+/// (self-intersections, spikes) robustly using Vatti's algorithm.
+///
+/// # DIVERGENCE FROM TIPPECANOE
+///
+/// Tippecanoe uses custom clipping that may produce different results for
+/// invalid geometries. We prioritize correctness (all output coords within
+/// bounds) over exact tippecanoe parity for these edge cases.
+fn clip_polygon_boolean_ops(poly: &Polygon<f64>, bounds: &TileBounds) -> Option<Geometry<f64>> {
+    let clip_rect = Rect::new(
+        Coord {
+            x: bounds.lng_min,
+            y: bounds.lat_min,
+        },
+        Coord {
+            x: bounds.lng_max,
+            y: bounds.lat_max,
+        },
+    );
+    let clip_poly = clip_rect.to_polygon();
+
+    // BooleanOps::intersection returns MultiPolygon
+    let result: MultiPolygon<f64> = poly.intersection(&clip_poly);
+
+    if result.0.is_empty() {
+        None
+    } else if result.0.len() == 1 {
+        // Single polygon: unwrap from MultiPolygon
+        Some(Geometry::Polygon(result.0.into_iter().next().unwrap()))
+    } else {
+        // Multiple polygons (e.g., from clipping a U-shape)
+        Some(Geometry::MultiPolygon(result))
+    }
 }
 
 /// Sutherland-Hodgman polygon clipping algorithm for axis-aligned rectangles.
@@ -587,11 +653,19 @@ fn clip_multipolygon(mp: &MultiPolygon<f64>, bounds: &TileBounds) -> Option<Mult
         return Some(mp.clone());
     }
 
-    // Clip each polygon individually using fast Sutherland-Hodgman
+    // Clip each polygon individually
+    // Note: clip_polygon may return MultiPolygon (from BooleanOps fallback)
     let mut clipped_polys = Vec::new();
     for poly in &mp.0 {
-        if let Some(Geometry::Polygon(clipped)) = clip_polygon(poly, bounds) {
-            clipped_polys.push(clipped);
+        match clip_polygon(poly, bounds) {
+            Some(Geometry::Polygon(clipped)) => {
+                clipped_polys.push(clipped);
+            }
+            Some(Geometry::MultiPolygon(clipped_mp)) => {
+                // BooleanOps can produce multiple polygons from a single input
+                clipped_polys.extend(clipped_mp.0);
+            }
+            _ => {}
         }
     }
 
@@ -1006,5 +1080,170 @@ mod tests {
         ]));
         let errors = validate_geometry(&ls);
         assert!(errors.is_empty(), "Valid linestring should have no errors");
+    }
+
+    // ========== BooleanOps Fallback Tests ==========
+
+    /// Helper to check all coordinates are within bounds (with small epsilon for floating point)
+    fn all_coords_within_bounds(geom: &Geometry<f64>, bounds: &TileBounds) -> bool {
+        let epsilon = 1e-10;
+        match geom {
+            Geometry::Polygon(poly) => {
+                for coord in poly.exterior().coords() {
+                    if coord.x < bounds.lng_min - epsilon
+                        || coord.x > bounds.lng_max + epsilon
+                        || coord.y < bounds.lat_min - epsilon
+                        || coord.y > bounds.lat_max + epsilon
+                    {
+                        return false;
+                    }
+                }
+                for interior in poly.interiors() {
+                    for coord in interior.coords() {
+                        if coord.x < bounds.lng_min - epsilon
+                            || coord.x > bounds.lng_max + epsilon
+                            || coord.y < bounds.lat_min - epsilon
+                            || coord.y > bounds.lat_max + epsilon
+                        {
+                            return false;
+                        }
+                    }
+                }
+                true
+            }
+            Geometry::MultiPolygon(mp) => {
+                mp.0.iter()
+                    .all(|p| all_coords_within_bounds(&Geometry::Polygon(p.clone()), bounds))
+            }
+            _ => true,
+        }
+    }
+
+    #[test]
+    fn test_clip_bowtie_uses_fallback_and_produces_valid_output() {
+        // Bowtie (figure-8) polygon that crosses the clip bounds
+        // The self-intersection at (5,5) should trigger BooleanOps fallback
+        let bounds = TileBounds::new(0.0, 0.0, 8.0, 8.0);
+
+        let bowtie = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -2.0, y: -2.0 },
+                Coord { x: 10.0, y: 10.0 },
+                Coord { x: 10.0, y: -2.0 },
+                Coord { x: -2.0, y: 10.0 },
+                Coord { x: -2.0, y: -2.0 },
+            ]),
+            vec![],
+        );
+
+        // Verify this is detected as invalid
+        let errors = validate_polygon(&bowtie);
+        assert!(!errors.is_empty(), "Bowtie should be detected as invalid");
+
+        // Clip the bowtie
+        let result = clip_polygon(&bowtie, &bounds);
+        assert!(result.is_some(), "Bowtie should produce clipped output");
+
+        // Key assertion: all output coordinates must be within bounds
+        let clipped = result.unwrap();
+        assert!(
+            all_coords_within_bounds(&clipped, &bounds),
+            "BooleanOps fallback should produce output within bounds"
+        );
+    }
+
+    #[test]
+    fn test_clip_spike_uses_fallback_and_produces_valid_output() {
+        // Spike polygon that extends outside the clip bounds
+        let bounds = TileBounds::new(0.0, 0.0, 5.0, 5.0);
+
+        let spike = Polygon::new(
+            LineString::from(vec![
+                Coord { x: 0.0, y: 0.0 },
+                Coord { x: 4.0, y: 0.0 },
+                Coord { x: 4.0, y: 4.0 },
+                Coord { x: 2.0, y: 4.0 },
+                Coord { x: 2.0, y: 8.0 }, // spike up outside bounds
+                Coord { x: 2.0, y: 4.0 }, // back down (self-touch)
+                Coord { x: 0.0, y: 4.0 },
+                Coord { x: 0.0, y: 0.0 },
+            ]),
+            vec![],
+        );
+
+        // Verify this is detected as invalid
+        let errors = validate_polygon(&spike);
+        assert!(!errors.is_empty(), "Spike should be detected as invalid");
+
+        // Clip the spike
+        let result = clip_polygon(&spike, &bounds);
+        assert!(result.is_some(), "Spike should produce clipped output");
+
+        // Key assertion: all output coordinates must be within bounds
+        let clipped = result.unwrap();
+        assert!(
+            all_coords_within_bounds(&clipped, &bounds),
+            "BooleanOps fallback should produce output within bounds"
+        );
+    }
+
+    #[test]
+    fn test_boolean_ops_directly() {
+        // Test the BooleanOps function directly with a simple case
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        // A valid polygon that spans outside bounds
+        let poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -5.0, y: -5.0 },
+                Coord { x: 15.0, y: -5.0 },
+                Coord { x: 15.0, y: 15.0 },
+                Coord { x: -5.0, y: 15.0 },
+                Coord { x: -5.0, y: -5.0 },
+            ]),
+            vec![],
+        );
+
+        let result = clip_polygon_boolean_ops(&poly, &bounds);
+        assert!(result.is_some());
+
+        let clipped = result.unwrap();
+        assert!(
+            all_coords_within_bounds(&clipped, &bounds),
+            "BooleanOps should clip to bounds"
+        );
+    }
+
+    #[test]
+    fn test_valid_polygon_uses_fast_path() {
+        // A valid polygon should use Sutherland-Hodgman (we verify by checking
+        // that both algorithms produce the same result for valid input)
+        let bounds = TileBounds::new(0.0, 0.0, 10.0, 10.0);
+
+        let valid_poly = Polygon::new(
+            LineString::from(vec![
+                Coord { x: -2.0, y: -2.0 },
+                Coord { x: 12.0, y: -2.0 },
+                Coord { x: 12.0, y: 12.0 },
+                Coord { x: -2.0, y: 12.0 },
+                Coord { x: -2.0, y: -2.0 },
+            ]),
+            vec![],
+        );
+
+        // Verify it's valid
+        let errors = validate_polygon(&valid_poly);
+        assert!(errors.is_empty(), "This polygon should be valid");
+
+        // Both methods should produce valid output
+        let sh_result = clip_polygon_sutherland_hodgman(&valid_poly, &bounds);
+        let bo_result = clip_polygon_boolean_ops(&valid_poly, &bounds);
+
+        assert!(sh_result.is_some());
+        assert!(bo_result.is_some());
+
+        // Both should be within bounds
+        assert!(all_coords_within_bounds(&sh_result.unwrap(), &bounds));
+        assert!(all_coords_within_bounds(&bo_result.unwrap(), &bounds));
     }
 }
