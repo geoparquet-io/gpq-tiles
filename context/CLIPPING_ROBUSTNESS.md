@@ -38,6 +38,48 @@ This document captures our research and decisions around polygon clipping edge c
 - **BooleanOps handles clipping** correctly even on invalid input
 - **Future work** could add GEOS bindings if repair is needed
 
+## Recommended Workflow: Fix Geometry Before Tiling
+
+> **gpq-tiles is a tiler, not a geometry repair tool.**
+
+For best results, validate and repair invalid geometries **before** conversion:
+
+```bash
+# With ogr2ogr (uses GEOS MakeValid)
+ogr2ogr -f Parquet output_clean.parquet input.parquet -makevalid
+
+# Or with DuckDB Spatial
+duckdb -c "COPY (SELECT ST_MakeValid(geometry) as geometry, * EXCLUDE geometry FROM 'input.parquet') TO 'output_clean.parquet'"
+```
+
+```sql
+-- PostGIS
+SELECT ST_MakeValid(geom) FROM my_table;
+```
+
+```python
+# Python with Shapely
+from shapely.validation import make_valid
+clean_geom = make_valid(dirty_geom)
+```
+
+### Why Pre-Process?
+
+1. **One-time cost** — Data cleaning runs once; tiling may happen repeatedly
+2. **Battle-tested** — GEOS/PostGIS `MakeValid` handles edge cases we haven't seen
+3. **Data quality** — You probably want to know your source data has issues anyway
+4. **Performance** — gpq-tiles stays fast and portable (pure Rust, no C++ dependencies)
+
+### What gpq-tiles Provides
+
+| Feature | Purpose |
+|---------|---------|
+| `--strict` mode (planned) | Identifies which geometries are invalid (diagnostic) |
+| Automatic fallback | Prevents crashes and garbage output |
+| Input validation | Detects self-intersections, spikes, invalid holes |
+
+**What we explicitly do NOT do:** Repair geometry. That's your data pipeline's responsibility.
+
 ## Problem Statement
 
 Polygon clipping is a critical step in the tiling pipeline that runs on every geometry. Edge cases include:
