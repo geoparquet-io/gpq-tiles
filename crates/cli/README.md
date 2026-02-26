@@ -14,8 +14,6 @@ Fast GeoParquet → PMTiles converter in Rust.
 > 2) The library is not robust against self-intersections. I'm working on [a port of Wagyu to Rust](https://github.com/nlebovits/wagyu-rs) to address this. In the meantime, this library is definitely not production-ready.
 > --Nissim
 
-This is a WIP port of Wagyu to Rust. Code is generated with Claude; please take it with a grain of salt as I figure it out. --Nissim
-
 ## Install
 
 ```bash
