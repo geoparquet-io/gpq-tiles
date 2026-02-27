@@ -44,7 +44,7 @@ jobs:
         run: cargo mutants --package gpq2tiles-core --output mutants.out
 
       - name: Upload mutation report
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: mutation-report
           path: mutants.out/

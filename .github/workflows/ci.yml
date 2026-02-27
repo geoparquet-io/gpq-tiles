@@ -232,7 +232,7 @@ jobs:
         timeout-minutes: 15
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: criterion-reports
           path: target/criterion/
@@ -262,7 +262,7 @@ jobs:
         run: cargo mutants --package gpq2tiles-core
 
       - name: Upload mutation report
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@v7
         with:
           name: mutation-report
           path: mutants.out/
